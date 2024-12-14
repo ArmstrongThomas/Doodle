@@ -92,14 +92,21 @@ static bool read_exact(int s, void* buf, size_t length) {
     return true;
 }
 
+void writeColor(u8* buffer, int idx, u8 r, u8 g, u8 b) {
+    buffer[idx]     = b;
+    buffer[idx + 1] = g;
+    buffer[idx + 2] = r;
+}
+
 void drawPointOnBuffer(u8* buffer, int fbWidth, int fbHeight, int x, int y, u8 r, u8 g, u8 b) {
     if (x >= 0 && x < fbWidth && y >= 0 && y < fbHeight) {
         int idx = 3 * (y * fbWidth + x);
-        buffer[idx] = r;
-        buffer[idx+1] = g;
-        buffer[idx+2] = b;
+        buffer[idx]     = b; // Swap R and B
+        buffer[idx + 1] = g;
+        buffer[idx + 2] = r;
     }
 }
+
 
 void drawLine(u8* buffer, int fbWidth, int fbHeight, int x0, int y0, int x1, int y1, u8 r, u8 g, u8 b) {
     int dx = abs(x1 - x0);
@@ -169,7 +176,7 @@ int main() {
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
 
-    printf("3DS Drawing App with Panning\n");
+    printf("3DS MultiUser Doodle App \n");
 
     SOC_buffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
     if(SOC_buffer == NULL) {
@@ -378,27 +385,27 @@ int main() {
                 printf("Server disconnected.\n");
             }
         }
-
         // Rendering
         if (fullCanvas) {
-        for (int y = 0; y < fbHeight; y++) {
-            for (int x = 0; x < fbWidth; x++) { 
-                int C_x = y + offsetX;
-                int C_y = (fbWidth - 1 - x) + offsetY;
-                if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight) {
-                    int bufferIdx = 3 * (y * fbWidth + x);
-                    int canvasIdx = 3 * (C_y * canvasWidth + C_x);
-                    buffer[bufferIdx] = fullCanvas[canvasIdx];
-                    buffer[bufferIdx + 1] = fullCanvas[canvasIdx + 1];
-                    buffer[bufferIdx + 2] = fullCanvas[canvasIdx + 2];
-                } else {
-                    // Draw white for areas outside the canvas
-                    int bufferIdx = 3 * (y * fbWidth + x);
-                    buffer[bufferIdx] = buffer[bufferIdx + 1] = buffer[bufferIdx + 2] = 255;
+            for (int y = 0; y < fbHeight; y++) {
+                for (int x = 0; x < fbWidth; x++) { 
+                    int C_x = y + offsetX;
+                    int C_y = (fbWidth - 1 - x) + offsetY;
+                    if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight) {
+                        int bufferIdx = 3 * (y * fbWidth + x);
+                        int canvasIdx = 3 * (C_y * canvasWidth + C_x);
+                        buffer[bufferIdx]     = fullCanvas[canvasIdx + 2]; // B
+                        buffer[bufferIdx + 1] = fullCanvas[canvasIdx + 1]; // G
+                        buffer[bufferIdx + 2] = fullCanvas[canvasIdx];     // R
+                    } else {
+                        // Draw white for areas outside the canvas
+                        int bufferIdx = 3 * (y * fbWidth + x);
+                        buffer[bufferIdx] = buffer[bufferIdx + 1] = buffer[bufferIdx + 2] = 255;
+                    }
                 }
             }
         }
-    }
+
 
         gspWaitForVBlank();
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
