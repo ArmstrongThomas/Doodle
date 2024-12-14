@@ -2,23 +2,31 @@
 #include <stdio.h>
 #include <string.h>
 #include <malloc.h>
-#include <cstdlib> 
-#include <stdarg.h>  
-#include <fcntl.h>   
-#include <unistd.h>  
-#include <errno.h>   
+#include <cstdlib>
+#include <stdarg.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <vector>
 #include <string>
 #include <sstream>
+#include <math.h>
+#include <algorithm>
 
 #define SOC_ALIGN       0x1000
 #define SOC_BUFFERSIZE  0x100000
 
 static u32 *SOC_buffer = NULL;
 static int sock = -1;
+
+struct DrawPoint {
+    int x, y;
+};
+
+std::vector<DrawPoint> pointBuffer;
 
 static void failExit(const char *fmt, ...) {
     va_list ap;
@@ -40,40 +48,32 @@ static void socShutdown() {
     socExit();
 }
 
-// A blocking read_line function that reads until '\n' or an error occurs
-// This sets the socket to blocking mode temporarily for simplicity.
 static bool read_line(int s, char* buffer, size_t maxlen) {
-    // Make sure the socket is blocking
     int flags = fcntl(s, F_GETFL, 0);
     fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
 
     size_t pos = 0;
     char c;
     while (pos < maxlen - 1) {
-
         int ret = recv(s, &c, 1, 0);
         if (ret <= 0) {
-            // error or connection closed
+            fcntl(s, F_SETFL, flags);
             return false;
         }
         if (c == '\n') {
             buffer[pos] = '\0';
-            // Restore non-blocking if desired
             fcntl(s, F_SETFL, flags);
             return true;
         }
         buffer[pos++] = c;
     }
 
-    // Restore non-blocking if desired
     fcntl(s, F_SETFL, flags);
     buffer[pos] = '\0';
-    return true; // line too long, but return what we got
+    return true;
 }
 
-// A blocking read_exact function that reads exactly 'length' bytes
 static bool read_exact(int s, void* buf, size_t length) {
-    // Make sure the socket is blocking
     int flags = fcntl(s, F_GETFL, 0);
     fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
 
@@ -82,117 +82,94 @@ static bool read_exact(int s, void* buf, size_t length) {
     while (received < length) {
         int ret = recv(s, ptr + received, length - received, 0);
         if (ret <= 0) {
-            // error or connection closed
             fcntl(s, F_SETFL, flags);
             return false;
         }
         received += ret;
     }
 
-    // Restore non-blocking if desired
     fcntl(s, F_SETFL, flags);
     return true;
 }
 
-// Define a structure for storing draw points
-struct DrawPoint {
-    int x, y;
-};
+void drawPointOnBuffer(u8* buffer, int fbWidth, int fbHeight, int x, int y, u8 r, u8 g, u8 b) {
+    if (x >= 0 && x < fbWidth && y >= 0 && y < fbHeight) {
+        int idx = 3 * (y * fbWidth + x);
+        buffer[idx] = r;
+        buffer[idx+1] = g;
+        buffer[idx+2] = b;
+    }
+}
 
-// Global buffer for batch points
-std::vector<DrawPoint> pointBuffer;
-
-// Integer-based Bresenham's line
-void drawLine(u8* buffer, int fbWidth, int fbHeight, int x0, int y0, int x1, int y1) {
+void drawLine(u8* buffer, int fbWidth, int fbHeight, int x0, int y0, int x1, int y1, u8 r, u8 g, u8 b) {
     int dx = abs(x1 - x0);
+    int dy = abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1;
-    int dy = -abs(y1 - y0);
     int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
+    int err = dx - dy;
+    int steps = std::max(dx, dy);
 
-    while (true) {
-        if (x0 >= 0 && x0 < fbWidth && y0 >= 0 && y0 < fbHeight) {
-            int idx = 3 * (y0 * fbWidth + x0);
-            buffer[idx] = 0; 
-            buffer[idx+1] = 0; 
-            buffer[idx+2] = 0; 
+    for (int i = 0; i <= steps; i++) {
+        float t = (steps == 0) ? 0.0f : static_cast<float>(i) / steps;
+        int x = x0 + (x1 - x0) * t;
+        int y = y0 + (y1 - y0) * t;
+
+        drawPointOnBuffer(buffer, fbWidth, fbHeight, x, y, r, g, b);
+
+        if (x == x1 && y == y1) break;
+    }
+}
+
+void processDrawPacket(const uint8_t* packet, size_t length, u8* buffer, int fbWidth, int fbHeight,
+                       u8* fullCanvas, int canvasWidth, int canvasHeight) {
+    if (length < 6) return; // Packet too short
+
+    uint8_t r = packet[1];
+    uint8_t g = packet[2];
+    uint8_t b = packet[3];
+    uint8_t size = packet[4];
+    uint8_t numPoints = packet[5];
+
+    if (length != static_cast<size_t>(6 + numPoints * 4)) return; // Invalid packet length
+
+    int prevX = -1, prevY = -1;
+
+    for (int i = 0; i < numPoints; i++) {
+        uint16_t x = *(uint16_t*)(packet + 6 + i * 4);
+        uint16_t y = *(uint16_t*)(packet + 8 + i * 4);
+
+        if (prevX != -1 && prevY != -1) {
+            // Draw line on fullCanvas
+            drawLine(fullCanvas, canvasWidth, canvasHeight, prevX, prevY, x, y, r, g, b);
         }
 
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+        prevX = x;
+        prevY = y;
     }
 }
 
 static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint>& points, const char* color = "#000000", int size = 1) {
     if (sock < 0 || points.empty()) return;
 
-    std::string msg = "{\"type\":\"drawBatch\",\"points\":[";
-    for (size_t i = 0; i < points.size(); ++i) {
-        msg += "{\"x\":" + std::to_string(points[i].x) + ",\"y\":" + std::to_string(points[i].y) + "}";
-        if (i < points.size() - 1) {
-            msg += ",";
-        }
+    uint8_t packet[1024]; // Adjust size as needed
+    packet[0] = 1; // Type: drawBatch
+    sscanf(color + 1, "%2hhx%2hhx%2hhx", &packet[1], &packet[2], &packet[3]);
+    packet[4] = size;
+    packet[5] = points.size() > 255 ? 255 : points.size();
+
+    for (size_t i = 0; i < packet[5]; i++) {
+        *(uint16_t*)(packet + 6 + i * 4) = points[i].x;
+        *(uint16_t*)(packet + 8 + i * 4) = points[i].y;
     }
-    msg += "],\"color\":\"" + std::string(color) + "\",\"size\":" + std::to_string(size) + "}\n";
 
-    send(sock, msg.c_str(), msg.size(), 0);
-}
-
-static void processServerMessage(u8* buffer, int fbWidth, int fbHeight, const char* msg) {
-    int x,y,size;
-    char color[8] = "#000000";
-    if (strstr(msg, "\"type\":\"draw\"")) {
-        char* xPtr = strstr((char*)msg,"\"x\":");
-        char* yPtr = strstr((char*)msg,"\"y\":");
-        char* cPtr = strstr((char*)msg,"\"color\":\"");
-        char* sPtr = strstr((char*)msg,"\"size\":");
-
-        if(xPtr && yPtr && cPtr && sPtr) {
-            x = atoi(xPtr+4);
-            y = atoi(yPtr+4);
-            {
-                char* start = cPtr+9; 
-                char* end = strchr(start,'"');
-                if(end && end - start < 8) {
-                    strncpy(color, start, end - start);
-                    color[end - start] = '\0';
-                }
-            }
-            size = atoi(sPtr+7);
-
-            int r=0,g=0,b=0;
-            if (strlen(color) == 7 && color[0] == '#') {
-                char rc[3]={color[1],color[2],'\0'};
-                char gc[3]={color[3],color[4],'\0'};
-                char bc[3]={color[5],color[6],'\0'};
-                r = strtol(rc,NULL,16);
-                g = strtol(gc,NULL,16);
-                b = strtol(bc,NULL,16);
-            }
-
-            for (int dx = -size/2; dx <= size/2; dx++) {
-                for (int dy = -size/2; dy <= size/2; dy++) {
-                    int nx = x + dx;
-                    int ny = y + dy;
-                    if (nx >=0 && nx < fbWidth && ny >=0 && ny < fbHeight) {
-                        int idx = 3*(ny*fbWidth + nx);
-                        buffer[idx+0] = r;
-                        buffer[idx+1] = g;
-                        buffer[idx+2] = b;
-                    }
-                }
-            }
-        }
-    }
+    send(sock, packet, 6 + packet[5] * 4, 0);
 }
 
 int main() {
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
 
-    printf("3DS Drawing App with Networking\n");
+    printf("3DS Drawing App with Panning\n");
 
     SOC_buffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
     if(SOC_buffer == NULL) {
@@ -227,7 +204,6 @@ int main() {
         printf("Connected!\n");
     }
 
-    // Get framebuffer info
     u16 fbWidth, fbHeight;
     u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fbWidth, &fbHeight);
     if (!fb) {
@@ -237,7 +213,7 @@ int main() {
     }
 
     printf("fbWidth=%u, fbHeight=%u\n", fbWidth, fbHeight);
-    printf("Touch bottom screen to draw. START to clear.\n");
+    printf("Touch bottom screen to draw. START to refresh. Hold LEFT D-Pad for pan.\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
     u8* buffer = (u8*)malloc(bufferSize);
@@ -248,13 +224,10 @@ int main() {
     }
     memset(buffer, 255, bufferSize);
 
-    bool isTouching = false;
-    int lastDrawX = 0;
-    int lastDrawY = 0;
-
-    int canvasWidth = fbHeight;  // Because we want a 320x240 canvas, and fbHeight=320, fbWidth=240
-    int canvasHeight = fbWidth;  // swap because of rotation
-    int canvasSize = 0; 
+    int canvasWidth = 0;
+    int canvasHeight = 0;
+    int canvasSize = 0;
+    u8* fullCanvas = NULL;
 
     if (sock >= 0) {
         char line[1024];
@@ -268,48 +241,33 @@ int main() {
                 canvasWidth = atoi(wPtr+8);
                 canvasHeight = atoi(hPtr+9);
                 canvasSize = atoi(sPtr+13);
-                printf("Received init: width=%d, height=%d, canvasSize=%d\n", canvasWidth, canvasHeight, canvasSize);
+                printf("Received canvas dimensions: W=%d, H=%d\n", canvasWidth, canvasHeight);
 
-                // Allocate a temporary buffer to read the canvas from server
-                u8* tempCanvas = (u8*)malloc(canvasSize);
-                if (tempCanvas && read_exact(sock, tempCanvas, canvasSize)) {
-                    // Clear buffer
-                    memset(buffer, 255, bufferSize);
-
-                    // Now map the canvas directly:
-                    // Canvas (C_x, C_y) -> Screen (Sx, Sy) = (C_x, C_y)
-                    // We know Sx = FbY and Sy = fbWidth - 1 - FbX
-                    // Rearranging: FbX = fbWidth - 1 - C_y, FbY = C_x
-                    for (int C_y = 0; C_y < canvasHeight && C_y < (int)fbWidth; C_y++) {
-                        for (int C_x = 0; C_x < canvasWidth && C_x < (int)fbHeight; C_x++) {
-                            int FbX = fbWidth - 1 - C_y;
-                            int FbY = C_x;
-
-                            int bufferIdx = 3 * (FbY * fbWidth + FbX);
-                            int canvasIdx = 3 * (C_y * canvasWidth + C_x);
-
-                            buffer[bufferIdx + 0] = tempCanvas[canvasIdx + 0];
-                            buffer[bufferIdx + 1] = tempCanvas[canvasIdx + 1];
-                            buffer[bufferIdx + 2] = tempCanvas[canvasIdx + 2];
-                        }
-                    }
+                fullCanvas = (u8*)malloc(canvasSize);
+                if (fullCanvas && read_exact(sock, fullCanvas, canvasSize)) {
+                    // We'll redraw from fullCanvas each frame.
                 } else {
                     printf("Failed to read canvas data.\n");
+                    if (fullCanvas) { free(fullCanvas); fullCanvas = NULL; }
                 }
-                if (tempCanvas) free(tempCanvas);
             } else {
                 printf("Invalid init line: %s\n", line);
             }
         }
 
-        // After reading init and canvas, set socket back to non-blocking for main loop
         int flags = fcntl(sock, F_GETFL, 0);
         fcntl(sock, F_SETFL, flags | O_NONBLOCK);
     }
 
-    char netBuf[1024];
-    memset(netBuf,0,sizeof(netBuf));
-    int netBufPos = 0;
+    int offsetX = 0;
+    int offsetY = 0;
+    int prevTouchX = -1;
+    int prevTouchY = -1;
+
+    auto clampOffsets = [&](int &ox, int &oy) {
+        ox = std::max(0, std::min(ox, canvasWidth - fbWidth));
+        oy = std::max(0, std::min(oy, canvasHeight - fbHeight));
+    };
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -317,75 +275,134 @@ int main() {
         u32 kHeld = hidKeysHeld();
 
         if (kDown & KEY_START) {
-            memset(buffer, 255, bufferSize);
-            isTouching = false;
+            // Re-fetch canvas from server
+            if (sock >= 0) {
+                char request[] = "getCanvas\n";
+                send(sock, request, strlen(request), 0);
+                
+                char response[1024];
+                if (read_line(sock, response, sizeof(response)) && strstr(response, "canvasData")) {
+                    if (read_exact(sock, fullCanvas, canvasSize)) {
+                        printf("Canvas refreshed from server.\n");
+                    } else {
+                        printf("Failed to read canvas data.\n");
+                    }
+                } else {
+                    printf("Invalid response from server.\n");
+                }
+            }
         }
 
-        if (kHeld & KEY_TOUCH) {
-            touchPosition touch;
-            hidTouchRead(&touch);
+        touchPosition touch;
+        hidTouchRead(&touch);
 
-            // Adjust touch coordinates
-            // The screen coordinate (Sx, Sy) = (touch.px, touch.py)
-            // We must convert (Sx, Sy) back to FbX, FbY:
-            // Sx = FbY
-            // Sy = fbWidth - 1 - FbX
-            // So FbY = Sx = touch.px, FbX = fbWidth - 1 - Sy = fbWidth - 1 - touch.py
-            int FbX = fbWidth - 1 - touch.py;
-            int FbY = touch.px;
+        if (kHeld & KEY_DLEFT) {
+            // Panning mode
+            if (kHeld & KEY_TOUCH) {
+                if (prevTouchX == -1 && prevTouchY == -1) {
+                    prevTouchX = touch.px;
+                    prevTouchY = touch.py;
+                } else {
+                    int deltaX = touch.px - prevTouchX;
+                    int deltaY = touch.py - prevTouchY;
+                    
+                    // Adjust offsets for correct panning direction
+                    offsetX -= deltaX;
+                    offsetY -= deltaY;
 
-            if (FbX >= 0 && FbX < fbWidth && FbY >= 0 && FbY < fbHeight) {
-                // Draw locally
-                drawLine(buffer, fbWidth, fbHeight, lastDrawX, lastDrawY, FbX, FbY);
+                    // Clamp offsets
+                    clampOffsets(offsetX, offsetY);
 
-                // Convert framebuffer coords back to canvas coords if sending to server
-                // Canvas coords (C_x, C_y) = (Sx, Sy) = (FbY, fbWidth - 1 - FbX)
-                int C_x = FbY;
-                int C_y = fbWidth - 1 - FbX;
-                pointBuffer.push_back({C_x, C_y});
+                    prevTouchX = touch.px;
+                    prevTouchY = touch.py;
+                }
+            } else {
+                prevTouchX = prevTouchY = -1;
+            }
+        } else {
+            // Normal drawing mode
+            if (kHeld & KEY_TOUCH) {
+                if (prevTouchX == -1 && prevTouchY == -1) {
+                    prevTouchX = touch.px;
+                    prevTouchY = touch.py;
+                } else {
+                    // Interpolate between previous and current touch points
+                    int steps = std::max(abs(touch.px - prevTouchX), abs(touch.py - prevTouchY));
+                    for (int i = 0; i <= steps; i++) {
+                        float t = (steps == 0) ? 0.0f : static_cast<float>(i) / steps;
+                        int x = prevTouchX + (touch.px - prevTouchX) * t;
+                        int y = prevTouchY + (touch.py - prevTouchY) * t;
+                        
+                        // Convert touch coordinates to framebuffer coordinates
+                        int FbX = x;
+                        int FbY = y;
 
-                if (pointBuffer.size() >= 10) { 
+                        // Draw point on local buffer
+                        drawPointOnBuffer(buffer, fbWidth, fbHeight, FbX, FbY, 0, 0, 0);
+
+                        // Draw point on fullCanvas
+                        int C_x = FbX + offsetX;
+                        int C_y = FbY + offsetY;
+                        if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight) {
+                            int canvasIdx = 3 * (C_y * canvasWidth + C_x);
+                            fullCanvas[canvasIdx] = fullCanvas[canvasIdx + 1] = fullCanvas[canvasIdx + 2] = 0;
+                        }
+
+                        pointBuffer.push_back({C_x, C_y});
+                    }
+
+                    // Send points to server if buffer is full
+                    if (pointBuffer.size() >= 10) {
+                        sendDrawBatchCommand(sock, pointBuffer, "#000000", 1);
+                        pointBuffer.clear();
+                    }
+
+                    prevTouchX = touch.px;
+                    prevTouchY = touch.py;
+                }
+            } else {
+                // Stylus released
+                if (!pointBuffer.empty()) {
                     sendDrawBatchCommand(sock, pointBuffer, "#000000", 1);
                     pointBuffer.clear();
                 }
-
-                lastDrawX = FbX;
-                lastDrawY = FbY;
-                isTouching = true;
+                prevTouchX = prevTouchY = -1;
             }
-        } else {
-            if (isTouching && !pointBuffer.empty()) {
-                sendDrawBatchCommand(sock, pointBuffer, "#000000", 1);
-                pointBuffer.clear();
-            }
-            isTouching = false;
         }
 
-        // Non-blocking read for subsequent JSON messages
+        // Server messages
         if (sock >= 0) {
-            int recvLen = recv(sock, netBuf+netBufPos, sizeof(netBuf)-netBufPos-1, 0);
+            uint8_t packetBuffer[1024];
+            int recvLen = recv(sock, packetBuffer, sizeof(packetBuffer), 0);
             if (recvLen > 0) {
-                netBufPos += recvLen;
-                netBuf[netBufPos] = '\0';
-
-                char* start = netBuf;
-                char* nl;
-                while ((nl = strchr(start, '\n'))) {
-                    *nl = '\0';
-                    processServerMessage(buffer, fbWidth, fbHeight, start);
-                    start = nl+1;
-                }
-
-                int leftover = (int)strlen(start);
-                memmove(netBuf, start, leftover+1);
-                netBufPos = leftover;
+                processDrawPacket(packetBuffer, recvLen, buffer, fbWidth, fbHeight, fullCanvas, canvasWidth, canvasHeight);
             } else if (recvLen == 0) {
                 close(sock);
                 sock = -1;
                 printf("Server disconnected.\n");
             }
-            // if recvLen < 0 && errno == EAGAIN, no data this frame
         }
+
+        // Rendering
+        if (fullCanvas) {
+        for (int y = 0; y < fbHeight; y++) {
+            for (int x = 0; x < fbWidth; x++) {
+                int C_x = y + offsetX;
+                int C_y = (fbWidth - 1 - x) + offsetY;
+                if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight) {
+                    int bufferIdx = 3 * (y * fbWidth + x);
+                    int canvasIdx = 3 * (C_y * canvasWidth + C_x);
+                    buffer[bufferIdx] = fullCanvas[canvasIdx];
+                    buffer[bufferIdx + 1] = fullCanvas[canvasIdx + 1];
+                    buffer[bufferIdx + 2] = fullCanvas[canvasIdx + 2];
+                } else {
+                    // Draw white for areas outside the canvas
+                    int bufferIdx = 3 * (y * fbWidth + x);
+                    buffer[bufferIdx] = buffer[bufferIdx + 1] = buffer[bufferIdx + 2] = 255;
+                }
+            }
+        }
+    }
 
         gspWaitForVBlank();
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
@@ -395,6 +412,7 @@ int main() {
     }
 
     if (sock >= 0) close(sock);
+    if (fullCanvas) free(fullCanvas);
     free(buffer);
     gfxExit();
     return 0;
