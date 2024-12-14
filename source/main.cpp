@@ -213,7 +213,7 @@ int main() {
     }
 
     printf("fbWidth=%u, fbHeight=%u\n", fbWidth, fbHeight);
-    printf("Touch bottom screen to draw. START to refresh. Hold LEFT D-Pad for pan.\n");
+    printf("Touch bottom screen to draw. \nSTART to refresh canvas and SELECT to exit.\nHold LEFT D-Pad for pan.\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
     u8* buffer = (u8*)malloc(bufferSize);
@@ -245,7 +245,6 @@ int main() {
 
                 fullCanvas = (u8*)malloc(canvasSize);
                 if (fullCanvas && read_exact(sock, fullCanvas, canvasSize)) {
-                    // We'll redraw from fullCanvas each frame.
                 } else {
                     printf("Failed to read canvas data.\n");
                     if (fullCanvas) { free(fullCanvas); fullCanvas = NULL; }
@@ -274,8 +273,12 @@ int main() {
         u32 kDown = hidKeysDown();
         u32 kHeld = hidKeysHeld();
 
+        if (kDown & KEY_SELECT) {
+            printf("Select key pressed. Exiting...\n");
+            break;
+        }
+
         if (kDown & KEY_START) {
-            // Re-fetch canvas from server
             if (sock >= 0) {
                 char request[] = "getCanvas\n";
                 send(sock, request, strlen(request), 0);
@@ -306,11 +309,9 @@ int main() {
                     int deltaX = touch.px - prevTouchX;
                     int deltaY = touch.py - prevTouchY;
                     
-                    // Adjust offsets for correct panning direction
                     offsetX -= deltaX;
                     offsetY -= deltaY;
 
-                    // Clamp offsets
                     clampOffsets(offsetX, offsetY);
 
                     prevTouchX = touch.px;
@@ -326,21 +327,17 @@ int main() {
                     prevTouchX = touch.px;
                     prevTouchY = touch.py;
                 } else {
-                    // Interpolate between previous and current touch points
                     int steps = std::max(abs(touch.px - prevTouchX), abs(touch.py - prevTouchY));
                     for (int i = 0; i <= steps; i++) {
                         float t = (steps == 0) ? 0.0f : static_cast<float>(i) / steps;
                         int x = prevTouchX + (touch.px - prevTouchX) * t;
                         int y = prevTouchY + (touch.py - prevTouchY) * t;
                         
-                        // Convert touch coordinates to framebuffer coordinates
                         int FbX = x;
                         int FbY = y;
 
-                        // Draw point on local buffer
                         drawPointOnBuffer(buffer, fbWidth, fbHeight, FbX, FbY, 0, 0, 0);
 
-                        // Draw point on fullCanvas
                         int C_x = FbX + offsetX;
                         int C_y = FbY + offsetY;
                         if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight) {
@@ -351,7 +348,6 @@ int main() {
                         pointBuffer.push_back({C_x, C_y});
                     }
 
-                    // Send points to server if buffer is full
                     if (pointBuffer.size() >= 10) {
                         sendDrawBatchCommand(sock, pointBuffer, "#000000", 1);
                         pointBuffer.clear();
@@ -386,7 +382,7 @@ int main() {
         // Rendering
         if (fullCanvas) {
         for (int y = 0; y < fbHeight; y++) {
-            for (int x = 0; x < fbWidth; x++) {
+            for (int x = 0; x < fbWidth; x++) { 
                 int C_x = y + offsetX;
                 int C_y = (fbWidth - 1 - x) + offsetY;
                 if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight) {
