@@ -16,6 +16,8 @@
 #include <math.h>
 #include <algorithm>
 #include <zlib.h>
+#include <unordered_map>
+#include <vector>
 
 #define SOC_ALIGN 0x1000
 #define SOC_BUFFERSIZE 0x100000
@@ -30,10 +32,10 @@ struct DrawPoint
 struct Color
 {
     u8 r, g, b;
-} currentColor = {0, 0, 0}; // Black by default
+} currentColor = {255, 0, 0}; // Red by default
 
-int currentBrushSize = 1; // Default brush size
-int currentBrushShape = 0; // 0 for circle, 1 for square
+int currentBrushSize = 1;  // Default brush size
+int currentBrushShape = 0; // 0 for circle, 1 for square, 2 for antialiased circle
 
 const int UI_MARGIN_X = 20;
 const int UI_MARGIN_Y = 10;
@@ -123,6 +125,40 @@ static bool read_exact(int s, void *buf, size_t length)
     return true;
 }
 
+std::unordered_map<int, std::vector<float>> gaussianFalloffTables;
+
+std::vector<float> computeGaussianFalloff(int radius)
+{
+    float sigma = radius / 1.5f; // Adjust softness (larger = softer)
+    float twoSigmaSquared = 2.0f * sigma * sigma;
+
+    int diameter = 2 * radius + 1;
+    std::vector<float> table(diameter * diameter, 0.0f);
+
+    for (int y = -radius; y <= radius; y++)
+    {
+        for (int x = -radius; x <= radius; x++)
+        {
+            float distanceSquared = x * x + y * y;
+            if (distanceSquared <= radius * radius)
+            {
+                table[(y + radius) * diameter + (x + radius)] = exp(-distanceSquared / twoSigmaSquared);
+            }
+        }
+    }
+
+    return table;
+}
+
+void initializeGaussianFalloff(const std::vector<int> &brushSizes)
+{
+    for (int size : brushSizes)
+    {
+        int radius = size / 2;
+        gaussianFalloffTables[size] = computeGaussianFalloff(radius);
+    }
+}
+
 void writeColor(u8 *buffer, int idx, u8 r, u8 g, u8 b)
 {
     buffer[idx] = b;
@@ -135,21 +171,62 @@ void drawPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight, int x, int y, u8 r
     if (x >= 0 && x < fbWidth && y >= 0 && y < fbHeight)
     {
         int idx = 3 * (y * fbWidth + x);
-        buffer[idx] = r;     // Red (was Blue)
-        buffer[idx + 1] = g; // Green (unchanged)
-        buffer[idx + 2] = b; // Blue (was Red)
+        buffer[idx] = r;     // Red
+        buffer[idx + 1] = g; // Green
+        buffer[idx + 2] = b; // Blue
     }
 }
+u8 clampColor(float colorValue)
+{
+    return static_cast<u8>(std::max(0.0f, std::min(255.0f, colorValue)));
+}
 
-void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, int size, int shape, u8 r, u8 g, u8 b) {
-    for (int y = -size/2; y <= size/2; y++) {
-        for (int x = -size/2; x <= size/2; x++) {
-            if (shape == 0) { // Circle
-                if (x*x + y*y <= (size/2)*(size/2)) {
+void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, int size, int shape, u8 r, u8 g, u8 b)
+{
+    for (int y = -size / 2; y <= size / 2; y++)
+    {
+        for (int x = -size / 2; x <= size / 2; x++)
+        {
+            if (shape == 0)
+            { // Circle
+                if (x * x + y * y <= (size / 2) * (size / 2))
+                {
                     drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
                 }
-            } else { // Square
+            }
+            else if (shape == 1)
+            { // Square
                 drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
+            }
+            else if (shape == 2) // Gaussian Soft Brush
+            {
+                int radius = size / 2;
+                const std::vector<float> &falloffTable = gaussianFalloffTables[size];
+                int diameter = 2 * radius + 1;
+
+                for (int y = -radius; y <= radius; y++)
+                {
+                    for (int x = -radius; x <= radius; x++)
+                    {
+                        if (centerY + y < 0 || centerY + y >= fbHeight || centerX + x < 0 || centerX + x >= fbWidth)
+                            continue;
+
+                        float intensity = falloffTable[(y + radius) * diameter + (x + radius)];
+                        if (intensity <= 0.0f)
+                            continue;
+
+                        int idx = 3 * ((centerY + y) * fbWidth + (centerX + x));
+                        u8 baseB = buffer[idx + 2];
+                        u8 baseG = buffer[idx + 1];
+                        u8 baseR = buffer[idx];
+
+                        u8 blendedR = std::round(r * intensity + baseR * (1.0f - intensity));
+                        u8 blendedG = std::round(g * intensity + baseG * (1.0f - intensity));
+                        u8 blendedB = std::round(b * intensity + baseB * (1.0f - intensity));
+
+                        drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, blendedR, blendedG, blendedB);
+                    }
+                }
             }
         }
     }
@@ -206,28 +283,44 @@ void HSVtoRGB(float h, float s, float v, float &r, float &g, float &b)
 
     switch (i % 6)
     {
-    case 0: r = v, g = t, b = p; break;
-    case 1: r = q, g = v, b = p; break;
-    case 2: r = p, g = v, b = t; break;
-    case 3: r = p, g = q, b = v; break;
-    case 4: r = t, g = p, b = v; break;
-    case 5: r = v, g = p, b = q; break;
+    case 0:
+        r = v, g = t, b = p;
+        break;
+    case 1:
+        r = q, g = v, b = p;
+        break;
+    case 2:
+        r = p, g = v, b = t;
+        break;
+    case 3:
+        r = p, g = q, b = v;
+        break;
+    case 4:
+        r = t, g = p, b = v;
+        break;
+    case 5:
+        r = v, g = p, b = q;
+        break;
     }
 }
 
-void drawHSVSliders(u8 *framebuffer, int screenWidth, int screenHeight, float &hue, float &saturation, float &value) {
+void drawHSVSliders(u8 *framebuffer, int screenWidth, int screenHeight, float &hue, float &saturation, float &value)
+{
     int sliderHeight = 280;
     int sliderWidth = 20;
     int startX[] = {screenWidth - 140, screenWidth - 170, screenWidth - 200};
 
-    for (int i = 0; i < 3; i++) {
-        for (int y = 20; y < 20 + sliderHeight; y++) {
+    for (int i = 0; i < 3; i++)
+    {
+        for (int y = 20; y < 20 + sliderHeight; y++)
+        {
             float h = (i == 0) ? (float)(y - 20) / sliderHeight : hue;
             float s = (i == 1) ? (float)(y - 20) / sliderHeight : saturation;
             float v = (i == 2) ? (float)(y - 20) / sliderHeight : value;
             float r, g, b;
             HSVtoRGB(h, s, v, r, g, b);
-            for (int x = startX[i] - sliderWidth; x < startX[i]; x++) {
+            for (int x = startX[i] - sliderWidth; x < startX[i]; x++)
+            {
                 int idx = 3 * (x + y * screenWidth);
                 framebuffer[idx] = b * 255;
                 framebuffer[idx + 1] = g * 255;
@@ -237,66 +330,54 @@ void drawHSVSliders(u8 *framebuffer, int screenWidth, int screenHeight, float &h
     }
 
     // Draw slider indicators
-    for (int i = 0; i < 3; i++) {
-        float indicatorValue = (i == 0) ? hue : (i == 1) ? saturation : value;
+    for (int i = 0; i < 3; i++)
+    {
+        float indicatorValue = (i == 0) ? hue : (i == 1) ? saturation
+                                                         : value;
         int indicatorY = 20 + (indicatorValue * sliderHeight);
-        for (int x = startX[i] - sliderWidth - 5; x < startX[i] + 5; x++) {
+        for (int x = startX[i] - sliderWidth - 5; x < startX[i] + 5; x++)
+        {
             int idx = 3 * (x + indicatorY * screenWidth);
             framebuffer[idx] = framebuffer[idx + 1] = framebuffer[idx + 2] = 0; // Black indicator
         }
     }
 }
 
-void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight) {
+void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
+{
     std::vector<int> brushSizes = {1, 2, 3, 5, 7};
     std::vector<int> brushPositions = {30, 60, 90, 120, 150};
 
-    for (size_t i = 0; i < brushSizes.size(); i++) {
+    for (size_t i = 0; i < brushSizes.size(); i++)
+    {
         int size = brushSizes[i];
         int y = brushPositions[i];
-        int x = screenWidth - 40;
 
         // Draw circular brush
-        for (int dx = -10; dx <= 10; dx++) {
-            for (int dy = -10; dy <= 10; dy++) {
-                if (dx * dx + dy * dy <= size * size) {
-                    int px = x + dx;
-                    int py = y + dy;
-                    if (px >= 0 && px < screenWidth && py >= 0 && py < screenHeight) {
-                        int idx = 3 * (px + py * screenWidth);
-                        framebuffer[idx] = 0; // Black circle
-                        framebuffer[idx + 1] = 0;
-                        framebuffer[idx + 2] = 0;
-                    }
-                }
-            }
-        }
+        int x = screenWidth - 40;
+        drawBrush(framebuffer, screenWidth, screenHeight, x, y, size, 0, 0, 0, 0);
 
         // Draw square brush
         int squareX = screenWidth - 70;
-        int squareY = y;
-        for (int dx = -size/2; dx <= size/2; dx++) {
-            for (int dy = -size/2; dy <= size/2; dy++) {
-                int px = squareX + dx;
-                int py = squareY + dy;
-                if (px >= 0 && px < screenWidth && py >= 0 && py < screenHeight) {
-                    int idx = 3 * (px + py * screenWidth);
-                    framebuffer[idx] = 0; // Black square
-                    framebuffer[idx + 1] = 0;
-                    framebuffer[idx + 2] = 0;
-                }
-            }
-        }
+        drawBrush(framebuffer, screenWidth, screenHeight, squareX, y, size, 1, 0, 0, 0);
+
+        // Draw antialiased circular brush
+        int antialiasedX = screenWidth - 100;
+        drawBrush(framebuffer, screenWidth, screenHeight, antialiasedX, y, size, 2, 0, 0, 0);
 
         // Highlight the selected brush size and shape
-        if (currentBrushSize == size) {
-            int highlightX = (currentBrushShape == 0) ? x : squareX;
-            int highlightY = (currentBrushShape == 0) ? y : squareY;
-            for (int angle = 0; angle < 360; angle++) {
+        if (currentBrushSize == size)
+        {
+            int highlightX = (currentBrushShape == 0) ? x : (currentBrushShape == 1) ? squareX
+                                                                                     : antialiasedX;
+            int highlightY = y;
+            for (int angle = 0; angle < 360; angle++)
+            {
                 float rad = angle * M_PI / 180.0f;
                 int px = highlightX + 12 * cos(rad);
                 int py = highlightY + 12 * sin(rad);
-                if (px >= 0 && px < screenWidth && py >= 0 && py < screenHeight) {
+                if (px >= 0 && px < screenWidth && py >= 0 && py < screenHeight)
+                {
                     int idx = 3 * (px + py * screenWidth);
                     framebuffer[idx] = 255; // Yellow border
                     framebuffer[idx + 1] = 255;
@@ -307,9 +388,12 @@ void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight) {
     }
 }
 
-void drawUIBackground(u8 *framebuffer, int screenWidth, int screenHeight) {
-    for (int x = screenWidth - 230; x < screenWidth - 20; x++) {
-        for (int y = 10; y < 310; y++) {
+void drawUIBackground(u8 *framebuffer, int screenWidth, int screenHeight)
+{
+    for (int x = screenWidth - 230; x < screenWidth - 20; x++)
+    {
+        for (int y = 10; y < 310; y++)
+        {
             int idx = 3 * (x + y * screenWidth);
             framebuffer[idx] = UI_BG_COLOR_B;
             framebuffer[idx + 1] = UI_BG_COLOR_G;
@@ -318,16 +402,21 @@ void drawUIBackground(u8 *framebuffer, int screenWidth, int screenHeight) {
     }
 }
 
-void drawCurrentSelection(u8 *framebuffer, int screenWidth, int screenHeight, Color color, bool colorPickerActive) {
-    if (colorPickerActive) {
+void drawCurrentSelection(u8 *framebuffer, int screenWidth, int screenHeight, Color color, bool colorPickerActive)
+{
+    if (colorPickerActive)
+    {
         // Draw color rectangle
         int rectSize = 100;
         int rectX = screenWidth - 30 - rectSize;
         int rectY = 200;
 
-        for (int x = rectX; x < rectX + rectSize; x++) {
-            for (int y = rectY; y < rectY + rectSize; y++) {
-                if (x >= 0 && x < screenWidth && y >= 0 && y < screenHeight) {
+        for (int x = rectX; x < rectX + rectSize; x++)
+        {
+            for (int y = rectY; y < rectY + rectSize; y++)
+            {
+                if (x >= 0 && x < screenWidth && y >= 0 && y < screenHeight)
+                {
                     int idx = 3 * (x + y * screenWidth);
                     framebuffer[idx] = color.b;
                     framebuffer[idx + 1] = color.g;
@@ -335,15 +424,20 @@ void drawCurrentSelection(u8 *framebuffer, int screenWidth, int screenHeight, Co
                 }
             }
         }
-    } else {
+    }
+    else
+    {
         // Draw small color rectangle when color picker is not active
         int rectSize = 10;
         int rectX = 10;
         int rectY = 300;
 
-        for (int x = rectX; x < rectX + rectSize; x++) {
-            for (int y = rectY; y < rectY + rectSize; y++) {
-                if (x >= 0 && x < screenWidth && y >= 0 && y < screenHeight) {
+        for (int x = rectX; x < rectX + rectSize; x++)
+        {
+            for (int y = rectY; y < rectY + rectSize; y++)
+            {
+                if (x >= 0 && x < screenWidth && y >= 0 && y < screenHeight)
+                {
                     int idx = 3 * (x + y * screenWidth);
                     framebuffer[idx] = color.b;
                     framebuffer[idx + 1] = color.g;
@@ -377,13 +471,15 @@ static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint> &points,
     send(sock, packet, 7 + packet[6] * 4, 0);
 }
 
-void handleHexColorInput() {
+void handleHexColorInput()
+{
     SwkbdState swkbd;
     char inputText[8];
     swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, -1);
     swkbdSetHintText(&swkbd, "Enter Hex Color (e.g., FF00FF)");
 
-    if (swkbdInputText(&swkbd, inputText, sizeof(inputText)) == SWKBD_BUTTON_CONFIRM) {
+    if (swkbdInputText(&swkbd, inputText, sizeof(inputText)) == SWKBD_BUTTON_CONFIRM)
+    {
         unsigned int hexValue;
         sscanf(inputText, "%x", &hexValue);
 
@@ -394,7 +490,8 @@ void handleHexColorInput() {
 }
 
 // Function to decompress data
-bool decompressData(const u8* compressedData, size_t compressedSize, u8* decompressedData, size_t decompressedSize) {
+bool decompressData(const u8 *compressedData, size_t compressedSize, u8 *decompressedData, size_t decompressedSize)
+{
     z_stream strm;
     strm.zalloc = Z_NULL;
     strm.zfree = Z_NULL;
@@ -402,12 +499,13 @@ bool decompressData(const u8* compressedData, size_t compressedSize, u8* decompr
     strm.avail_in = 0;
     strm.next_in = Z_NULL;
 
-    if (inflateInit(&strm) != Z_OK) {
+    if (inflateInit(&strm) != Z_OK)
+    {
         return false;
     }
 
     strm.avail_in = compressedSize;
-    strm.next_in = (Bytef*)compressedData;
+    strm.next_in = (Bytef *)compressedData;
     strm.avail_out = decompressedSize;
     strm.next_out = decompressedData;
 
@@ -463,6 +561,9 @@ int main()
         printf("Connected!\n");
     }
 
+    std::vector<int> brushSizes = {1, 2, 3, 5, 7}; // Define your brush sizes
+    initializeGaussianFalloff(brushSizes);
+
     u16 fbWidth, fbHeight;
     u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fbWidth, &fbHeight);
     if (!fb)
@@ -473,7 +574,7 @@ int main()
     }
 
     printf("fbWidth=%u, fbHeight=%u\n", fbWidth, fbHeight);
-    printf("Touch bottom screen to draw. \nSTART to refresh canvas and SELECT to exit.\nHold LEFT D-Pad for pan.\n");
+    printf("Touch bottom screen to draw. \nSTART to refresh canvas and SELECT to exit.\nHold LEFT D-Pad or A button for pan.\nToggle the color picker with DOWN D-Pad or B button.\n Hold UP D-Pad or X button and tap to sample a color!\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
     u8 *buffer = (u8 *)malloc(bufferSize);
@@ -509,11 +610,11 @@ int main()
                 int compressedSize = atoi(sPtr + 17);
                 printf("Received canvas dimensions: W=%d, H=%d, Compressed Size=%d\n", canvasWidth, canvasHeight, compressedSize);
 
-                u8* compressedCanvas = (u8*)malloc(compressedSize);
+                u8 *compressedCanvas = (u8 *)malloc(compressedSize);
                 if (compressedCanvas && read_exact(sock, compressedCanvas, compressedSize))
                 {
                     canvasSize = canvasWidth * canvasHeight * 3;
-                    fullCanvas = (u8*)malloc(canvasSize);
+                    fullCanvas = (u8 *)malloc(canvasSize);
                     if (fullCanvas && decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize))
                     {
                         printf("Canvas decompressed successfully.\n");
@@ -551,8 +652,8 @@ int main()
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
-        ox = std::max(0, std::min(ox, canvasWidth - fbWidth));
-        oy = std::max(0, std::min(oy, canvasHeight - fbHeight));
+        ox = std::max(-20, std::min(ox, canvasWidth - fbWidth));
+        oy = std::max(-20, std::min(oy, canvasHeight - fbHeight + 100));
     };
 
     while (aptMainLoop())
@@ -581,7 +682,7 @@ int main()
                     if (sPtr)
                     {
                         int compressedSize = atoi(sPtr + 17);
-                        u8* compressedCanvas = (u8*)malloc(compressedSize);
+                        u8 *compressedCanvas = (u8 *)malloc(compressedSize);
                         if (compressedCanvas && read_exact(sock, compressedCanvas, compressedSize))
                         {
                             if (decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize))
@@ -611,7 +712,7 @@ int main()
             }
         }
 
-        if (kDown & KEY_DDOWN)
+        if (kDown & (KEY_DDOWN | KEY_B))
         {
             colorPickerActive = !colorPickerActive;
             printf(colorPickerActive ? "Color picker activated\n" : "Color picker deactivated\n");
@@ -625,14 +726,40 @@ int main()
         touchPosition touch;
         hidTouchRead(&touch);
 
-        if (colorPickerActive && (kHeld & KEY_TOUCH)) {
-            if (touch.py >= 140 && touch.py < 160) {
+        // Eye Dropper functionality
+        if ((kHeld & KEY_DUP) || (kHeld & KEY_X))
+        {
+            if (kDown & KEY_TOUCH)
+            {
+                int touchX = touch.px + offsetX;
+                int touchY = touch.py + offsetY;
+
+                if (touchX >= 0 && touchX < canvasWidth && touchY >= 0 && touchY < canvasHeight)
+                {
+                    int idx = 3 * (touchY * canvasWidth + touchX);
+                    currentColor.r = fullCanvas[idx];
+                    currentColor.g = fullCanvas[idx + 1];
+                    currentColor.b = fullCanvas[idx + 2];
+
+                    printf("Color picked: R=%d, G=%d, B=%d\n", currentColor.r, currentColor.g, currentColor.b);
+                }
+            }
+        }
+
+        if (colorPickerActive && (kHeld & KEY_TOUCH))
+        {
+            if (touch.py >= 140 && touch.py < 160)
+            {
                 // Hue slider
                 hue = (float)(touch.px - 20) / 280;
-            } else if (touch.py >= 170 && touch.py < 190) {
+            }
+            else if (touch.py >= 170 && touch.py < 190)
+            {
                 // Saturation slider
                 saturation = (float)(touch.px - 20) / 280;
-            } else if (touch.py >= 200 && touch.py < 220) {
+            }
+            else if (touch.py >= 200 && touch.py < 220)
+            {
                 // Value slider
                 value = (float)(touch.px - 20) / 280;
             }
@@ -652,23 +779,34 @@ int main()
             // Check if touch is on brush size selectors
             std::vector<int> brushSizes = {1, 2, 3, 5, 7};
             std::vector<int> brushPositions = {30, 60, 90, 120, 150};
-            for (size_t i = 0; i < brushSizes.size(); i++) {
+            for (size_t i = 0; i < brushSizes.size(); i++)
+            {
                 int x = brushPositions[i];
-                if (touch.px >= x - 30 && touch.px <= x + 10) {
-                    if (touch.py >= 20 && touch.py <= 40) {
+                if (touch.px >= x - 30 && touch.px <= x + 10)
+                {
+                    if (touch.py >= 20 && touch.py <= 40)
+                    {
                         currentBrushSize = brushSizes[i];
                         currentBrushShape = 0; // Circle
                         break;
-                    } else if (touch.py >= 50 && touch.py <= 70) {
+                    }
+                    else if (touch.py >= 50 && touch.py <= 70)
+                    {
                         currentBrushSize = brushSizes[i];
                         currentBrushShape = 1; // Square
+                        break;
+                    }
+                    else if (touch.py >= 80 && touch.py <= 100)
+                    {
+                        currentBrushSize = brushSizes[i];
+                        currentBrushShape = 2; // Antialiased Circle
                         break;
                     }
                 }
             }
         }
 
-        if (kHeld & KEY_DLEFT)
+        if (kHeld & (KEY_DLEFT | KEY_A))
         {
             // Panning mode
             if (kHeld & KEY_TOUCH)
@@ -701,7 +839,7 @@ int main()
         {
             // Normal drawing mode
             if (kHeld & KEY_TOUCH)
-                {
+            {
                 if (prevTouchX == -1 && prevTouchY == -1)
                 {
                     prevTouchX = touch.px;
@@ -788,9 +926,9 @@ int main()
                     }
                     else
                     {
-                        // Draw white for areas outside the canvas
+                        // Draw a light gray color for areas outside the canvas
                         int bufferIdx = 3 * (y * fbWidth + x);
-                        buffer[bufferIdx] = buffer[bufferIdx + 1] = buffer[bufferIdx + 2] = 255;
+                        buffer[bufferIdx] = buffer[bufferIdx + 1] = buffer[bufferIdx + 2] = 240;
                     }
                 }
             }
@@ -800,18 +938,13 @@ int main()
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
         memcpy(fb, buffer, bufferSize);
 
-        // Draw color picker and current selection after canvas rendering
         if (colorPickerActive)
         {
-            // Draw UI background
             drawUIBackground(fb, fbWidth, fbHeight);
-
-            // Draw color picker and brush size selector
             drawHSVSliders(fb, fbWidth, fbHeight, hue, saturation, value);
             drawBrushSizeSelector(fb, fbWidth, fbHeight);
         }
 
-        // Draw current color and brush size on the bottom screen's top right
         drawCurrentSelection(fb, fbWidth, fbHeight, currentColor, colorPickerActive);
 
         gfxFlushBuffers();
