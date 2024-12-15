@@ -188,7 +188,7 @@ int main() {
     }
     atexit(socShutdown);
 
-    const char* server_ip = "10.0.0.166";
+    const char* server_ip = "38.45.65.90";
     int server_port = 3030;
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
