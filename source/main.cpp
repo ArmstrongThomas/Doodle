@@ -309,7 +309,7 @@ int main()
     consoleInit(GFX_TOP, NULL);
     UIState::init();
 
-    printf("3DS MultiUser Doodle App \n");
+    printf("3DS Collab Doodle\n");
 
     if (!NetworkManager::initialize())
     {
@@ -338,6 +338,7 @@ int main()
     }
 
     printf("fbWidth=%u, fbHeight=%u\n", fbWidth, fbHeight);
+    
     printf("Controls:\n"
            "- Touch the bottom screen to draw\n"
            "- START: Refresh canvas from server\n"

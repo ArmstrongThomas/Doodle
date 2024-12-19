@@ -40,7 +40,7 @@ bool NetworkManager::initialize() {
     sa.sin_port = htons(server_port);
     inet_pton(AF_INET, server_ip, &sa.sin_addr);
 
-    printf("Connecting to %s:%d...\n", server_ip, server_port);
+    printf("Connecting to server... ");
     if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         printf("Failed to connect: %d %s\n", errno, strerror(errno));
         close(sock);
