@@ -1,5 +1,3 @@
-# Contents of README.md
-
 # Doodle
 
 ## Overview
@@ -18,6 +16,9 @@ Doodle is a simple drawing application designed for the Nintendo 3DS platform. I
 - Hold UP D-pad and tap someone where on the canvas to sample that color!
 - Tap X to input a Hex Color code!
 
+## Server Information
+- Live Canvas: [http://server1.rpgwo.org:3000/](http://server1.rpgwo.org:3000/)
+- Canvas History: [http://server1.rpgwo.org/](http://server1.rpgwo.org/) (Updated hourly)
 
 ## Running the Application
 After building, you can run the application on a modified 3DS or using a 3DS emulator, like Citra.
