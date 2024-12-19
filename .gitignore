@@ -4,3 +4,5 @@
 *.elf
 *.smdh
 /.vscode
+citra.bat
+oldmain.cpp

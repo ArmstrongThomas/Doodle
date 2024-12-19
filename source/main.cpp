@@ -18,37 +18,12 @@
 #include <zlib.h>
 #include <unordered_map>
 #include <vector>
+#include "ui.h"
+#include "network.h"
 
-#define SOC_ALIGN 0x1000
-#define SOC_BUFFERSIZE 0x100000
-
-static u32 *SOC_buffer = NULL;
-static int sock = -1;
-
-struct DrawPoint
-{
-    int x, y;
-};
-struct Color
-{
-    u8 r, g, b;
-} currentColor = {255, 0, 0}; // Red by default
-
-int currentBrushSize = 1;  // Default brush size
-int currentBrushShape = 0; // 0 for circle, 1 for square, 2 for antialiased circle
-
-const int UI_MARGIN_X = 20;
-const int UI_MARGIN_Y = 10;
-const int UI_BG_COLOR_R = 200;
-const int UI_BG_COLOR_G = 200;
-const int UI_BG_COLOR_B = 200;
-
-// UI State
-bool colorPickerActive = false;
-std::vector<DrawPoint> pointBuffer;
-
-// HSV values
-float hue = 0.0f, saturation = 1.0f, value = 1.0f;
+Color currentColor = {255, 0, 0}; // Red by default
+int currentBrushSize = 1;
+int currentBrushShape = 0;
 
 static void failExit(const char *fmt, ...)
 {
@@ -66,63 +41,6 @@ static void failExit(const char *fmt, ...)
     }
     gfxExit();
     exit(0);
-}
-
-static void socShutdown()
-{
-    printf("Shutting down network...\n");
-    socExit();
-}
-
-static bool read_line(int s, char *buffer, size_t maxlen)
-{
-    int flags = fcntl(s, F_GETFL, 0);
-    fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
-
-    size_t pos = 0;
-    char c;
-    while (pos < maxlen - 1)
-    {
-        int ret = recv(s, &c, 1, 0);
-        if (ret <= 0)
-        {
-            fcntl(s, F_SETFL, flags);
-            return false;
-        }
-        if (c == '\n')
-        {
-            buffer[pos] = '\0';
-            fcntl(s, F_SETFL, flags);
-            return true;
-        }
-        buffer[pos++] = c;
-    }
-
-    fcntl(s, F_SETFL, flags);
-    buffer[pos] = '\0';
-    return true;
-}
-
-static bool read_exact(int s, void *buf, size_t length)
-{
-    int flags = fcntl(s, F_GETFL, 0);
-    fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
-
-    size_t received = 0;
-    char *ptr = (char *)buf;
-    while (received < length)
-    {
-        int ret = recv(s, ptr + received, length - received, 0);
-        if (ret <= 0)
-        {
-            fcntl(s, F_SETFL, flags);
-            return false;
-        }
-        received += ret;
-    }
-
-    fcntl(s, F_SETFL, flags);
-    return true;
 }
 
 std::unordered_map<int, std::vector<float>> gaussianFalloffTables;
@@ -273,76 +191,6 @@ void processDrawPacket(const uint8_t *packet, size_t length, u8 *buffer, int fbW
     }
 }
 
-void HSVtoRGB(float h, float s, float v, float &r, float &g, float &b)
-{
-    int i = int(h * 6);
-    float f = h * 6 - i;
-    float p = v * (1 - s);
-    float q = v * (1 - f * s);
-    float t = v * (1 - (1 - f) * s);
-
-    switch (i % 6)
-    {
-    case 0:
-        r = v, g = t, b = p;
-        break;
-    case 1:
-        r = q, g = v, b = p;
-        break;
-    case 2:
-        r = p, g = v, b = t;
-        break;
-    case 3:
-        r = p, g = q, b = v;
-        break;
-    case 4:
-        r = t, g = p, b = v;
-        break;
-    case 5:
-        r = v, g = p, b = q;
-        break;
-    }
-}
-
-void drawHSVSliders(u8 *framebuffer, int screenWidth, int screenHeight, float &hue, float &saturation, float &value)
-{
-    int sliderHeight = 280;
-    int sliderWidth = 20;
-    int startX[] = {screenWidth - 140, screenWidth - 170, screenWidth - 200};
-
-    for (int i = 0; i < 3; i++)
-    {
-        for (int y = 20; y < 20 + sliderHeight; y++)
-        {
-            float h = (i == 0) ? (float)(y - 20) / sliderHeight : hue;
-            float s = (i == 1) ? (float)(y - 20) / sliderHeight : saturation;
-            float v = (i == 2) ? (float)(y - 20) / sliderHeight : value;
-            float r, g, b;
-            HSVtoRGB(h, s, v, r, g, b);
-            for (int x = startX[i] - sliderWidth; x < startX[i]; x++)
-            {
-                int idx = 3 * (x + y * screenWidth);
-                framebuffer[idx] = b * 255;
-                framebuffer[idx + 1] = g * 255;
-                framebuffer[idx + 2] = r * 255;
-            }
-        }
-    }
-
-    // Draw slider indicators
-    for (int i = 0; i < 3; i++)
-    {
-        float indicatorValue = (i == 0) ? hue : (i == 1) ? saturation
-                                                         : value;
-        int indicatorY = 20 + (indicatorValue * sliderHeight);
-        for (int x = startX[i] - sliderWidth - 5; x < startX[i] + 5; x++)
-        {
-            int idx = 3 * (x + indicatorY * screenWidth);
-            framebuffer[idx] = framebuffer[idx + 1] = framebuffer[idx + 2] = 0; // Black indicator
-        }
-    }
-}
-
 void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
 {
     std::vector<int> brushSizes = {1, 2, 3, 5, 7};
@@ -382,66 +230,6 @@ void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
                     framebuffer[idx] = 255; // Yellow border
                     framebuffer[idx + 1] = 255;
                     framebuffer[idx + 2] = 0;
-                }
-            }
-        }
-    }
-}
-
-void drawUIBackground(u8 *framebuffer, int screenWidth, int screenHeight)
-{
-    for (int x = screenWidth - 230; x < screenWidth - 20; x++)
-    {
-        for (int y = 10; y < 310; y++)
-        {
-            int idx = 3 * (x + y * screenWidth);
-            framebuffer[idx] = UI_BG_COLOR_B;
-            framebuffer[idx + 1] = UI_BG_COLOR_G;
-            framebuffer[idx + 2] = UI_BG_COLOR_R;
-        }
-    }
-}
-
-void drawCurrentSelection(u8 *framebuffer, int screenWidth, int screenHeight, Color color, bool colorPickerActive)
-{
-    if (colorPickerActive)
-    {
-        // Draw color rectangle
-        int rectSize = 100;
-        int rectX = screenWidth - 30 - rectSize;
-        int rectY = 200;
-
-        for (int x = rectX; x < rectX + rectSize; x++)
-        {
-            for (int y = rectY; y < rectY + rectSize; y++)
-            {
-                if (x >= 0 && x < screenWidth && y >= 0 && y < screenHeight)
-                {
-                    int idx = 3 * (x + y * screenWidth);
-                    framebuffer[idx] = color.b;
-                    framebuffer[idx + 1] = color.g;
-                    framebuffer[idx + 2] = color.r;
-                }
-            }
-        }
-    }
-    else
-    {
-        // Draw small color rectangle when color picker is not active
-        int rectSize = 10;
-        int rectX = 10;
-        int rectY = 300;
-
-        for (int x = rectX; x < rectX + rectSize; x++)
-        {
-            for (int y = rectY; y < rectY + rectSize; y++)
-            {
-                if (x >= 0 && x < screenWidth && y >= 0 && y < screenHeight)
-                {
-                    int idx = 3 * (x + y * screenWidth);
-                    framebuffer[idx] = color.b;
-                    framebuffer[idx + 1] = color.g;
-                    framebuffer[idx + 2] = color.r;
                 }
             }
         }
@@ -519,46 +307,22 @@ int main()
 {
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
+    UIState::init();
 
     printf("3DS MultiUser Doodle App \n");
 
-    SOC_buffer = (u32 *)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
-    if (SOC_buffer == NULL)
+    if (!NetworkManager::initialize())
     {
-        failExit("memalign: failed to allocate\n");
+        // Handle error
+        return 1;
     }
+    atexit(NetworkManager::shutdown);
 
-    if (socInit(SOC_buffer, SOC_BUFFERSIZE) != 0)
-    {
-        failExit("socInit failed\n");
-    }
-    atexit(socShutdown);
-
-    const char *server_ip = "38.45.65.90";
-    int server_port = 3030;
-
-    sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = NetworkManager::getSocket();
     if (sock < 0)
     {
-        failExit("socket: %d %s\n", errno, strerror(errno));
-    }
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_ip, &sa.sin_addr);
-
-    printf("Connecting to %s:%d...\n", server_ip, server_port);
-    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0)
-    {
-        printf("Failed to connect: %d %s\n", errno, strerror(errno));
-        close(sock);
-        sock = -1;
-    }
-    else
-    {
-        printf("Connected!\n");
+        failExit("No valid socket connection\n");
+        return 1;
     }
 
     std::vector<int> brushSizes = {1, 2, 3, 5, 7}; // Define your brush sizes
@@ -574,7 +338,14 @@ int main()
     }
 
     printf("fbWidth=%u, fbHeight=%u\n", fbWidth, fbHeight);
-    printf("Touch bottom screen to draw. \nSTART to refresh canvas and SELECT to exit.\nHold LEFT D-Pad or A button for pan.\nToggle the color picker with DOWN D-Pad or B button.\n Hold UP D-Pad or X button and tap to sample a color!\n");
+    printf("Controls:\n"
+           "- Touch the bottom screen to draw\n"
+           "- START: Refresh canvas from server\n"
+           "- SELECT: Exit\n"
+           "- Hold LEFT/A + stylus: Pan viewport\n"
+           "- DOWN/B: Toggle Color Picker\n"
+           "- Hold UP + tap: Sample color\n"
+           "- X: Input Hex color code\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
     u8 *buffer = (u8 *)malloc(bufferSize);
@@ -594,7 +365,7 @@ int main()
     if (sock >= 0)
     {
         char line[1024];
-        if (!read_line(sock, line, sizeof(line)))
+        if (!NetworkManager::readLine(sock, line, sizeof(line)))
         {
             printf("Failed to read init line.\n");
         }
@@ -611,7 +382,7 @@ int main()
                 printf("Received canvas dimensions: W=%d, H=%d, Compressed Size=%d\n", canvasWidth, canvasHeight, compressedSize);
 
                 u8 *compressedCanvas = (u8 *)malloc(compressedSize);
-                if (compressedCanvas && read_exact(sock, compressedCanvas, compressedSize))
+                if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, compressedSize))
                 {
                     canvasSize = canvasWidth * canvasHeight * 3;
                     fullCanvas = (u8 *)malloc(canvasSize);
@@ -676,14 +447,14 @@ int main()
                 send(sock, request, strlen(request), 0);
 
                 char response[1024];
-                if (read_line(sock, response, sizeof(response)) && strstr(response, "compressedCanvas"))
+                if (NetworkManager::readLine(sock, response, sizeof(response)) && strstr(response, "compressedCanvas"))
                 {
                     char *sPtr = strstr(response, "\"compressedSize\":");
                     if (sPtr)
                     {
                         int compressedSize = atoi(sPtr + 17);
                         u8 *compressedCanvas = (u8 *)malloc(compressedSize);
-                        if (compressedCanvas && read_exact(sock, compressedCanvas, compressedSize))
+                        if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, compressedSize))
                         {
                             if (decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize))
                             {
@@ -714,8 +485,8 @@ int main()
 
         if (kDown & (KEY_DDOWN | KEY_B))
         {
-            colorPickerActive = !colorPickerActive;
-            printf(colorPickerActive ? "Color picker activated\n" : "Color picker deactivated\n");
+            UIState::toggleColorPicker();
+            printf(UIState::isColorPickerActive() ? "Color picker activated\n" : "Color picker deactivated\n");
         }
 
         if (kDown & KEY_X)
@@ -746,32 +517,33 @@ int main()
             }
         }
 
-        if (colorPickerActive && (kHeld & KEY_TOUCH))
+        if (UIState::isColorPickerActive() && (kHeld & KEY_TOUCH))
         {
+            float h, s, v;
+            UIState::getHSV(h, s, v);
+
             if (touch.py >= 140 && touch.py < 160)
             {
-                // Hue slider
-                hue = (float)(touch.px - 20) / 280;
+                h = (float)(touch.px - 20) / 280;
             }
             else if (touch.py >= 170 && touch.py < 190)
             {
-                // Saturation slider
-                saturation = (float)(touch.px - 20) / 280;
+                s = (float)(touch.px - 20) / 280;
             }
             else if (touch.py >= 200 && touch.py < 220)
             {
-                // Value slider
-                value = (float)(touch.px - 20) / 280;
+                v = (float)(touch.px - 20) / 280;
             }
 
-            // Clamp values
-            hue = std::max(0.0f, std::min(1.0f, hue));
-            saturation = std::max(0.0f, std::min(1.0f, saturation));
-            value = std::max(0.0f, std::min(1.0f, value));
+            h = std::max(0.0f, std::min(1.0f, h));
+            s = std::max(0.0f, std::min(1.0f, s));
+            v = std::max(0.0f, std::min(1.0f, v));
+
+            UIState::updateHSV(h, s, v);
 
             // Convert HSV to RGB
             float r, g, b;
-            HSVtoRGB(hue, saturation, value, r, g, b);
+            UIState::HSVtoRGB(h, s, v, r, g, b);
             currentColor.r = r * 255;
             currentColor.g = g * 255;
             currentColor.b = b * 255;
@@ -835,7 +607,7 @@ int main()
                 prevTouchX = prevTouchY = -1;
             }
         }
-        else if (!colorPickerActive)
+        else if (!UIState::isColorPickerActive())
         {
             // Normal drawing mode
             if (kHeld & KEY_TOUCH)
@@ -861,17 +633,19 @@ int main()
                         int C_y = y + offsetY;
                         if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight)
                         {
-                            // Use currentColor here too
-                            drawBrush(fullCanvas, canvasWidth, canvasHeight, C_x, C_y, currentBrushSize, currentBrushShape, currentColor.r, currentColor.g, currentColor.b);
+                            drawBrush(fullCanvas, canvasWidth, canvasHeight, C_x, C_y,
+                                      currentBrushSize, currentBrushShape,
+                                      currentColor.r, currentColor.g, currentColor.b);
                         }
 
-                        pointBuffer.push_back({C_x, C_y});
+                        UIState::addPoint(C_x, C_y);
                     }
 
-                    if (pointBuffer.size() >= 10)
+                    if (UIState::getPoints().size() >= 10)
                     {
-                        sendDrawBatchCommand(sock, pointBuffer, currentColor, currentBrushSize, currentBrushShape);
-                        pointBuffer.clear();
+                        sendDrawBatchCommand(sock, UIState::getPoints(), currentColor,
+                                             currentBrushSize, currentBrushShape);
+                        UIState::clearPoints();
                     }
 
                     prevTouchX = touch.px;
@@ -881,10 +655,11 @@ int main()
             else
             {
                 // Stylus released
-                if (!pointBuffer.empty())
+                if (!UIState::getPoints().empty())
                 {
-                    sendDrawBatchCommand(sock, pointBuffer, currentColor, currentBrushSize, currentBrushShape);
-                    pointBuffer.clear();
+                    sendDrawBatchCommand(sock, UIState::getPoints(), currentColor,
+                                         currentBrushSize, currentBrushShape);
+                    UIState::clearPoints();
                 }
                 prevTouchX = prevTouchY = -1;
             }
@@ -938,14 +713,16 @@ int main()
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
         memcpy(fb, buffer, bufferSize);
 
-        if (colorPickerActive)
+        if (UIState::isColorPickerActive())
         {
-            drawUIBackground(fb, fbWidth, fbHeight);
-            drawHSVSliders(fb, fbWidth, fbHeight, hue, saturation, value);
+            UIInterface::drawUIBackground(fb, fbWidth, fbHeight);
+            float h, s, v;
+            UIState::getHSV(h, s, v);
+            UIInterface::drawHSVSliders(fb, fbWidth, fbHeight, h, s, v);
             drawBrushSizeSelector(fb, fbWidth, fbHeight);
         }
 
-        drawCurrentSelection(fb, fbWidth, fbHeight, currentColor, colorPickerActive);
+        UIInterface::drawCurrentSelection(fb, fbWidth, fbHeight, currentColor);
 
         gfxFlushBuffers();
         gfxSwapBuffers();
