@@ -4,12 +4,6 @@
 #include <malloc.h>
 #include <cstdlib>
 #include <stdarg.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -17,7 +11,6 @@
 #include <algorithm>
 #include <zlib.h>
 #include <unordered_map>
-#include <vector>
 #include "ui.h"
 #include "network.h"
 
@@ -335,10 +328,7 @@ int main()
         printf("Failed to get framebuffer\n");
         gfxExit();
         return 1;
-    }
-
-    printf("fbWidth=%u, fbHeight=%u\n", fbWidth, fbHeight);
-    
+    }    
     printf("Controls:\n"
            "- Touch the bottom screen to draw\n"
            "- START: Refresh canvas from server\n"
