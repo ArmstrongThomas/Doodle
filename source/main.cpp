@@ -427,50 +427,88 @@ int main()
         if (kDown & KEY_SELECT)
         {
             printf("Select key pressed. Exiting...\n");
+            
+            // Clear any pending points
+            UIState::clearPoints();
+            
+            // Ensure proper disconnection
+            NetworkManager::disconnect();
+            
+            // Wait briefly to ensure disconnection completes
+            for (int i = 0; i < 30; i++) {
+                gspWaitForVBlank();
+            }
+            
             break;
         }
 
         if (kDown & KEY_START)
         {
-            if (sock >= 0)
-            {
-                char request[] = "getCanvas\n";
-                send(sock, request, strlen(request), 0);
+            printf("Refreshing canvas from server...\n");
+            if (!NetworkManager::ensureConnected()) {
+                printf("Cannot refresh canvas - connection failed!\n");
+                continue;
+            }
 
-                char response[1024];
-                if (NetworkManager::readLine(sock, response, sizeof(response)) && strstr(response, "compressedCanvas"))
-                {
-                    char *sPtr = strstr(response, "\"compressedSize\":");
-                    if (sPtr)
-                    {
-                        int compressedSize = atoi(sPtr + 17);
-                        u8 *compressedCanvas = (u8 *)malloc(compressedSize);
-                        if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, compressedSize))
-                        {
-                            if (decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize))
-                            {
-                                printf("Canvas refreshed from server.\n");
-                            }
-                            else
-                            {
-                                printf("Failed to decompress canvas data.\n");
-                            }
-                            free(compressedCanvas);
-                        }
-                        else
-                        {
-                            printf("Failed to read compressed canvas data.\n");
-                        }
-                    }
-                    else
-                    {
-                        printf("Invalid response from server.\n");
-                    }
+            char request[] = "getCanvas\n";
+            if (send(NetworkManager::getSocket(), request, strlen(request), 0) <= 0) {
+                printf("Failed to send refresh request. Attempting to reconnect...\n");
+                if (!NetworkManager::reconnect()) {
+                    printf("Reconnection failed. Please try again later.\n");
+                    continue;
                 }
-                else
-                {
-                    printf("Invalid response from server.\n");
+                // Retry sending after reconnection
+                if (send(NetworkManager::getSocket(), request, strlen(request), 0) <= 0) {
+                    printf("Failed to send refresh request even after reconnection.\n");
+                    continue;
                 }
+            }
+
+            char response[1024];
+            if (!NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response))) {
+                printf("Failed to read server response.\n");
+                continue;
+            }
+
+            if (!strstr(response, "compressedCanvas")) {
+                printf("Invalid response format from server: %s\n", response);
+                continue;
+            }
+
+            char *sPtr = strstr(response, "\"compressedSize\":");
+            if (!sPtr) {
+                printf("Missing compressed size in server response.\n");
+                continue;
+            }
+
+            int compressedSize = atoi(sPtr + 17);
+            if (compressedSize <= 0 || compressedSize > 10000000) { // Sanity check for size
+                printf("Invalid compressed size: %d\n", compressedSize);
+                continue;
+            }
+
+            u8 *compressedCanvas = (u8 *)malloc(compressedSize);
+            if (!compressedCanvas) {
+                printf("Failed to allocate memory for compressed canvas.\n");
+                continue;
+            }
+
+            bool success = false;
+            if (NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, compressedSize)) {
+                if (decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize)) {
+                    printf("Canvas refreshed successfully!\n");
+                    success = true;
+                } else {
+                    printf("Failed to decompress canvas data.\n");
+                }
+            } else {
+                printf("Failed to read compressed canvas data.\n");
+            }
+
+            free(compressedCanvas);
+            
+            if (!success) {
+                printf("Canvas refresh failed. Try again?\n");
             }
         }
 
@@ -634,6 +672,13 @@ int main()
 
                     if (UIState::getPoints().size() >= 10)
                     {
+                        if (!NetworkManager::checkConnection()) {
+                            printf("Connection lost while drawing! Attempting to reconnect...\n");
+                            if (!NetworkManager::reconnect()) {
+                                UIState::clearPoints(); // Clear points if reconnect failed
+                                continue;
+                            }
+                        }
                         sendDrawBatchCommand(sock, UIState::getPoints(), currentColor,
                                              currentBrushSize, currentBrushShape);
                         UIState::clearPoints();
@@ -648,6 +693,13 @@ int main()
                 // Stylus released
                 if (!UIState::getPoints().empty())
                 {
+                    if (!NetworkManager::checkConnection()) {
+                        printf("Connection lost while drawing! Attempting to reconnect...\n");
+                        if (!NetworkManager::reconnect()) {
+                            UIState::clearPoints(); // Clear points if reconnect failed
+                            continue;
+                        }
+                    }
                     sendDrawBatchCommand(sock, UIState::getPoints(), currentColor,
                                          currentBrushSize, currentBrushShape);
                     UIState::clearPoints();

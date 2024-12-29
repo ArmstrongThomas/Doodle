@@ -19,6 +19,9 @@ class NetworkManager
 private:
     static u32 *SOC_buffer;
     static int sock;
+    static bool isConnected;
+    static const char* SERVER_DOMAIN;
+    static const char* SERVER_PORT;
 
 public:
     static bool initialize();
@@ -27,6 +30,12 @@ public:
     static bool readExact(int s, void *buf, size_t length);
     static int getSocket() { return sock; }
     static void setSocket(int s) { sock = s; }
+    static bool disconnect();
+    static bool isSocketConnected() { return isConnected; }
+    static bool reconnect();
+    static bool connect(const char* server_domain, const char* server_port_str);
+    static bool checkConnection();
+    static bool ensureConnected();
 };
 
 #endif
