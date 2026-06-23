@@ -17,6 +17,14 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Server update checks with manifest, size, and SHA-256 verification.
 - App metadata/icon via SMDH, including the visible app version.
 
+## Screenshots
+
+<img width="325" height="392" alt="image" src="https://github.com/user-attachments/assets/bf6f6af4-396c-473d-bd6e-8dc747d2e07c" />
+<img width="320" height="386" alt="image" src="https://github.com/user-attachments/assets/764a0ff5-6994-46f2-b583-b112c4a5ef61" />
+<img width="321" height="389" alt="image" src="https://github.com/user-attachments/assets/f45f9464-cb0e-4d4b-9f0c-d0374a1a65e2" />
+
+
+
 ## Controls
 
 - Touch bottom screen: Draw.
@@ -89,7 +97,7 @@ Copy the built `.3dsx` to the SD card, or send it with `3dslink` while the Homeb
 For the current public build, use:
 
 ```text
-CollabDoodle-1.1.0.3dsx
+CollabDoodle-update.3dsx
 ```
 
 ## Updates
