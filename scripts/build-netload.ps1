@@ -14,6 +14,9 @@ Push-Location $root
 try {
     & 'C:\devkitPro\msys2\usr\bin\make.exe' clean
     & 'C:\devkitPro\msys2\usr\bin\make.exe'
+    $updatesDir = Join-Path (Split-Path -Parent $root) 'Doodle-Server\updates'
+    New-Item -ItemType Directory -Force -Path $updatesDir | Out-Null
+    Copy-Item -Force -Path (Join-Path $root 'Doodle.3dsx') -Destination (Join-Path $updatesDir 'CollabDoodle.3dsx')
     & 'C:\devkitPro\tools\bin\3dslink.exe' -a $Address -r $Retries Doodle.3dsx
 }
 finally {

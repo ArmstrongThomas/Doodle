@@ -10,8 +10,8 @@
 u32* NetworkManager::SOC_buffer = nullptr;
 int NetworkManager::sock = -1;
 bool NetworkManager::isConnected = false;
-const char* NetworkManager::SERVER_DOMAIN = "192.168.1.46";
-const char* NetworkManager::SERVER_PORT = "3030";
+const char* NetworkManager::SERVER_DOMAIN = SERVER_HOST;
+const char* NetworkManager::SERVER_PORT = SERVER_TCP_PORT;
 static const int IO_TIMEOUT_MS = 8000;
 static const int CONNECT_TIMEOUT_MS = 5000;
 static const int SOC_IN_PROGRESS = -26;

@@ -38,8 +38,12 @@ DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_TITLE	:=	Collab Doodle
-APP_DESCRIPTION	:=	Shared canvas drawing for Nintendo 3DS
+APP_VERSION	?=	1.1.0
+SERVER_HOST	?=	server1.rpgwo.org
+SERVER_TCP_PORT	?=	3030
+SERVER_HTTP_PORT	?=	3000
+APP_TITLE	:=	Collab Doodle v$(APP_VERSION)
+APP_DESCRIPTION	:=	Shared canvas drawing for Nintendo 3DS - v$(APP_VERSION)
 APP_AUTHOR	:=	Tommy
 ICON		:=	icon.png
 #ROMFS		:=	romfs
@@ -54,7 +58,12 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 
-CFLAGS	+=	$(INCLUDE) -D__3DS__
+CFLAGS	+=	$(INCLUDE) -D__3DS__ \
+			-DAPP_ID=\"collab-doodle\" \
+			-DAPP_VERSION=\"$(APP_VERSION)\" \
+			-DSERVER_HOST=\"$(SERVER_HOST)\" \
+			-DSERVER_TCP_PORT=\"$(SERVER_TCP_PORT)\" \
+			-DSERVER_HTTP_PORT=\"$(SERVER_HTTP_PORT)\"
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 

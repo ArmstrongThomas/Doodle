@@ -15,6 +15,9 @@ class Protocol {
 public:
     static bool parseCanvasMeta(const char *line, CanvasMeta &meta);
     static bool parseChannels(const char *line, char channels[][25], int maxChannels, int &count, char *currentChannel);
+    static bool parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
+                                    char *reason, size_t reasonSize);
+    static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
     static void buildUpdateRequest(char *buffer, size_t size);
 };

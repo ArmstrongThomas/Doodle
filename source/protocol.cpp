@@ -53,11 +53,11 @@ bool Protocol::parseChannels(const char *line, char channels[][25], int maxChann
     if (!ptr)
         return true;
     ptr += strlen("\"channels\":[");
-    while (*ptr && count < maxChannels)
+    while (*ptr && *ptr != ']' && count < maxChannels)
     {
-        while (*ptr && *ptr != '"')
+        while (*ptr && *ptr != ']' && *ptr != '"')
             ptr++;
-        if (!*ptr)
+        if (!*ptr || *ptr == ']')
             break;
         ptr++;
         const char *end = strchr(ptr, '"');
@@ -74,6 +74,23 @@ bool Protocol::parseChannels(const char *line, char channels[][25], int maxChann
     return true;
 }
 
+bool Protocol::parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
+                                   char *reason, size_t reasonSize)
+{
+    if (!line || !strstr(line, "\"type\":\"updateRequired\""))
+        return false;
+    jsonString(line, "\"latestVersion\":\"", latestVersion, latestVersionSize);
+    jsonString(line, "\"reason\":\"", reason, reasonSize);
+    return true;
+}
+
+void Protocol::buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported)
+{
+    snprintf(buffer, size,
+             "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":2,\"updaterSupported\":%s}\n",
+             appId, version, updaterSupported ? "true" : "false");
+}
+
 void Protocol::buildSwitchChannel(char *buffer, size_t size, const char *channel)
 {
     snprintf(buffer, size, "{\"type\":\"switchChannel\",\"channel\":\"%s\"}\n", channel);
@@ -81,5 +98,5 @@ void Protocol::buildSwitchChannel(char *buffer, size_t size, const char *channel
 
 void Protocol::buildUpdateRequest(char *buffer, size_t size)
 {
-    snprintf(buffer, size, "GET /api/updates/latest HTTP/1.0\r\nHost: server1.rpgwo.org\r\n\r\n");
+    snprintf(buffer, size, "GET /api/updates/latest HTTP/1.0\r\nHost: %s\r\n\r\n", SERVER_HOST);
 }

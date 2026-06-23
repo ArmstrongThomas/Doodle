@@ -17,8 +17,6 @@
 #include "protocol.h"
 #include "updater.h"
 
-#define APP_VERSION "1.0.0"
-
 Color currentColor = {255, 0, 0}; // Red by default
 int currentBrushSize = 1;
 int currentBrushShape = 0;
@@ -37,6 +35,187 @@ static void failExit(const char *fmt, ...)
         hidScanInput();
         if (hidKeysDown() & KEY_B)
             break;
+    }
+    gfxExit();
+    exit(0);
+}
+
+static bool sendClientHello(int sock)
+{
+    char hello[128];
+    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, true);
+    return sock >= 0 && send(sock, hello, strlen(hello), 0) > 0;
+}
+
+static void putPixel(u8 *fb, int width, int height, int x, int y, u8 r, u8 g, u8 b)
+{
+    if (!fb || x < 0 || y < 0 || x >= width || y >= height)
+        return;
+    int idx = 3 * (y * width + x);
+    fb[idx] = b;
+    fb[idx + 1] = g;
+    fb[idx + 2] = r;
+}
+
+static void putScreenPixel(u8 *fb, int fbWidth, int fbHeight, int screenX, int screenY, u8 r, u8 g, u8 b)
+{
+    int fbX = fbWidth - 1 - screenY;
+    int fbY = screenX;
+    putPixel(fb, fbWidth, fbHeight, fbX, fbY, r, g, b);
+}
+
+static void fillRect(u8 *fb, int width, int height, int x, int y, int w, int h, u8 r, u8 g, u8 b)
+{
+    for (int py = y; py < y + h; py++)
+        for (int px = x; px < x + w; px++)
+            putScreenPixel(fb, width, height, px, py, r, g, b);
+}
+
+static void drawMiniGlyph(u8 *fb, int width, int height, int x, int y, char c, u8 r, u8 g, u8 b)
+{
+    u8 glyph[7] = {0};
+    switch (c)
+    {
+        case 'A': { u8 g[7] = {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'B': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
+        case 'C': { u8 g[7] = {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'D': { u8 g[7] = {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
+        case 'E': { u8 g[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}; memcpy(glyph,g,7); break; }
+        case 'F': { u8 g[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 'G': { u8 g[7] = {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}; memcpy(glyph,g,7); break; }
+        case 'H': { u8 g[7] = {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'I': { u8 g[7] = {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case 'K': { u8 g[7] = {0x11,0x12,0x14,0x18,0x14,0x12,0x11}; memcpy(glyph,g,7); break; }
+        case 'L': { u8 g[7] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; memcpy(glyph,g,7); break; }
+        case 'M': { u8 g[7] = {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'N': { u8 g[7] = {0x11,0x19,0x15,0x13,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'O': { u8 g[7] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'P': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 'R': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; memcpy(glyph,g,7); break; }
+        case 'S': { u8 g[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
+        case 'T': { u8 g[7] = {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
+        case 'U': { u8 g[7] = {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'V': { u8 g[7] = {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}; memcpy(glyph,g,7); break; }
+        case 'W': { u8 g[7] = {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}; memcpy(glyph,g,7); break; }
+        case 'X': { u8 g[7] = {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'Y': { u8 g[7] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
+        case '0': { u8 g[7] = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case '1': { u8 g[7] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case '2': { u8 g[7] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}; memcpy(glyph,g,7); break; }
+        case '3': { u8 g[7] = {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
+        case '4': { u8 g[7] = {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}; memcpy(glyph,g,7); break; }
+        case '5': { u8 g[7] = {0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
+        case '6': { u8 g[7] = {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case '7': { u8 g[7] = {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}; memcpy(glyph,g,7); break; }
+        case '8': { u8 g[7] = {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case '9': { u8 g[7] = {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}; memcpy(glyph,g,7); break; }
+        case '.': { u8 g[7] = {0,0,0,0,0,0x0C,0x0C}; memcpy(glyph,g,7); break; }
+        case '-': { u8 g[7] = {0,0,0,0x1F,0,0,0}; memcpy(glyph,g,7); break; }
+        default: return;
+    }
+    for (int gy = 0; gy < 7; gy++)
+        for (int gx = 0; gx < 5; gx++)
+            if (glyph[gy] & (1 << (4 - gx)))
+                putScreenPixel(fb, width, height, x + gx, y + gy, r, g, b);
+}
+
+static void drawMiniText(u8 *fb, int width, int height, int x, int y, const char *text, u8 r, u8 g, u8 b)
+{
+    int cx = x;
+    while (*text)
+    {
+        char c = *text;
+        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+        if (c != ' ') drawMiniGlyph(fb, width, height, cx, y, c, r, g, b);
+        cx += 6;
+        text++;
+    }
+}
+
+static void drawStatusPanel(gfxScreen_t screen, const char *title, const char *line, int progress, int total)
+{
+    u16 w, h;
+    u8 *fb = gfxGetFramebuffer(screen, GFX_LEFT, &w, &h);
+    int screenWidth = h;
+    int screenHeight = w;
+    fillRect(fb, w, h, 0, 0, screenWidth, screenHeight, 24, 33, 38);
+    drawMiniText(fb, w, h, 34, 70, title, 245, 248, 250);
+    drawMiniText(fb, w, h, 34, 96, line, 180, 202, 212);
+    int barWidth = std::max(32, screenWidth - 68);
+    fillRect(fb, w, h, 34, 128, barWidth, 16, 58, 72, 80);
+    if (total > 0)
+    {
+        int filled = std::max(0, std::min(barWidth, progress * barWidth / total));
+        fillRect(fb, w, h, 34, 128, filled, 16, 13, 122, 117);
+    }
+
+    if (screen == GFX_TOP)
+    {
+        u16 rw, rh;
+        u8 *right = gfxGetFramebuffer(GFX_TOP, GFX_RIGHT, &rw, &rh);
+        if (right && rw == w && rh == h)
+            memcpy(right, fb, (size_t)w * h * 3);
+    }
+}
+
+static void drawStatusScreen(const char *title, const char *line, int progress, int total)
+{
+    drawStatusPanel(GFX_BOTTOM, title, line, progress, total);
+    gfxFlushBuffers();
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    gspWaitForVBlank();
+}
+
+static void drawPromptPanel(gfxScreen_t screen, const char *title, const char *line)
+{
+    u16 w, h;
+    u8 *fb = gfxGetFramebuffer(screen, GFX_LEFT, &w, &h);
+    int screenWidth = h;
+    int screenHeight = w;
+    fillRect(fb, w, h, 0, 0, screenWidth, screenHeight, 24, 33, 38);
+    drawMiniText(fb, w, h, 26, 70, title, 245, 248, 250);
+    drawMiniText(fb, w, h, 26, 96, line, 180, 202, 212);
+    drawMiniText(fb, w, h, 26, 138, "A DOWNLOAD", 94, 234, 212);
+    drawMiniText(fb, w, h, 26, 160, "B CANCEL", 255, 115, 115);
+}
+
+static void drawPromptScreen(const char *title, const char *line)
+{
+    drawPromptPanel(GFX_BOTTOM, title, line);
+    gfxFlushBuffers();
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    gspWaitForVBlank();
+}
+
+static bool waitForUpdateConfirm(const UpdateManifest &manifest)
+{
+    while (aptMainLoop())
+    {
+        drawPromptScreen("UPDATE AVAILABLE", manifest.latestVersion);
+        hidScanInput();
+        u32 down = hidKeysDown();
+        if (down & KEY_A) return true;
+        if (down & KEY_B) return false;
+    }
+    return false;
+}
+
+static void updateProgress(int downloaded, int total, void *)
+{
+    drawStatusScreen("DOWNLOADING UPDATE", "PLEASE WAIT", downloaded, total);
+}
+
+static void exitAfterUpdateInstalled()
+{
+    while (aptMainLoop())
+    {
+        drawStatusScreen("UPDATE READY", "A CLOSE REOPEN APP", 1, 1);
+        hidScanInput();
+        u32 down = hidKeysDown();
+        if ((down & KEY_A) || (down & KEY_B))
+        {
+            break;
+        }
     }
     gfxExit();
     exit(0);
@@ -332,11 +511,14 @@ void handleHexColorInput()
 }
 
 // Function to decompress data
-int main()
+int main(int argc, char **argv)
 {
     gfxInitDefault();
     gfxSetDoubleBuffering(GFX_TOP, false);
     UIState::init();
+    const char *appPath = (argc > 0 && argv && argv[0] && argv[0][0]) ? argv[0] : "sdmc:/3ds/CollabDoodle-current.3dsx";
+
+    drawStatusScreen("PLEASE WAIT", "CONNECTING", 0, 0);
 
     printf("3DS Collab Doodle\n");
 
@@ -352,6 +534,12 @@ int main()
         failExit("No valid socket connection\n");
         return 1;
     }
+
+    if (!sendClientHello(sock))
+    {
+        failExit("Failed to send client hello.");
+    }
+    printf("Client hello sent: %s\n", APP_VERSION);
 
     std::vector<int> brushSizes = {1, 2, 3, 5, 7}; // Define your brush sizes
     initializeGaussianFalloff(brushSizes);
@@ -404,6 +592,20 @@ int main()
         while (NetworkManager::readLine(sock, line, sizeof(line)))
         {
             char currentChannel[25] = "";
+            char latestVersion[32] = "";
+            char updateReason[48] = "";
+            if (Protocol::parseUpdateRequired(line, latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
+            {
+                printf("Update required: %s Latest: %s\n", updateReason, latestVersion);
+                UpdateManifest manifest;
+                if (Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, manifest) && waitForUpdateConfirm(manifest) &&
+                    Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, appPath, updateProgress, NULL) == UPDATE_DOWNLOAD_OK)
+                {
+                    exitAfterUpdateInstalled();
+                }
+                failExit("Update required.\nDownload the latest Collab Doodle build to continue.");
+            }
+
             if (Protocol::parseChannels(line, availableChannels, 8, availableChannelCount, currentChannel))
             {
                 if (currentChannel[0])
@@ -498,7 +700,8 @@ int main()
         if (strcmp(canvas.channel, availableChannels[selectedChannel]) == 0)
             return true;
 
-        if (!NetworkManager::ensureConnected())
+        if (!NetworkManager::checkConnection() &&
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())))
         {
             printf("Cannot switch channel - connection failed.\n");
             return false;
@@ -580,7 +783,8 @@ int main()
         if (kDown & KEY_START)
         {
             printf("Refreshing canvas from server...\n");
-            if (!NetworkManager::ensureConnected()) {
+            if (!NetworkManager::checkConnection() &&
+                (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket()))) {
                 printf("Cannot refresh canvas - connection failed!\n");
                 continue;
             }
@@ -588,7 +792,7 @@ int main()
             char request[] = "getCanvas\n";
             if (send(NetworkManager::getSocket(), request, strlen(request), 0) <= 0) {
                 printf("Failed to send refresh request. Attempting to reconnect...\n");
-                if (!NetworkManager::reconnect()) {
+                if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())) {
                     printf("Reconnection failed. Please try again later.\n");
                     continue;
                 }
@@ -647,8 +851,38 @@ int main()
         if (kDown & KEY_Y)
         {
             printf("Checking for updates...\n");
-            updateAvailable = Updater::checkForUpdate("192.168.1.46", "3000", APP_VERSION);
-            printf(updateAvailable ? "Update available.\n" : "No update available or check failed.\n");
+            UpdateManifest manifest;
+            if (!Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, manifest))
+            {
+                updateAvailable = false;
+                printf("Update check failed.\n");
+            }
+            else if (!manifest.available)
+            {
+                updateAvailable = false;
+                printf("Already on latest version %s.\n", APP_VERSION);
+            }
+            else
+            {
+                updateAvailable = true;
+                printf("Update %s available.\n", manifest.latestVersion);
+                if (waitForUpdateConfirm(manifest))
+                {
+                    UpdateDownloadResult result = Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, appPath, updateProgress, NULL);
+                    if (result == UPDATE_DOWNLOAD_OK)
+                    {
+                        exitAfterUpdateInstalled();
+                    }
+                    else
+                    {
+                        printf("Download failed: %d\n", result);
+                    }
+                }
+                else
+                {
+                    printf("Update canceled.\n");
+                }
+            }
             topMode = TOP_MODE_CANVAS;
             topRenderFrame = 10;
         }
@@ -874,7 +1108,7 @@ int main()
                     {
                         if (!NetworkManager::checkConnection()) {
                             printf("Connection lost while drawing! Attempting to reconnect...\n");
-                            if (!NetworkManager::reconnect()) {
+                            if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())) {
                                 UIState::clearPoints(); // Clear points if reconnect failed
                                 continue;
                             }
@@ -905,7 +1139,7 @@ int main()
                 {
                     if (!NetworkManager::checkConnection()) {
                         printf("Connection lost while drawing! Attempting to reconnect...\n");
-                        if (!NetworkManager::reconnect()) {
+                        if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())) {
                             UIState::clearPoints(); // Clear points if reconnect failed
                             continue;
                         }
