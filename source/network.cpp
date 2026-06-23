@@ -3,14 +3,34 @@
 #include <string.h>
 #include <errno.h>
 #include <netdb.h>
+#include <sys/select.h>
+#include <sys/time.h>
 
 // Static member initialization
 u32* NetworkManager::SOC_buffer = nullptr;
 int NetworkManager::sock = -1;
 bool NetworkManager::isConnected = false;
-// const char* NetworkManager::SERVER_DOMAIN = "10.0.0.166";
-const char* NetworkManager::SERVER_DOMAIN = "server1.rpgwo.org";
+const char* NetworkManager::SERVER_DOMAIN = "192.168.1.46";
 const char* NetworkManager::SERVER_PORT = "3030";
+static const int IO_TIMEOUT_MS = 8000;
+static const int CONNECT_TIMEOUT_MS = 5000;
+static const int SOC_IN_PROGRESS = -26;
+
+static timeval makeTimeout(int timeoutMs) {
+    timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    return tv;
+}
+
+static bool waitForSocket(int s, bool writeReady, int timeoutMs) {
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(s, &set);
+    timeval tv = makeTimeout(timeoutMs);
+    int result = select(s + 1, writeReady ? NULL : &set, writeReady ? &set : NULL, NULL, &tv);
+    return result > 0 && FD_ISSET(s, &set);
+}
 
 bool NetworkManager::initialize() {
     printf("Initializing network...\n");
@@ -32,13 +52,6 @@ bool NetworkManager::initialize() {
 }
 
 bool NetworkManager::connect(const char* server_domain, const char* server_port_str) {
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        printf("socket: %d %s\n", errno, strerror(errno));
-        return false;
-    }
-
     struct addrinfo hints;
     struct addrinfo *result;
     memset(&hints, 0, sizeof(hints));
@@ -55,10 +68,37 @@ bool NetworkManager::connect(const char* server_domain, const char* server_port_
     printf("Connecting to server... ");
     bool connected = false;
     for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
-        if (::connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) { 
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            printf("socket: %d %s\n", errno, strerror(errno));
+            continue;
+        }
+
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+        int ret = ::connect(sock, rp->ai_addr, rp->ai_addrlen);
+        if (ret == 0) {
             connected = true;
             break;
         }
+
+        if ((ret == SOC_IN_PROGRESS || errno == SOC_IN_PROGRESS || errno == EINPROGRESS || errno == EWOULDBLOCK) &&
+            waitForSocket(sock, true, CONNECT_TIMEOUT_MS)) {
+            int socketError = 0;
+            socklen_t socketErrorLen = sizeof(socketError);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLen) == 0 &&
+                (socketError == 0 || socketError == EISCONN || socketError == SOC_IN_PROGRESS)) {
+                connected = true;
+                break;
+            }
+            errno = socketError;
+        }
+
+        printf("connect ret=%d errno=%d\n", ret, errno);
+
+        close(sock);
+        sock = -1;
     }
 
     freeaddrinfo(result);
@@ -71,6 +111,8 @@ bool NetworkManager::connect(const char* server_domain, const char* server_port_
         return false;
     }
 
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
     printf("Connected!\n");
     isConnected = true;
     return true;
@@ -152,6 +194,10 @@ bool NetworkManager::readLine(int s, char* buffer, size_t maxlen) {
     size_t pos = 0;
     char c;
     while (pos < maxlen - 1) {
+        if (!waitForSocket(s, false, IO_TIMEOUT_MS)) {
+            fcntl(s, F_SETFL, flags);
+            return false;
+        }
         int ret = recv(s, &c, 1, 0);
         if (ret <= 0) {
             fcntl(s, F_SETFL, flags);
@@ -179,6 +225,10 @@ bool NetworkManager::readExact(int s, void* buf, size_t length) {
     size_t received = 0;
     char* ptr = (char*)buf;
     while (received < length) {
+        if (!waitForSocket(s, false, IO_TIMEOUT_MS)) {
+            fcntl(s, F_SETFL, flags);
+            return false;
+        }
         int ret = recv(s, ptr + received, length - received, 0);
         if (ret <= 0) {
             fcntl(s, F_SETFL, flags);

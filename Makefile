@@ -38,6 +38,10 @@ DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
+APP_TITLE	:=	Collab Doodle
+APP_DESCRIPTION	:=	Shared canvas drawing for Nintendo 3DS
+APP_AUTHOR	:=	Tommy
+ICON		:=	icon.png
 #ROMFS		:=	romfs
 #GFXBUILD	:=	$(ROMFS)/gfx
 

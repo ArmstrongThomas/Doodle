@@ -9,10 +9,15 @@
 #include <sstream>
 #include <math.h>
 #include <algorithm>
-#include <zlib.h>
 #include <unordered_map>
 #include "ui.h"
 #include "network.h"
+#include "canvas_state.h"
+#include "renderer.h"
+#include "protocol.h"
+#include "updater.h"
+
+#define APP_VERSION "1.0.0"
 
 Color currentColor = {255, 0, 0}; // Red by default
 int currentBrushSize = 1;
@@ -20,6 +25,7 @@ int currentBrushShape = 0;
 
 static void failExit(const char *fmt, ...)
 {
+    consoleInit(GFX_TOP, NULL);
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -143,6 +149,51 @@ void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, 
     }
 }
 
+static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
+                             int screenX, int screenY, int offsetX, int offsetY, CanvasState &canvas)
+{
+    int canvasX = screenX + offsetX;
+    int canvasY = screenY + offsetY;
+    if (canvasX < 0 || canvasX >= canvasWidth || canvasY < 0 || canvasY >= canvasHeight)
+        return;
+
+    drawBrush(fullCanvas, canvasWidth, canvasHeight, canvasX, canvasY,
+              currentBrushSize, currentBrushShape,
+              currentColor.r, currentColor.g, currentColor.b);
+    canvas.markDirty(canvasX, canvasY, currentBrushSize);
+    UIState::addPoint(canvasX, canvasY);
+}
+
+static void drawStrokeLine(u8 *fullCanvas, int canvasWidth, int canvasHeight,
+                           float x0, float y0, float x1, float y1,
+                           int offsetX, int offsetY, CanvasState &canvas)
+{
+    int steps = std::max(1, (int)std::ceil(std::max(fabsf(x1 - x0), fabsf(y1 - y0))));
+    for (int i = 0; i <= steps; i++)
+    {
+        float t = (float)i / (float)steps;
+        int x = (int)std::round(x0 + (x1 - x0) * t);
+        int y = (int)std::round(y0 + (y1 - y0) * t);
+        drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, x, y, offsetX, offsetY, canvas);
+    }
+}
+
+static void drawStrokeCurve(u8 *fullCanvas, int canvasWidth, int canvasHeight,
+                            float x0, float y0, float cx, float cy, float x1, float y1,
+                            int offsetX, int offsetY, CanvasState &canvas)
+{
+    float lengthEstimate = hypotf(cx - x0, cy - y0) + hypotf(x1 - cx, y1 - cy);
+    int steps = std::max(2, (int)std::ceil(lengthEstimate * 1.25f));
+    for (int i = 0; i <= steps; i++)
+    {
+        float t = (float)i / (float)steps;
+        float inv = 1.0f - t;
+        int x = (int)std::round(inv * inv * x0 + 2.0f * inv * t * cx + t * t * x1);
+        int y = (int)std::round(inv * inv * y0 + 2.0f * inv * t * cy + t * t * y1);
+        drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, x, y, offsetX, offsetY, canvas);
+    }
+}
+
 void processDrawPacket(const uint8_t *packet, size_t length, u8 *buffer, int fbWidth, int fbHeight,
                        u8 *fullCanvas, int canvasWidth, int canvasHeight)
 {
@@ -234,22 +285,32 @@ static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint> &points,
     if (sock < 0 || points.empty())
         return;
 
-    uint8_t packet[7 + points.size() * 4];
-    packet[0] = 1; // Type: drawBatch
-    packet[1] = color.r;
-    packet[2] = color.g;
-    packet[3] = color.b;
-    packet[4] = size;
-    packet[5] = shape;
-    packet[6] = points.size() > 255 ? 255 : points.size();
-
-    for (size_t i = 0; i < packet[6]; i++)
+    const size_t maxPointsPerPacket = 64;
+    size_t start = 0;
+    while (start < points.size())
     {
-        *(uint16_t *)(packet + 7 + i * 4) = points[i].x;
-        *(uint16_t *)(packet + 9 + i * 4) = points[i].y;
-    }
+        size_t count = std::min(maxPointsPerPacket, points.size() - start);
+        uint8_t packet[7 + maxPointsPerPacket * 4];
+        packet[0] = 1; // Type: drawBatch
+        packet[1] = color.r;
+        packet[2] = color.g;
+        packet[3] = color.b;
+        packet[4] = size;
+        packet[5] = shape;
+        packet[6] = (uint8_t)count;
 
-    send(sock, packet, 7 + packet[6] * 4, 0);
+        for (size_t i = 0; i < count; i++)
+        {
+            *(uint16_t *)(packet + 7 + i * 4) = points[start + i].x;
+            *(uint16_t *)(packet + 9 + i * 4) = points[start + i].y;
+        }
+
+        send(sock, packet, 7 + count * 4, 0);
+
+        if (start + count >= points.size())
+            break;
+        start += count - 1; // Overlap one point so remote clients keep a continuous line.
+    }
 }
 
 void handleHexColorInput()
@@ -271,43 +332,17 @@ void handleHexColorInput()
 }
 
 // Function to decompress data
-bool decompressData(const u8 *compressedData, size_t compressedSize, u8 *decompressedData, size_t decompressedSize)
-{
-    z_stream strm;
-    strm.zalloc = Z_NULL;
-    strm.zfree = Z_NULL;
-    strm.opaque = Z_NULL;
-    strm.avail_in = 0;
-    strm.next_in = Z_NULL;
-
-    if (inflateInit(&strm) != Z_OK)
-    {
-        return false;
-    }
-
-    strm.avail_in = compressedSize;
-    strm.next_in = (Bytef *)compressedData;
-    strm.avail_out = decompressedSize;
-    strm.next_out = decompressedData;
-
-    int ret = inflate(&strm, Z_FINISH);
-    inflateEnd(&strm);
-
-    return ret == Z_STREAM_END;
-}
-
 int main()
 {
     gfxInitDefault();
-    consoleInit(GFX_TOP, NULL);
+    gfxSetDoubleBuffering(GFX_TOP, false);
     UIState::init();
 
     printf("3DS Collab Doodle\n");
 
     if (!NetworkManager::initialize())
     {
-        // Handle error
-        return 1;
+        failExit("Network connection failed or timed out.");
     }
     atexit(NetworkManager::shutdown);
 
@@ -336,7 +371,9 @@ int main()
            "- Hold LEFT/A + stylus: Pan viewport\n"
            "- DOWN/B: Toggle Color Picker\n"
            "- Hold UP + tap: Sample color\n"
-           "- X: Input Hex color code\n");
+           "- X: Input Hex color code\n"
+           "- Y: Check for updates\n"
+           "- L: Switch channel\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
     u8 *buffer = (u8 *)malloc(bufferSize);
@@ -350,56 +387,64 @@ int main()
 
     int canvasWidth = 0;
     int canvasHeight = 0;
-    int canvasSize = 0;
     u8 *fullCanvas = NULL;
+    CanvasState canvas;
+    bool updateAvailable = false;
+    int topRenderFrame = 10;
+    char availableChannels[8][25];
+    int availableChannelCount = 0;
 
     if (sock >= 0)
     {
         char line[1024];
-        if (!NetworkManager::readLine(sock, line, sizeof(line)))
+        CanvasMeta meta;
+        bool receivedMeta = false;
+        while (NetworkManager::readLine(sock, line, sizeof(line)))
         {
-            printf("Failed to read init line.\n");
+            char currentChannel[25] = "";
+            if (Protocol::parseChannels(line, availableChannels, 8, availableChannelCount, currentChannel))
+            {
+                if (currentChannel[0])
+                    canvas.setChannel(currentChannel);
+                continue;
+            }
+
+            if (Protocol::parseCanvasMeta(line, meta))
+            {
+                receivedMeta = true;
+                break;
+            }
+        }
+
+        if (!receivedMeta)
+        {
+            printf("Failed to read init canvas metadata.\n");
         }
         else
         {
-            char *wPtr = strstr(line, "\"width\":");
-            char *hPtr = strstr(line, "\"height\":");
-            char *sPtr = strstr(line, "\"compressedSize\":");
-            if (wPtr && hPtr && sPtr)
-            {
-                canvasWidth = atoi(wPtr + 8);
-                canvasHeight = atoi(hPtr + 9);
-                int compressedSize = atoi(sPtr + 17);
-                printf("Received canvas dimensions: W=%d, H=%d, Compressed Size=%d\n", canvasWidth, canvasHeight, compressedSize);
+            canvasWidth = meta.width;
+            canvasHeight = meta.height;
+            canvas.setChannel(meta.channel);
+            printf("Received canvas dimensions: W=%d, H=%d, Compressed Size=%d\n", canvasWidth, canvasHeight, meta.compressedSize);
 
-                u8 *compressedCanvas = (u8 *)malloc(compressedSize);
-                if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, compressedSize))
+            u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
+            if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, meta.compressedSize))
+            {
+                if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
                 {
-                    canvasSize = canvasWidth * canvasHeight * 3;
-                    fullCanvas = (u8 *)malloc(canvasSize);
-                    if (fullCanvas && decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize))
-                    {
-                        printf("Canvas decompressed successfully.\n");
-                    }
-                    else
-                    {
-                        printf("Failed to decompress canvas data.\n");
-                        if (fullCanvas)
-                        {
-                            free(fullCanvas);
-                            fullCanvas = NULL;
-                        }
-                    }
-                    free(compressedCanvas);
+                    fullCanvas = canvas.pixels;
+                    Renderer::invalidateMinimap();
+                    printf("Canvas decompressed successfully.\n");
                 }
                 else
                 {
-                    printf("Failed to read compressed canvas data.\n");
+                    printf("Failed to decompress canvas data.\n");
                 }
+                free(compressedCanvas);
             }
             else
             {
-                printf("Invalid init line: %s\n", line);
+                printf("Failed to read compressed canvas data.\n");
             }
         }
 
@@ -411,6 +456,11 @@ int main()
     int offsetY = 0;
     int prevTouchX = -1;
     int prevTouchY = -1;
+    int prevPrevTouchX = -1;
+    int prevPrevTouchY = -1;
+    float lastStrokeX = 0.0f;
+    float lastStrokeY = 0.0f;
+    bool hasLastStrokePoint = false;
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
@@ -470,18 +520,13 @@ int main()
                 continue;
             }
 
-            if (!strstr(response, "compressedCanvas")) {
+            CanvasMeta refreshMeta;
+            if (!Protocol::parseCanvasMeta(response, refreshMeta)) {
                 printf("Invalid response format from server: %s\n", response);
                 continue;
             }
 
-            char *sPtr = strstr(response, "\"compressedSize\":");
-            if (!sPtr) {
-                printf("Missing compressed size in server response.\n");
-                continue;
-            }
-
-            int compressedSize = atoi(sPtr + 17);
+            int compressedSize = refreshMeta.compressedSize;
             if (compressedSize <= 0 || compressedSize > 10000000) { // Sanity check for size
                 printf("Invalid compressed size: %d\n", compressedSize);
                 continue;
@@ -495,7 +540,9 @@ int main()
 
             bool success = false;
             if (NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, compressedSize)) {
-                if (decompressData(compressedCanvas, compressedSize, fullCanvas, canvasSize)) {
+                if (canvas.loadFromCompressed(compressedCanvas, compressedSize)) {
+                    fullCanvas = canvas.pixels;
+                    Renderer::invalidateMinimap();
                     printf("Canvas refreshed successfully!\n");
                     success = true;
                 } else {
@@ -509,6 +556,52 @@ int main()
             
             if (!success) {
                 printf("Canvas refresh failed. Try again?\n");
+            }
+        }
+
+        if (kDown & KEY_Y)
+        {
+            printf("Checking for updates...\n");
+            updateAvailable = Updater::checkForUpdate("192.168.1.46", "3000", APP_VERSION);
+            printf(updateAvailable ? "Update available.\n" : "No update available or check failed.\n");
+        }
+
+        if ((kDown & KEY_L) && availableChannelCount > 0)
+        {
+            int selected = 0;
+            for (int i = 0; i < availableChannelCount; i++)
+            {
+                if (strcmp(canvas.channel, availableChannels[i]) == 0)
+                    selected = (i + 1) % availableChannelCount;
+            }
+
+            char command[96];
+            Protocol::buildSwitchChannel(command, sizeof(command), availableChannels[selected]);
+            if (send(NetworkManager::getSocket(), command, strlen(command), 0) > 0)
+            {
+                printf("Switching to channel %s...\n", availableChannels[selected]);
+                char response[1024];
+                CanvasMeta meta;
+                if (NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response)) &&
+                    Protocol::parseCanvasMeta(response, meta))
+                {
+                    u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
+                    if (compressedCanvas && NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, meta.compressedSize))
+                    {
+                        canvasWidth = meta.width;
+                        canvasHeight = meta.height;
+                        canvas.setChannel(meta.channel);
+                        if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
+                        {
+                            fullCanvas = canvas.pixels;
+                            offsetX = offsetY = 0;
+                            Renderer::invalidateMinimap();
+                            printf("Switched to %s.\n", canvas.channel);
+                        }
+                    }
+                    if (compressedCanvas)
+                        free(compressedCanvas);
+                }
             }
         }
 
@@ -616,6 +709,8 @@ int main()
                 {
                     prevTouchX = touch.px;
                     prevTouchY = touch.py;
+                    prevPrevTouchX = prevPrevTouchY = -1;
+                    hasLastStrokePoint = false;
                 }
                 else
                 {
@@ -626,6 +721,9 @@ int main()
                     offsetY -= deltaY;
 
                     clampOffsets(offsetX, offsetY);
+                    canvas.offsetX = offsetX;
+                    canvas.offsetY = offsetY;
+                    canvas.markFullDirty();
 
                     prevTouchX = touch.px;
                     prevTouchY = touch.py;
@@ -634,6 +732,8 @@ int main()
             else
             {
                 prevTouchX = prevTouchY = -1;
+                prevPrevTouchX = prevPrevTouchY = -1;
+                hasLastStrokePoint = false;
             }
         }
         else if (!UIState::isColorPickerActive())
@@ -645,32 +745,37 @@ int main()
                 {
                     prevTouchX = touch.px;
                     prevTouchY = touch.py;
+                    prevPrevTouchX = prevPrevTouchY = -1;
+                    lastStrokeX = (float)touch.px;
+                    lastStrokeY = (float)touch.py;
+                    hasLastStrokePoint = true;
+                    drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, touch.px, touch.py, offsetX, offsetY, canvas);
                 }
                 else
                 {
-                    int steps = std::max(abs(touch.px - prevTouchX), abs(touch.py - prevTouchY));
-                    for (int i = 0; i <= steps; i++)
+                    if (prevPrevTouchX == -1 || prevPrevTouchY == -1 || !hasLastStrokePoint)
                     {
-                        float t = (steps == 0) ? 0.0f : static_cast<float>(i) / steps;
-                        int x = prevTouchX + (touch.px - prevTouchX) * t;
-                        int y = prevTouchY + (touch.py - prevTouchY) * t;
-
-                        // Use currentColor here
-                        drawBrush(buffer, fbWidth, fbHeight, x, y, currentBrushSize, currentBrushShape, currentColor.r, currentColor.g, currentColor.b);
-
-                        int C_x = x + offsetX;
-                        int C_y = y + offsetY;
-                        if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight)
-                        {
-                            drawBrush(fullCanvas, canvasWidth, canvasHeight, C_x, C_y,
-                                      currentBrushSize, currentBrushShape,
-                                      currentColor.r, currentColor.g, currentColor.b);
-                        }
-
-                        UIState::addPoint(C_x, C_y);
+                        drawStrokeLine(fullCanvas, canvasWidth, canvasHeight,
+                                       (float)prevTouchX, (float)prevTouchY,
+                                       (float)touch.px, (float)touch.py,
+                                       offsetX, offsetY, canvas);
+                        lastStrokeX = (float)touch.px;
+                        lastStrokeY = (float)touch.py;
+                    }
+                    else
+                    {
+                        float endX = ((float)prevTouchX + (float)touch.px) * 0.5f;
+                        float endY = ((float)prevTouchY + (float)touch.py) * 0.5f;
+                        drawStrokeCurve(fullCanvas, canvasWidth, canvasHeight,
+                                        lastStrokeX, lastStrokeY,
+                                        (float)prevTouchX, (float)prevTouchY,
+                                        endX, endY,
+                                        offsetX, offsetY, canvas);
+                        lastStrokeX = endX;
+                        lastStrokeY = endY;
                     }
 
-                    if (UIState::getPoints().size() >= 10)
+                    if (UIState::getPoints().size() >= 32)
                     {
                         if (!NetworkManager::checkConnection()) {
                             printf("Connection lost while drawing! Attempting to reconnect...\n");
@@ -684,6 +789,8 @@ int main()
                         UIState::clearPoints();
                     }
 
+                    prevPrevTouchX = prevTouchX;
+                    prevPrevTouchY = prevTouchY;
                     prevTouchX = touch.px;
                     prevTouchY = touch.py;
                 }
@@ -691,6 +798,14 @@ int main()
             else
             {
                 // Stylus released
+                if (hasLastStrokePoint && prevTouchX != -1 && prevTouchY != -1)
+                {
+                    drawStrokeLine(fullCanvas, canvasWidth, canvasHeight,
+                                   lastStrokeX, lastStrokeY,
+                                   (float)prevTouchX, (float)prevTouchY,
+                                   offsetX, offsetY, canvas);
+                }
+
                 if (!UIState::getPoints().empty())
                 {
                     if (!NetworkManager::checkConnection()) {
@@ -705,6 +820,8 @@ int main()
                     UIState::clearPoints();
                 }
                 prevTouchX = prevTouchY = -1;
+                prevPrevTouchX = prevPrevTouchY = -1;
+                hasLastStrokePoint = false;
             }
         }
 
@@ -715,7 +832,49 @@ int main()
             int recvLen = recv(sock, packetBuffer, sizeof(packetBuffer), 0);
             if (recvLen > 0)
             {
-                processDrawPacket(packetBuffer, recvLen, buffer, fbWidth, fbHeight, fullCanvas, canvasWidth, canvasHeight);
+                if (packetBuffer[0] == '{')
+                {
+                    packetBuffer[std::min(recvLen, (int)sizeof(packetBuffer) - 1)] = '\0';
+                    CanvasMeta meta;
+                    char currentChannel[25] = "";
+                    if (Protocol::parseChannels((char *)packetBuffer, availableChannels, 8, availableChannelCount, currentChannel))
+                    {
+                        if (currentChannel[0])
+                            canvas.setChannel(currentChannel);
+                    }
+                    else if (strstr((char *)packetBuffer, "channelChanged"))
+                    {
+                        char changed[25] = "";
+                        int ignoredCount = 0;
+                        Protocol::parseChannels((char *)packetBuffer, availableChannels, 8, ignoredCount, changed);
+                    }
+                    else if (Protocol::parseCanvasMeta((char *)packetBuffer, meta))
+                    {
+                        canvasWidth = meta.width;
+                        canvasHeight = meta.height;
+                        canvas.setChannel(meta.channel);
+                        if (canvas.allocate(canvasWidth, canvasHeight))
+                        {
+                            u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
+                            if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, meta.compressedSize))
+                            {
+                                if (canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
+                                {
+                                    fullCanvas = canvas.pixels;
+                                    Renderer::invalidateMinimap();
+                                }
+                            }
+                            if (compressedCanvas)
+                                free(compressedCanvas);
+                        }
+                    }
+                }
+                else
+                {
+                    processDrawPacket(packetBuffer, recvLen, buffer, fbWidth, fbHeight, fullCanvas, canvasWidth, canvasHeight);
+                    canvas.markFullDirty();
+                    Renderer::invalidateMinimap();
+                }
             }
             else if (recvLen == 0)
             {
@@ -726,36 +885,26 @@ int main()
         }
 
         // Rendering
-        if (fullCanvas)
+        canvas.offsetX = offsetX;
+        canvas.offsetY = offsetY;
+        bool canvasWasDirty = canvas.dirty.valid;
+        Renderer::renderViewport(canvas, buffer, fbWidth, fbHeight, false);
+        canvas.clearDirty();
+
+        bool activelyDrawing = !UIState::isColorPickerActive() &&
+                               !(kHeld & (KEY_DLEFT | KEY_A)) &&
+                               (kHeld & KEY_TOUCH);
+        topRenderFrame++;
+        if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
-            for (int y = 0; y < fbHeight; y++)
-            {
-                for (int x = 0; x < fbWidth; x++)
-                {
-                    int C_x = y + offsetX;
-                    int C_y = (fbWidth - 1 - x) + offsetY;
-                    if (C_x >= 0 && C_x < canvasWidth && C_y >= 0 && C_y < canvasHeight)
-                    {
-                        int bufferIdx = 3 * (y * fbWidth + x);
-                        int canvasIdx = 3 * (C_y * canvasWidth + C_x);
-                        buffer[bufferIdx] = fullCanvas[canvasIdx + 2];     // B
-                        buffer[bufferIdx + 1] = fullCanvas[canvasIdx + 1]; // G
-                        buffer[bufferIdx + 2] = fullCanvas[canvasIdx];     // R
-                    }
-                    else
-                    {
-                        // Draw a light gray color for areas outside the canvas
-                        int bufferIdx = 3 * (y * fbWidth + x);
-                        buffer[bufferIdx] = buffer[bufferIdx + 1] = buffer[bufferIdx + 2] = 240;
-                    }
-                }
-            }
+            Renderer::renderMinimap(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor);
+            topRenderFrame = 0;
         }
 
         gspWaitForVBlank();
+        Renderer::presentTopFrame();
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
         memcpy(fb, buffer, bufferSize);
-
         if (UIState::isColorPickerActive())
         {
             UIInterface::drawUIBackground(fb, fbWidth, fbHeight);
@@ -773,8 +922,6 @@ int main()
 
     if (sock >= 0)
         close(sock);
-    if (fullCanvas)
-        free(fullCanvas);
     free(buffer);
     gfxExit();
     return 0;
