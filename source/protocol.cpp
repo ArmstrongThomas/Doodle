@@ -43,9 +43,10 @@ bool Protocol::parseCanvasMeta(const char *line, CanvasMeta &meta)
 
 bool Protocol::parseChannels(const char *line, char channels[][25], int maxChannels, int &count, char *currentChannel)
 {
-    count = 0;
     if (!line || !strstr(line, "\"type\":\"channels\""))
         return false;
+
+    count = 0;
     jsonString(line, "\"currentChannel\":\"", currentChannel, 25);
 
     const char *ptr = strstr(line, "\"channels\":[");

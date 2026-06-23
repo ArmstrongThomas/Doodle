@@ -391,6 +391,8 @@ int main()
     CanvasState canvas;
     bool updateAvailable = false;
     int topRenderFrame = 10;
+    TopScreenMode topMode = TOP_MODE_CANVAS;
+    int selectedChannel = 0;
     char availableChannels[8][25];
     int availableChannelCount = 0;
 
@@ -467,6 +469,89 @@ int main()
         ox = std::max(-20, std::min(ox, canvasWidth - fbWidth));
         oy = std::max(-20, std::min(oy, canvasHeight - fbHeight + 100));
     };
+
+    auto syncSelectedChannel = [&]()
+    {
+        if (availableChannelCount <= 0)
+        {
+            selectedChannel = 0;
+            return;
+        }
+
+        selectedChannel = std::max(0, std::min(selectedChannel, availableChannelCount - 1));
+        for (int i = 0; i < availableChannelCount; i++)
+        {
+            if (strcmp(canvas.channel, availableChannels[i]) == 0)
+            {
+                selectedChannel = i;
+                return;
+            }
+        }
+    };
+
+    auto switchToSelectedChannel = [&]() -> bool
+    {
+        if (availableChannelCount <= 0)
+            return false;
+
+        selectedChannel = std::max(0, std::min(selectedChannel, availableChannelCount - 1));
+        if (strcmp(canvas.channel, availableChannels[selectedChannel]) == 0)
+            return true;
+
+        if (!NetworkManager::ensureConnected())
+        {
+            printf("Cannot switch channel - connection failed.\n");
+            return false;
+        }
+
+        char command[96];
+        Protocol::buildSwitchChannel(command, sizeof(command), availableChannels[selectedChannel]);
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            printf("Failed to request channel switch.\n");
+            return false;
+        }
+
+        printf("Switching to channel %s...\n", availableChannels[selectedChannel]);
+        char response[1024];
+        CanvasMeta meta;
+        if (!NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response)) ||
+            !Protocol::parseCanvasMeta(response, meta))
+        {
+            printf("Channel switch response was invalid.\n");
+            return false;
+        }
+
+        u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
+        if (!compressedCanvas)
+        {
+            printf("Failed to allocate channel canvas.\n");
+            return false;
+        }
+
+        bool switched = false;
+        if (NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, meta.compressedSize))
+        {
+            canvasWidth = meta.width;
+            canvasHeight = meta.height;
+            canvas.setChannel(meta.channel);
+            if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
+            {
+                fullCanvas = canvas.pixels;
+                offsetX = offsetY = 0;
+                clampOffsets(offsetX, offsetY);
+                Renderer::invalidateMinimap();
+                printf("Switched to %s.\n", canvas.channel);
+                switched = true;
+            }
+        }
+
+        free(compressedCanvas);
+        syncSelectedChannel();
+        return switched;
+    };
+
+    syncSelectedChannel();
 
     while (aptMainLoop())
     {
@@ -564,50 +649,60 @@ int main()
             printf("Checking for updates...\n");
             updateAvailable = Updater::checkForUpdate("192.168.1.46", "3000", APP_VERSION);
             printf(updateAvailable ? "Update available.\n" : "No update available or check failed.\n");
+            topMode = TOP_MODE_CANVAS;
+            topRenderFrame = 10;
         }
 
-        if ((kDown & KEY_L) && availableChannelCount > 0)
+        if (kDown & KEY_R)
         {
-            int selected = 0;
-            for (int i = 0; i < availableChannelCount; i++)
-            {
-                if (strcmp(canvas.channel, availableChannels[i]) == 0)
-                    selected = (i + 1) % availableChannelCount;
-            }
+            topMode = (topMode == TOP_MODE_CONTROLS) ? TOP_MODE_CANVAS : TOP_MODE_CONTROLS;
+            topRenderFrame = 10;
+        }
 
-            char command[96];
-            Protocol::buildSwitchChannel(command, sizeof(command), availableChannels[selected]);
-            if (send(NetworkManager::getSocket(), command, strlen(command), 0) > 0)
+        if (kDown & KEY_L)
+        {
+            if (topMode == TOP_MODE_CHANNELS)
             {
-                printf("Switching to channel %s...\n", availableChannels[selected]);
-                char response[1024];
-                CanvasMeta meta;
-                if (NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response)) &&
-                    Protocol::parseCanvasMeta(response, meta))
-                {
-                    u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
-                    if (compressedCanvas && NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, meta.compressedSize))
-                    {
-                        canvasWidth = meta.width;
-                        canvasHeight = meta.height;
-                        canvas.setChannel(meta.channel);
-                        if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
-                        {
-                            fullCanvas = canvas.pixels;
-                            offsetX = offsetY = 0;
-                            Renderer::invalidateMinimap();
-                            printf("Switched to %s.\n", canvas.channel);
-                        }
-                    }
-                    if (compressedCanvas)
-                        free(compressedCanvas);
-                }
+                topMode = TOP_MODE_CANVAS;
+            }
+            else
+            {
+                syncSelectedChannel();
+                topMode = TOP_MODE_CHANNELS;
+            }
+            topRenderFrame = 10;
+        }
+
+        if (topMode == TOP_MODE_CHANNELS)
+        {
+            if ((kDown & KEY_DUP) && availableChannelCount > 0)
+            {
+                selectedChannel = (selectedChannel + availableChannelCount - 1) % availableChannelCount;
+                topRenderFrame = 10;
+            }
+            if ((kDown & KEY_DDOWN) && availableChannelCount > 0)
+            {
+                selectedChannel = (selectedChannel + 1) % availableChannelCount;
+                topRenderFrame = 10;
+            }
+            if (kDown & KEY_A)
+            {
+                if (switchToSelectedChannel())
+                    topMode = TOP_MODE_CANVAS;
+                topRenderFrame = 10;
+            }
+            if (kDown & KEY_B)
+            {
+                topMode = TOP_MODE_CANVAS;
+                topRenderFrame = 10;
+                continue;
             }
         }
 
-        if (kDown & (KEY_DDOWN | KEY_B))
+        if (topMode != TOP_MODE_CHANNELS && (kDown & (KEY_DDOWN | KEY_B)))
         {
             UIState::toggleColorPicker();
+            topMode = TOP_MODE_CANVAS;
             printf(UIState::isColorPickerActive() ? "Color picker activated\n" : "Color picker deactivated\n");
         }
 
@@ -620,7 +715,7 @@ int main()
         hidTouchRead(&touch);
 
         // Eye Dropper functionality
-        if ((kHeld & KEY_DUP) || (kHeld & KEY_X))
+        if (topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
         {
             if (kDown & KEY_TOUCH)
             {
@@ -639,7 +734,7 @@ int main()
             }
         }
 
-        if (UIState::isColorPickerActive() && (kHeld & KEY_TOUCH))
+        if (topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && (kHeld & KEY_TOUCH))
         {
             float h, s, v;
             UIState::getHSV(h, s, v);
@@ -700,7 +795,7 @@ int main()
             }
         }
 
-        if (kHeld & (KEY_DLEFT | KEY_A))
+        if (topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DLEFT | KEY_A)))
         {
             // Panning mode
             if (kHeld & KEY_TOUCH)
@@ -736,7 +831,7 @@ int main()
                 hasLastStrokePoint = false;
             }
         }
-        else if (!UIState::isColorPickerActive())
+        else if (topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive())
         {
             // Normal drawing mode
             if (kHeld & KEY_TOUCH)
@@ -841,6 +936,8 @@ int main()
                     {
                         if (currentChannel[0])
                             canvas.setChannel(currentChannel);
+                        syncSelectedChannel();
+                        topRenderFrame = 10;
                     }
                     else if (strstr((char *)packetBuffer, "channelChanged"))
                     {
@@ -892,12 +989,15 @@ int main()
         canvas.clearDirty();
 
         bool activelyDrawing = !UIState::isColorPickerActive() &&
+                               topMode == TOP_MODE_CANVAS &&
                                !(kHeld & (KEY_DLEFT | KEY_A)) &&
                                (kHeld & KEY_TOUCH);
         topRenderFrame++;
         if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
-            Renderer::renderMinimap(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor);
+            Renderer::renderTop(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor,
+                                currentBrushSize, currentBrushShape, topMode,
+                                availableChannels, availableChannelCount, selectedChannel);
             topRenderFrame = 0;
         }
 

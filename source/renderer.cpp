@@ -122,6 +122,9 @@ static void drawGlyph(u8 *target, int width, int height, int x, int y, char c, u
         case '-': { u8 g[7] = {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
         case ':': { u8 g[7] = {0x00,0x04,0x00,0x00,0x04,0x00,0x00}; memcpy(glyph,g,7); break; }
         case '.': { u8 g[7] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}; memcpy(glyph,g,7); break; }
+        case '/': { u8 g[7] = {0x01,0x01,0x02,0x04,0x08,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case '<': { u8 g[7] = {0x02,0x04,0x08,0x10,0x08,0x04,0x02}; memcpy(glyph,g,7); break; }
+        case '>': { u8 g[7] = {0x08,0x04,0x02,0x01,0x02,0x04,0x08}; memcpy(glyph,g,7); break; }
         default: return;
     }
 
@@ -141,6 +144,27 @@ static void drawText(u8 *target, int width, int height, int x, int y, const char
         cursor += 6;
         text++;
     }
+}
+
+static void drawUpperText(u8 *target, int width, int height, int x, int y, const char *text, u8 r, u8 g, u8 b)
+{
+    char buffer[64];
+    strncpy(buffer, text ? text : "", sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+    for (char *p = buffer; *p; p++)
+        if (*p >= 'a' && *p <= 'z')
+            *p = *p - 'a' + 'A';
+    drawText(target, width, height, x, y, buffer, r, g, b);
+}
+
+static void drawTopChrome(bool connected, bool updateAvailable)
+{
+    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, TOP_SCREEN_H, 232, 236, 239);
+    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, 30, 24, 33, 38);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 10, "COLLAB DOODLE", 245, 248, 250);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 300, 10, connected ? "CONN" : "OFF", connected ? 94 : 255, connected ? 234 : 115, connected ? 212 : 115);
+    if (updateAvailable)
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 348, 10, "UP", 255, 214, 102);
 }
 
 void Renderer::invalidateMinimap()
@@ -170,14 +194,11 @@ static void updateMinimapCache(CanvasState &canvas)
     minimapCacheValid = true;
 }
 
-static void composeTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor)
+static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor, int brushSize, int brushShape)
 {
-    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, TOP_SCREEN_H, 232, 236, 239);
-    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, 30, 24, 33, 38);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 10, "COLLAB DOODLE", 245, 248, 250);
+    drawTopChrome(connected, updateAvailable);
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 44, connected ? "CONN" : "OFF", connected ? 19 : 214, connected ? 126 : 40, connected ? 118 : 40);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 64, "CH", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 44, "CH", 73, 82, 92);
 
     char channel[16];
     strncpy(channel, canvas.channel[0] ? canvas.channel : "main", sizeof(channel) - 1);
@@ -187,15 +208,20 @@ static void composeTopFrame(CanvasState &canvas, bool connected, bool updateAvai
             *p = *p - 'a' + 'A';
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 76, channel, 32, 36, 42);
 
-    if (updateAvailable)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 96, "UPDATE", 214, 40, 40);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 100, "BRUSH", 73, 82, 92);
+    char brush[16];
+    snprintf(brush, sizeof(brush), "%d %s", brushSize, brushShape == 1 ? "SQ" : brushShape == 2 ? "SOFT" : "CIR");
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 112, brush, 32, 36, 42);
 
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 42, 260, 150, 255, 255, 255);
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 42, 260, 150, 169, 180, 190);
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 132, "COLOR", 73, 82, 92);
-    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 146, 42, 42, currentColor.r, currentColor.g, currentColor.b);
-    strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 146, 42, 42, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 138, "COLOR", 73, 82, 92);
+    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 152, 42, 42, currentColor.r, currentColor.g, currentColor.b);
+    strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 152, 42, 42, 32, 36, 42);
+
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 206, "L CH", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 332, 206, "R HELP", 73, 82, 92);
 
     if (!canvas.pixels || canvas.width <= 0 || canvas.height <= 0)
     {
@@ -230,6 +256,55 @@ static void composeTopFrame(CanvasState &canvas, bool connected, bool updateAvai
     topFrameValid = true;
 }
 
+static void composeChannelTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
+                                   char channels[][25], int channelCount, int selectedChannel)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "CHANNELS", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 46, "A SWITCH", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 60, "B CLOSE", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 74, "UP/DOWN", 73, 82, 92);
+
+    int rows = std::min(channelCount, 8);
+    for (int i = 0; i < rows; i++)
+    {
+        int y = 76 + i * 18;
+        bool selected = i == selectedChannel;
+        bool current = strcmp(canvas.channel, channels[i]) == 0;
+        if (selected)
+        {
+            fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, y - 5, 190, 17, 24, 33, 38);
+        }
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 34, y, current ? ">" : " ", selected ? 245 : 73, selected ? 248 : 82, selected ? 250 : 92);
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, channels[i], selected ? 245 : 32, selected ? 248 : 36, selected ? 250 : 42);
+    }
+
+    if (rows == 0)
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "NO CHANNELS", 214, 40, 40);
+
+    topFrameValid = true;
+}
+
+static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool updateAvailable)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "CONTROLS", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 74, "TOUCH DRAW", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 92, "LEFT TOUCH PAN", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 110, "L CHANNELS", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 128, "B COLOR PICKER", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 146, "UP TOUCH SAMPLE", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 164, "X HEX COLOR", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 182, "START REFRESH", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 200, "Y UPDATE CHECK", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 200, "R CLOSE", 73, 82, 92);
+
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 74, "CHANNEL", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 88, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+
+    topFrameValid = true;
+}
+
 static void presentTopFrameToFramebuffer(u8 *fb, u16 fbWidth, u16 fbHeight)
 {
     if (!fb || !topFrameValid)
@@ -255,16 +330,23 @@ static void presentTopFrameToFramebuffer(u8 *fb, u16 fbWidth, u16 fbHeight)
     }
 }
 
-void Renderer::renderMinimap(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor)
+void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
+                         int brushSize, int brushShape, TopScreenMode mode,
+                         char channels[][25], int channelCount, int selectedChannel)
 {
     minimapFrameCounter++;
-    if (!minimapCacheValid || minimapFrameCounter >= 15)
+    if (mode == TOP_MODE_CANVAS && (!minimapCacheValid || minimapFrameCounter >= 15))
     {
         updateMinimapCache(canvas);
         minimapFrameCounter = 0;
     }
 
-    composeTopFrame(canvas, connected, updateAvailable, currentColor);
+    if (mode == TOP_MODE_CHANNELS)
+        composeChannelTopFrame(canvas, connected, updateAvailable, channels, channelCount, selectedChannel);
+    else if (mode == TOP_MODE_CONTROLS)
+        composeControlsTopFrame(canvas, connected, updateAvailable);
+    else
+        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape);
 }
 
 void Renderer::presentTopFrame()
