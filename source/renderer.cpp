@@ -28,8 +28,8 @@ void Renderer::renderViewport(CanvasState &canvas, u8 *buffer, int fbWidth, int 
     {
         for (int x = startX; x <= endX; x++)
         {
-            int canvasX = y + canvas.offsetX;
-            int canvasY = (fbWidth - 1 - x) + canvas.offsetY;
+            int canvasX = canvas.screenToCanvasX(y);
+            int canvasY = canvas.screenToCanvasY(fbWidth - 1 - x);
             int bufferIdx = 3 * (y * fbWidth + x);
             if (canvasX >= 0 && canvasX < canvas.width && canvasY >= 0 && canvasY < canvas.height)
             {
@@ -218,6 +218,9 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
     snprintf(brush, sizeof(brush), "%d %s", brushSize, brushShape == 1 ? "SQ" : brushShape == 2 ? "SOFT" : "CIR");
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 112, brush, 32, 36, 42);
 
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 124, "ZOOM", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 324, 124, canvas.zoomLabel(), 32, 36, 42);
+
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 42, 260, 150, 255, 255, 255);
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 42, 260, 150, 169, 180, 190);
 
@@ -252,8 +255,8 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
 
     int viewX = mapX + std::max(0, canvas.offsetX) * mapW / canvas.width;
     int viewY = mapY + std::max(0, canvas.offsetY) * mapH / canvas.height;
-    int viewW = std::max(3, 320 * mapW / canvas.width);
-    int viewH = std::max(3, 240 * mapH / canvas.height);
+    int viewW = std::max(3, canvas.viewWidth(320) * mapW / canvas.width);
+    int viewH = std::max(3, canvas.viewHeight(240) * mapH / canvas.height);
     if (viewX + viewW > mapX + mapW) viewW = mapX + mapW - viewX;
     if (viewY + viewH > mapY + mapH) viewH = mapY + mapH - viewY;
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, viewX, viewY, viewW, viewH, 214, 40, 40);
@@ -301,7 +304,7 @@ static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool up
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 146, "UP TOUCH SAMPLE", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 164, "X HEX COLOR", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 182, "START REFRESH", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 200, "Y UPDATE CHECK", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 200, "RIGHT/Y TOUCH ZOOM", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 200, "R CLOSE", 73, 82, 92);
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 74, "CHANNEL", 73, 82, 92);

@@ -43,7 +43,7 @@ static void failExit(const char *fmt, ...)
 static bool sendClientHello(int sock)
 {
     char hello[128];
-    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, true);
+    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true);
     return sock >= 0 && send(sock, hello, strlen(hello), 0) > 0;
 }
 
@@ -262,6 +262,68 @@ void writeColor(u8 *buffer, int idx, u8 r, u8 g, u8 b)
     buffer[idx + 2] = r;
 }
 
+static void putBufferScreenPixel(u8 *buffer, int fbWidth, int fbHeight, int screenX, int screenY, u8 r, u8 g, u8 b)
+{
+    int fbX = fbWidth - 1 - screenY;
+    int fbY = screenX;
+    if (!buffer || fbX < 0 || fbX >= fbWidth || fbY < 0 || fbY >= fbHeight)
+        return;
+
+    int idx = 3 * (fbY * fbWidth + fbX);
+    buffer[idx] = b;
+    buffer[idx + 1] = g;
+    buffer[idx + 2] = r;
+}
+
+static void fillBufferScreenRect(u8 *buffer, int fbWidth, int fbHeight, int x, int y, int w, int h, u8 r, u8 g, u8 b)
+{
+    for (int py = y; py < y + h; py++)
+        for (int px = x; px < x + w; px++)
+            putBufferScreenPixel(buffer, fbWidth, fbHeight, px, py, r, g, b);
+}
+
+static void strokeBufferScreenRect(u8 *buffer, int fbWidth, int fbHeight, int x, int y, int w, int h, u8 r, u8 g, u8 b)
+{
+    for (int px = x; px < x + w; px++)
+    {
+        putBufferScreenPixel(buffer, fbWidth, fbHeight, px, y, r, g, b);
+        putBufferScreenPixel(buffer, fbWidth, fbHeight, px, y + h - 1, r, g, b);
+    }
+    for (int py = y; py < y + h; py++)
+    {
+        putBufferScreenPixel(buffer, fbWidth, fbHeight, x, py, r, g, b);
+        putBufferScreenPixel(buffer, fbWidth, fbHeight, x + w - 1, py, r, g, b);
+    }
+}
+
+static int zoomOverlayX(bool leftSide)
+{
+    return leftSide ? 8 : 270;
+}
+
+static void drawZoomOverlay(u8 *buffer, int fbWidth, int fbHeight, bool leftSide)
+{
+    const int x = zoomOverlayX(leftSide);
+    const int upY = 42;
+    const int downY = 144;
+    const int w = 42;
+    const int h = 58;
+
+    fillBufferScreenRect(buffer, fbWidth, fbHeight, x, upY, w, h, 24, 33, 38);
+    fillBufferScreenRect(buffer, fbWidth, fbHeight, x, downY, w, h, 24, 33, 38);
+    strokeBufferScreenRect(buffer, fbWidth, fbHeight, x, upY, w, h, 245, 248, 250);
+    strokeBufferScreenRect(buffer, fbWidth, fbHeight, x, downY, w, h, 245, 248, 250);
+
+    fillBufferScreenRect(buffer, fbWidth, fbHeight, x + 12, upY + 27, 18, 4, 94, 234, 212);
+    fillBufferScreenRect(buffer, fbWidth, fbHeight, x + 19, upY + 20, 4, 18, 94, 234, 212);
+    fillBufferScreenRect(buffer, fbWidth, fbHeight, x + 12, downY + 27, 18, 4, 255, 115, 115);
+}
+
+static bool pointInRect(int px, int py, int x, int y, int w, int h)
+{
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
 void drawPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight, int x, int y, u8 r, u8 g, u8 b)
 {
     if (x >= 0 && x < fbWidth && y >= 0 && y < fbHeight)
@@ -329,10 +391,10 @@ void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, 
 }
 
 static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
-                             int screenX, int screenY, int offsetX, int offsetY, CanvasState &canvas)
+                             int screenX, int screenY, CanvasState &canvas)
 {
-    int canvasX = screenX + offsetX;
-    int canvasY = screenY + offsetY;
+    int canvasX = canvas.screenToCanvasX(screenX);
+    int canvasY = canvas.screenToCanvasY(screenY);
     if (canvasX < 0 || canvasX >= canvasWidth || canvasY < 0 || canvasY >= canvasHeight)
         return;
 
@@ -345,31 +407,55 @@ static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
 
 static void drawStrokeLine(u8 *fullCanvas, int canvasWidth, int canvasHeight,
                            float x0, float y0, float x1, float y1,
-                           int offsetX, int offsetY, CanvasState &canvas)
+                           CanvasState &canvas)
 {
-    int steps = std::max(1, (int)std::ceil(std::max(fabsf(x1 - x0), fabsf(y1 - y0))));
+    float zoom = canvas.zoomScale();
+    float cx0 = (float)canvas.offsetX + x0 / zoom;
+    float cy0 = (float)canvas.offsetY + y0 / zoom;
+    float cx1 = (float)canvas.offsetX + x1 / zoom;
+    float cy1 = (float)canvas.offsetY + y1 / zoom;
+    int steps = std::max(1, (int)std::ceil(std::max(fabsf(cx1 - cx0), fabsf(cy1 - cy0))));
     for (int i = 0; i <= steps; i++)
     {
         float t = (float)i / (float)steps;
-        int x = (int)std::round(x0 + (x1 - x0) * t);
-        int y = (int)std::round(y0 + (y1 - y0) * t);
-        drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, x, y, offsetX, offsetY, canvas);
+        int x = (int)std::round(cx0 + (cx1 - cx0) * t);
+        int y = (int)std::round(cy0 + (cy1 - cy0) * t);
+        if (x < 0 || x >= canvasWidth || y < 0 || y >= canvasHeight)
+            continue;
+        drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
+                  currentBrushSize, currentBrushShape,
+                  currentColor.r, currentColor.g, currentColor.b);
+        canvas.markDirty(x, y, currentBrushSize);
+        UIState::addPoint(x, y);
     }
 }
 
 static void drawStrokeCurve(u8 *fullCanvas, int canvasWidth, int canvasHeight,
                             float x0, float y0, float cx, float cy, float x1, float y1,
-                            int offsetX, int offsetY, CanvasState &canvas)
+                            CanvasState &canvas)
 {
-    float lengthEstimate = hypotf(cx - x0, cy - y0) + hypotf(x1 - cx, y1 - cy);
+    float zoom = canvas.zoomScale();
+    float c0x = (float)canvas.offsetX + x0 / zoom;
+    float c0y = (float)canvas.offsetY + y0 / zoom;
+    float ccx = (float)canvas.offsetX + cx / zoom;
+    float ccy = (float)canvas.offsetY + cy / zoom;
+    float c1x = (float)canvas.offsetX + x1 / zoom;
+    float c1y = (float)canvas.offsetY + y1 / zoom;
+    float lengthEstimate = hypotf(ccx - c0x, ccy - c0y) + hypotf(c1x - ccx, c1y - ccy);
     int steps = std::max(2, (int)std::ceil(lengthEstimate * 1.25f));
     for (int i = 0; i <= steps; i++)
     {
         float t = (float)i / (float)steps;
         float inv = 1.0f - t;
-        int x = (int)std::round(inv * inv * x0 + 2.0f * inv * t * cx + t * t * x1);
-        int y = (int)std::round(inv * inv * y0 + 2.0f * inv * t * cy + t * t * y1);
-        drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, x, y, offsetX, offsetY, canvas);
+        int x = (int)std::round(inv * inv * c0x + 2.0f * inv * t * ccx + t * t * c1x);
+        int y = (int)std::round(inv * inv * c0y + 2.0f * inv * t * ccy + t * t * c1y);
+        if (x < 0 || x >= canvasWidth || y < 0 || y >= canvasHeight)
+            continue;
+        drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
+                  currentBrushSize, currentBrushShape,
+                  currentColor.r, currentColor.g, currentColor.b);
+        canvas.markDirty(x, y, currentBrushSize);
+        UIState::addPoint(x, y);
     }
 }
 
@@ -560,7 +646,7 @@ int main(int argc, char **argv)
            "- DOWN/B: Toggle Color Picker\n"
            "- Hold UP + tap: Sample color\n"
            "- X: Input Hex color code\n"
-           "- Y: Check for updates\n"
+           "- Hold RIGHT/Y + touch: Zoom buttons\n"
            "- L: Switch channel\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
@@ -597,6 +683,9 @@ int main(int argc, char **argv)
             if (Protocol::parseUpdateRequired(line, latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
             {
                 printf("Update required: %s Latest: %s\n", updateReason, latestVersion);
+#if TEST_MODE
+                failExit("Server requested update to %s.\nTEST_MODE disables updater.", latestVersion);
+#else
                 UpdateManifest manifest;
                 if (Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, manifest) && waitForUpdateConfirm(manifest) &&
                     Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, appPath, updateProgress, NULL) == UPDATE_DOWNLOAD_OK)
@@ -604,6 +693,7 @@ int main(int argc, char **argv)
                     exitAfterUpdateInstalled();
                 }
                 failExit("Update required.\nDownload the latest Collab Doodle build to continue.");
+#endif
             }
 
             if (Protocol::parseChannels(line, availableChannels, 8, availableChannelCount, currentChannel))
@@ -668,8 +758,11 @@ int main(int argc, char **argv)
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
-        ox = std::max(-20, std::min(ox, canvasWidth - fbWidth));
-        oy = std::max(-20, std::min(oy, canvasHeight - fbHeight + 100));
+        canvas.offsetX = ox;
+        canvas.offsetY = oy;
+        canvas.clampOffsets(fbHeight, fbWidth);
+        ox = canvas.offsetX;
+        oy = canvas.offsetY;
     };
 
     auto syncSelectedChannel = [&]()
@@ -848,45 +941,6 @@ int main(int argc, char **argv)
             }
         }
 
-        if (kDown & KEY_Y)
-        {
-            printf("Checking for updates...\n");
-            UpdateManifest manifest;
-            if (!Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, manifest))
-            {
-                updateAvailable = false;
-                printf("Update check failed.\n");
-            }
-            else if (!manifest.available)
-            {
-                updateAvailable = false;
-                printf("Already on latest version %s.\n", APP_VERSION);
-            }
-            else
-            {
-                updateAvailable = true;
-                printf("Update %s available.\n", manifest.latestVersion);
-                if (waitForUpdateConfirm(manifest))
-                {
-                    UpdateDownloadResult result = Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, appPath, updateProgress, NULL);
-                    if (result == UPDATE_DOWNLOAD_OK)
-                    {
-                        exitAfterUpdateInstalled();
-                    }
-                    else
-                    {
-                        printf("Download failed: %d\n", result);
-                    }
-                }
-                else
-                {
-                    printf("Update canceled.\n");
-                }
-            }
-            topMode = TOP_MODE_CANVAS;
-            topRenderFrame = 10;
-        }
-
         if (kDown & KEY_R)
         {
             topMode = (topMode == TOP_MODE_CONTROLS) ? TOP_MODE_CANVAS : TOP_MODE_CONTROLS;
@@ -933,7 +987,46 @@ int main(int argc, char **argv)
             }
         }
 
-        if (topMode != TOP_MODE_CHANNELS && (kDown & (KEY_DDOWN | KEY_B)))
+        touchPosition touch;
+        hidTouchRead(&touch);
+
+        bool zoomOverlayLeft = (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT);
+        bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DRIGHT | KEY_Y));
+        if (zoomOverlayActive && (kDown & KEY_TOUCH))
+        {
+            const int zoomButtonX = zoomOverlayX(zoomOverlayLeft);
+            const int zoomButtonW = 42;
+            const int zoomButtonH = 58;
+            bool zoomChanged = false;
+            if (pointInRect(touch.px, touch.py, zoomButtonX, 42, zoomButtonW, zoomButtonH))
+            {
+                canvas.zoomIn();
+                zoomChanged = true;
+            }
+            else if (pointInRect(touch.px, touch.py, zoomButtonX, 144, zoomButtonW, zoomButtonH))
+            {
+                canvas.zoomOut();
+                zoomChanged = true;
+            }
+
+            if (zoomChanged)
+            {
+                canvas.offsetX = offsetX;
+                canvas.offsetY = offsetY;
+                canvas.clampOffsets(fbHeight, fbWidth);
+                offsetX = canvas.offsetX;
+                offsetY = canvas.offsetY;
+                canvas.markFullDirty();
+                Renderer::invalidateMinimap();
+                topRenderFrame = 10;
+                prevTouchX = prevTouchY = -1;
+                prevPrevTouchX = prevPrevTouchY = -1;
+                hasLastStrokePoint = false;
+                printf("Zoom: %s\n", canvas.zoomLabel());
+            }
+        }
+
+        if (topMode != TOP_MODE_CHANNELS && !(kHeld & (KEY_DRIGHT | KEY_Y)) && (kDown & (KEY_DDOWN | KEY_B)))
         {
             UIState::toggleColorPicker();
             topMode = TOP_MODE_CANVAS;
@@ -945,16 +1038,15 @@ int main(int argc, char **argv)
             handleHexColorInput();
         }
 
-        touchPosition touch;
-        hidTouchRead(&touch);
-
         // Eye Dropper functionality
-        if (topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
+        if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
         {
             if (kDown & KEY_TOUCH)
             {
-                int touchX = touch.px + offsetX;
-                int touchY = touch.py + offsetY;
+                canvas.offsetX = offsetX;
+                canvas.offsetY = offsetY;
+                int touchX = canvas.screenToCanvasX(touch.px);
+                int touchY = canvas.screenToCanvasY(touch.py);
 
                 if (touchX >= 0 && touchX < canvasWidth && touchY >= 0 && touchY < canvasHeight)
                 {
@@ -968,7 +1060,7 @@ int main(int argc, char **argv)
             }
         }
 
-        if (topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && (kHeld & KEY_TOUCH))
+        if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && (kHeld & KEY_TOUCH))
         {
             float h, s, v;
             UIState::getHSV(h, s, v);
@@ -1029,7 +1121,7 @@ int main(int argc, char **argv)
             }
         }
 
-        if (topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DLEFT | KEY_A)))
+        if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DLEFT | KEY_A)))
         {
             // Panning mode
             if (kHeld & KEY_TOUCH)
@@ -1043,8 +1135,8 @@ int main(int argc, char **argv)
                 }
                 else
                 {
-                    int deltaX = touch.px - prevTouchX;
-                    int deltaY = touch.py - prevTouchY;
+                    int deltaX = canvas.screenDeltaToCanvas(touch.px - prevTouchX);
+                    int deltaY = canvas.screenDeltaToCanvas(touch.py - prevTouchY);
 
                     offsetX -= deltaX;
                     offsetY -= deltaY;
@@ -1065,7 +1157,7 @@ int main(int argc, char **argv)
                 hasLastStrokePoint = false;
             }
         }
-        else if (topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive())
+        else if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive())
         {
             // Normal drawing mode
             if (kHeld & KEY_TOUCH)
@@ -1078,7 +1170,9 @@ int main(int argc, char **argv)
                     lastStrokeX = (float)touch.px;
                     lastStrokeY = (float)touch.py;
                     hasLastStrokePoint = true;
-                    drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, touch.px, touch.py, offsetX, offsetY, canvas);
+                    canvas.offsetX = offsetX;
+                    canvas.offsetY = offsetY;
+                    drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, touch.px, touch.py, canvas);
                 }
                 else
                 {
@@ -1087,7 +1181,7 @@ int main(int argc, char **argv)
                         drawStrokeLine(fullCanvas, canvasWidth, canvasHeight,
                                        (float)prevTouchX, (float)prevTouchY,
                                        (float)touch.px, (float)touch.py,
-                                       offsetX, offsetY, canvas);
+                                       canvas);
                         lastStrokeX = (float)touch.px;
                         lastStrokeY = (float)touch.py;
                     }
@@ -1099,7 +1193,7 @@ int main(int argc, char **argv)
                                         lastStrokeX, lastStrokeY,
                                         (float)prevTouchX, (float)prevTouchY,
                                         endX, endY,
-                                        offsetX, offsetY, canvas);
+                                        canvas);
                         lastStrokeX = endX;
                         lastStrokeY = endY;
                     }
@@ -1132,7 +1226,7 @@ int main(int argc, char **argv)
                     drawStrokeLine(fullCanvas, canvasWidth, canvasHeight,
                                    lastStrokeX, lastStrokeY,
                                    (float)prevTouchX, (float)prevTouchY,
-                                   offsetX, offsetY, canvas);
+                                   canvas);
                 }
 
                 if (!UIState::getPoints().empty())
@@ -1220,6 +1314,8 @@ int main(int argc, char **argv)
         canvas.offsetY = offsetY;
         bool canvasWasDirty = canvas.dirty.valid;
         Renderer::renderViewport(canvas, buffer, fbWidth, fbHeight, false);
+        if (zoomOverlayActive)
+            drawZoomOverlay(buffer, fbWidth, fbHeight, zoomOverlayLeft);
         canvas.clearDirty();
 
         bool activelyDrawing = !UIState::isColorPickerActive() &&

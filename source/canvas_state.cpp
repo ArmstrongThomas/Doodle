@@ -1,8 +1,9 @@
 #include "canvas_state.h"
 #include <zlib.h>
+#include <cmath>
 
 CanvasState::CanvasState()
-    : width(0), height(0), size(0), offsetX(0), offsetY(0), pixels(NULL)
+    : width(0), height(0), size(0), offsetX(0), offsetY(0), zoomLevel(0), pixels(NULL)
 {
     channel[0] = '\0';
     clearDirty();
@@ -105,8 +106,74 @@ void CanvasState::clearDirty()
 
 void CanvasState::clampOffsets(int screenWidth, int screenHeight)
 {
-    offsetX = std::max(-20, std::min(offsetX, width - screenWidth));
-    offsetY = std::max(-20, std::min(offsetY, height - screenHeight + 100));
+    int visibleWidth = viewWidth(screenWidth);
+    int visibleHeight = viewHeight(screenHeight);
+    offsetX = std::max(-20, std::min(offsetX, width - visibleWidth));
+    offsetY = std::max(-20, std::min(offsetY, height - visibleHeight + 100));
+}
+
+void CanvasState::zoomIn()
+{
+    zoomLevel = std::min(2, zoomLevel + 1);
+}
+
+void CanvasState::zoomOut()
+{
+    zoomLevel = std::max(-1, zoomLevel - 1);
+}
+
+float CanvasState::zoomScale() const
+{
+    if (zoomLevel <= -1) return 0.5f;
+    if (zoomLevel == 1) return 2.0f;
+    if (zoomLevel >= 2) return 4.0f;
+    return 1.0f;
+}
+
+const char *CanvasState::zoomLabel() const
+{
+    if (zoomLevel <= -1) return "0.5X";
+    if (zoomLevel == 1) return "2X";
+    if (zoomLevel >= 2) return "4X";
+    return "1X";
+}
+
+int CanvasState::viewWidth(int screenWidth) const
+{
+    if (zoomLevel <= -1) return screenWidth * 2;
+    if (zoomLevel == 1) return std::max(1, screenWidth / 2);
+    if (zoomLevel >= 2) return std::max(1, screenWidth / 4);
+    return screenWidth;
+}
+
+int CanvasState::viewHeight(int screenHeight) const
+{
+    if (zoomLevel <= -1) return screenHeight * 2;
+    if (zoomLevel == 1) return std::max(1, screenHeight / 2);
+    if (zoomLevel >= 2) return std::max(1, screenHeight / 4);
+    return screenHeight;
+}
+
+int CanvasState::screenToCanvasX(int screenX) const
+{
+    if (zoomLevel <= -1) return offsetX + screenX * 2;
+    if (zoomLevel == 1) return offsetX + screenX / 2;
+    if (zoomLevel >= 2) return offsetX + screenX / 4;
+    return offsetX + screenX;
+}
+
+int CanvasState::screenToCanvasY(int screenY) const
+{
+    if (zoomLevel <= -1) return offsetY + screenY * 2;
+    if (zoomLevel == 1) return offsetY + screenY / 2;
+    if (zoomLevel >= 2) return offsetY + screenY / 4;
+    return offsetY + screenY;
+}
+
+int CanvasState::screenDeltaToCanvas(int delta) const
+{
+    float scaled = (float)delta / zoomScale();
+    return (int)std::round(scaled);
 }
 
 void CanvasState::setChannel(const char *name)

@@ -22,6 +22,15 @@ public:
     void markDirty(int x, int y, int radius);
     void clearDirty();
     void clampOffsets(int screenWidth, int screenHeight);
+    void zoomIn();
+    void zoomOut();
+    float zoomScale() const;
+    const char *zoomLabel() const;
+    int viewWidth(int screenWidth) const;
+    int viewHeight(int screenHeight) const;
+    int screenToCanvasX(int screenX) const;
+    int screenToCanvasY(int screenY) const;
+    int screenDeltaToCanvas(int delta) const;
     void setChannel(const char *name);
 
     int width;
@@ -29,6 +38,7 @@ public:
     int size;
     int offsetX;
     int offsetY;
+    int zoomLevel;
     u8 *pixels;
     DirtyRect dirty;
     char channel[25];

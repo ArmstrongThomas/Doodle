@@ -38,10 +38,11 @@ DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_VERSION	?=	1.1.0
+APP_VERSION	?=	1.1.1
 SERVER_HOST	?=	server1.rpgwo.org
 SERVER_TCP_PORT	?=	3030
 SERVER_HTTP_PORT	?=	3000
+TEST_MODE	?=	0
 APP_TITLE	:=	Collab Doodle v$(APP_VERSION)
 APP_DESCRIPTION	:=	Shared canvas drawing for Nintendo 3DS - v$(APP_VERSION)
 APP_AUTHOR	:=	Tommy
@@ -63,7 +64,8 @@ CFLAGS	+=	$(INCLUDE) -D__3DS__ \
 			-DAPP_VERSION=\"$(APP_VERSION)\" \
 			-DSERVER_HOST=\"$(SERVER_HOST)\" \
 			-DSERVER_TCP_PORT=\"$(SERVER_TCP_PORT)\" \
-			-DSERVER_HTTP_PORT=\"$(SERVER_HTTP_PORT)\"
+			-DSERVER_HTTP_PORT=\"$(SERVER_HTTP_PORT)\" \
+			-DTEST_MODE=$(TEST_MODE)
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 

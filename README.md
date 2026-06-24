@@ -4,12 +4,13 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.1.0`
+- Version: `1.1.1`
 
 ## Features
 
 - Real-time collaborative drawing with the 3DS touchscreen.
 - Top-screen minimap with viewport marker.
+- Zoom levels: `0.5x`, `1x`, `2x`, and `4x`.
 - Named channels: `main`, `sketch`, and `test`.
 - Channel switch UI on the 3DS.
 - Color picker, color sampling, brush size/shape controls, and hex color entry.
@@ -29,6 +30,10 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 - Touch bottom screen: Draw.
 - Hold LEFT D-Pad or A + drag stylus: Pan viewport.
+- Hold RIGHT D-Pad: Show zoom buttons on the right side of the bottom screen.
+- Hold Y: Show zoom buttons on the left side of the bottom screen.
+- Hold RIGHT D-Pad or Y + tap `+`: Zoom in.
+- Hold RIGHT D-Pad or Y + tap `-`: Zoom out.
 - START: Refresh canvas from server.
 - SELECT: Exit.
 - L: Open/close channel selector.
@@ -38,7 +43,6 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - B or D-Pad DOWN: Toggle color picker.
 - Hold D-Pad UP + tap canvas: Sample color.
 - X: Enter hex color.
-- Y: Check for updates.
 
 ## Server Links
 
@@ -72,10 +76,11 @@ make
 The Makefile exposes release/server variables:
 
 ```make
-APP_VERSION ?= 1.1.0
+APP_VERSION ?= 1.1.1
 SERVER_HOST ?= server1.rpgwo.org
 SERVER_TCP_PORT ?= 3030
 SERVER_HTTP_PORT ?= 3000
+TEST_MODE ?= 0
 ```
 
 Override them when building local test versions:
@@ -84,7 +89,13 @@ Override them when building local test versions:
 make SERVER_HOST=192.168.1.46 SERVER_TCP_PORT=3030 SERVER_HTTP_PORT=3000
 ```
 
-The same values are compiled into networking, updater requests, client hello/version checks, SMDH metadata, and the top-screen version label.
+Local 3dslink test build with updater prompts disabled:
+
+```powershell
+make TEST_MODE=1 SERVER_HOST=192.168.1.46 SERVER_TCP_PORT=3030 SERVER_HTTP_PORT=3000
+```
+
+The same values are compiled into networking, updater requests, client hello/version checks, SMDH metadata, and the top-screen version label. `TEST_MODE=1` disables client-side update prompts/downloads so local builds can be sent with `3dslink` without publishing a live update.
 
 ## Running on Hardware
 
