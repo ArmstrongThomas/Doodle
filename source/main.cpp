@@ -10,6 +10,8 @@
 #include <math.h>
 #include <algorithm>
 #include <unordered_map>
+#include <sys/stat.h>
+#include <errno.h>
 #include "ui.h"
 #include "network.h"
 #include "canvas_state.h"
@@ -20,6 +22,183 @@
 Color currentColor = {255, 0, 0}; // Red by default
 int currentBrushSize = 1;
 int currentBrushShape = 0;
+
+struct DeviceIdentity {
+    char deviceId[48];
+    char deviceSecret[64];
+    char displayName[32];
+    char username[25];
+    char backupCode[32];
+};
+
+static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", ""};
+static char gIdentityStorageStatus[64] = "STORE UNKNOWN";
+static char gIdentityBootStatus[64] = "BOOT UNKNOWN";
+static const char *IDENTITY_PRIMARY_PATH = "sdmc:/3ds/CollabDoodle/identity.txt";
+static const char *IDENTITY_FALLBACK_PATH = "sdmc:/3ds/CollabDoodle.identity.txt";
+static int gLastPrimaryReadErr = 0;
+static int gLastFallbackReadErr = 0;
+
+static void randomHex(char *out, size_t outSize)
+{
+    static const char *hex = "0123456789abcdef";
+    static bool seeded = false;
+    if (!out || outSize == 0)
+        return;
+    if (!seeded)
+    {
+        srand((unsigned int)(osGetTime() ^ svcGetSystemTick()));
+        seeded = true;
+    }
+    for (size_t i = 0; i + 1 < outSize; i++)
+        out[i] = hex[rand() & 15];
+    out[outSize - 1] = '\0';
+}
+
+static void trimLine(char *text)
+{
+    if (!text)
+        return;
+    size_t len = strlen(text);
+    while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r' || text[len - 1] == ' '))
+        text[--len] = '\0';
+}
+
+static bool readIdentityFile(const char *path)
+{
+    errno = 0;
+    FILE *file = fopen(path, "r");
+    int openErr = errno;
+    if (!file)
+    {
+        if (strcmp(path, IDENTITY_PRIMARY_PATH) == 0)
+            gLastPrimaryReadErr = openErr;
+        else
+            gLastFallbackReadErr = openErr;
+        return false;
+    }
+
+    char deviceId[96] = "";
+    char deviceSecret[128] = "";
+    char displayName[64] = "";
+    char username[64] = "";
+    char backupCode[64] = "";
+    fgets(deviceId, sizeof(deviceId), file);
+    fgets(deviceSecret, sizeof(deviceSecret), file);
+    fgets(displayName, sizeof(displayName), file);
+    fgets(username, sizeof(username), file);
+    fgets(backupCode, sizeof(backupCode), file);
+    fclose(file);
+
+    trimLine(deviceId);
+    trimLine(deviceSecret);
+    trimLine(displayName);
+    trimLine(username);
+    trimLine(backupCode);
+    snprintf(gIdentity.deviceId, sizeof(gIdentity.deviceId), "%s", deviceId);
+    snprintf(gIdentity.deviceSecret, sizeof(gIdentity.deviceSecret), "%s", deviceSecret);
+    snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", displayName);
+    snprintf(gIdentity.username, sizeof(gIdentity.username), "%s", username);
+    snprintf(gIdentity.backupCode, sizeof(gIdentity.backupCode), "%s", backupCode);
+    if (!gIdentity.displayName[0])
+        strcpy(gIdentity.displayName, "3DS User");
+    if (!gIdentity.username[0])
+        strcpy(gIdentity.username, "pending");
+
+    return gIdentity.deviceId[0] && gIdentity.deviceSecret[0];
+}
+
+static bool writeIdentityFile(const char *path)
+{
+    errno = 0;
+    FILE *file = fopen(path, "w");
+    if (!file)
+        return false;
+    fprintf(file, "%s\n%s\n%s\n%s\n%s\n", gIdentity.deviceId, gIdentity.deviceSecret,
+            gIdentity.displayName, gIdentity.username, gIdentity.backupCode);
+    fflush(file);
+    bool ok = fclose(file) == 0;
+    return ok;
+}
+
+static bool verifyIdentityWrite(const char *path)
+{
+    DeviceIdentity expected = gIdentity;
+    DeviceIdentity current = gIdentity;
+    bool ok = readIdentityFile(path) &&
+              strcmp(gIdentity.deviceId, expected.deviceId) == 0 &&
+              strcmp(gIdentity.deviceSecret, expected.deviceSecret) == 0;
+    gIdentity = current;
+    return ok;
+}
+
+static const char *deviceIdSuffix()
+{
+    size_t len = strlen(gIdentity.deviceId);
+    return len > 6 ? gIdentity.deviceId + len - 6 : gIdentity.deviceId;
+}
+
+static void saveDeviceIdentity()
+{
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/CollabDoodle", 0777);
+
+    bool primaryOk = writeIdentityFile(IDENTITY_PRIMARY_PATH);
+    int primaryErr = primaryOk ? 0 : errno;
+    bool fallbackOk = writeIdentityFile(IDENTITY_FALLBACK_PATH);
+    int fallbackErr = fallbackOk ? 0 : errno;
+    bool primaryVerify = primaryOk && verifyIdentityWrite(IDENTITY_PRIMARY_PATH);
+    bool fallbackVerify = fallbackOk && verifyIdentityWrite(IDENTITY_FALLBACK_PATH);
+
+    if (primaryVerify)
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "SAVED P %s", deviceIdSuffix());
+    else if (fallbackVerify)
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "SAVED F %s", deviceIdSuffix());
+    else if (primaryOk || fallbackOk)
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "WRITE NOREAD %d/%d", gLastPrimaryReadErr, gLastFallbackReadErr);
+    else
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "SAVE ERR %d/%d", primaryErr, fallbackErr);
+}
+
+static void loadDeviceIdentity()
+{
+    Result fsResult = fsInit();
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/CollabDoodle", 0777);
+
+    if (readIdentityFile(IDENTITY_PRIMARY_PATH))
+    {
+        snprintf(gIdentityBootStatus, sizeof(gIdentityBootStatus), "LOADED P %s", deviceIdSuffix());
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "%s", gIdentityBootStatus);
+        return;
+    }
+    int primaryErr = errno;
+
+    if (readIdentityFile(IDENTITY_FALLBACK_PATH))
+    {
+        snprintf(gIdentityBootStatus, sizeof(gIdentityBootStatus), "LOADED F %s", deviceIdSuffix());
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "%s", gIdentityBootStatus);
+        saveDeviceIdentity();
+        return;
+    }
+    int fallbackErr = errno;
+
+    if (!gIdentity.deviceId[0] || !gIdentity.deviceSecret[0])
+    {
+        strcpy(gIdentity.deviceId, "3ds-");
+        randomHex(gIdentity.deviceId + 4, sizeof(gIdentity.deviceId) - 4);
+        randomHex(gIdentity.deviceSecret, sizeof(gIdentity.deviceSecret));
+        strcpy(gIdentity.displayName, "3DS User");
+        strcpy(gIdentity.username, "pending");
+        gIdentity.backupCode[0] = '\0';
+        snprintf(gIdentityBootStatus, sizeof(gIdentityBootStatus), "NEW %s R%d/%d",
+                 deviceIdSuffix(), primaryErr, fallbackErr);
+        snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "%s", gIdentityBootStatus);
+        saveDeviceIdentity();
+        snprintf(gIdentityBootStatus, sizeof(gIdentityBootStatus), "NEW %s R%d/%d F%08lX",
+                 deviceIdSuffix(), primaryErr, fallbackErr, (unsigned long)fsResult);
+    }
+}
 
 static void failExit(const char *fmt, ...)
 {
@@ -42,8 +221,9 @@ static void failExit(const char *fmt, ...)
 
 static bool sendClientHello(int sock)
 {
-    char hello[128];
-    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true);
+    char hello[320];
+    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true,
+                         gIdentity.deviceId, gIdentity.deviceSecret, gIdentity.displayName);
     return sock >= 0 && send(sock, hello, strlen(hello), 0) > 0;
 }
 
@@ -69,6 +249,48 @@ static void fillRect(u8 *fb, int width, int height, int x, int y, int w, int h, 
     for (int py = y; py < y + h; py++)
         for (int px = x; px < x + w; px++)
             putScreenPixel(fb, width, height, px, py, r, g, b);
+}
+
+static void drawRectOutline(u8 *fb, int fbWidth, int fbHeight, int x, int y, int w, int h, u8 r, u8 g, u8 b)
+{
+    if (!fb || w <= 0 || h <= 0)
+        return;
+    for (int inset = 0; inset < 2; inset++)
+    {
+        for (int px = x + inset; px < x + w - inset; px++)
+        {
+            putScreenPixel(fb, fbWidth, fbHeight, px, y + inset, r, g, b);
+            putScreenPixel(fb, fbWidth, fbHeight, px, y + h - 1 - inset, r, g, b);
+        }
+        for (int py = y + inset; py < y + h - inset; py++)
+        {
+            putScreenPixel(fb, fbWidth, fbHeight, x + inset, py, r, g, b);
+            putScreenPixel(fb, fbWidth, fbHeight, x + w - 1 - inset, py, r, g, b);
+        }
+    }
+}
+
+static void applyCanvasRectLocal(CanvasState &canvas, int x, int y, int w, int h, Color color)
+{
+    if (!canvas.pixels || w <= 0 || h <= 0)
+        return;
+    int minX = std::max(0, x);
+    int minY = std::max(0, y);
+    int maxX = std::min(canvas.width - 1, x + w - 1);
+    int maxY = std::min(canvas.height - 1, y + h - 1);
+    if (minX > maxX || minY > maxY)
+        return;
+    for (int py = minY; py <= maxY; py++)
+    {
+        for (int px = minX; px <= maxX; px++)
+        {
+            int idx = 3 * (py * canvas.width + px);
+            canvas.pixels[idx] = color.r;
+            canvas.pixels[idx + 1] = color.g;
+            canvas.pixels[idx + 2] = color.b;
+        }
+    }
+    canvas.markDirty((minX + maxX) / 2, (minY + maxY) / 2, std::max(maxX - minX, maxY - minY) / 2 + 2);
 }
 
 static void drawMiniGlyph(u8 *fb, int width, int height, int x, int y, char c, u8 r, u8 g, u8 b)
@@ -341,6 +563,13 @@ u8 clampColor(float colorValue)
 
 void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, int size, int shape, u8 r, u8 g, u8 b)
 {
+    static const int bayer4[4][4] = {
+        {0, 8, 2, 10},
+        {12, 4, 14, 6},
+        {3, 11, 1, 9},
+        {15, 7, 13, 5},
+    };
+    int radius = std::max(1, size / 2);
     for (int y = -size / 2; y <= size / 2; y++)
     {
         for (int x = -size / 2; x <= size / 2; x++)
@@ -356,35 +585,16 @@ void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, 
             { // Square
                 drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
             }
-            else if (shape == 2) // Gaussian Soft Brush
+            else if (shape == 2)
             {
-                int radius = size / 2;
-                const std::vector<float> &falloffTable = gaussianFalloffTables[size];
-                int diameter = 2 * radius + 1;
-
-                for (int y = -radius; y <= radius; y++)
-                {
-                    for (int x = -radius; x <= radius; x++)
-                    {
-                        if (centerY + y < 0 || centerY + y >= fbHeight || centerX + x < 0 || centerX + x >= fbWidth)
-                            continue;
-
-                        float intensity = falloffTable[(y + radius) * diameter + (x + radius)];
-                        if (intensity <= 0.0f)
-                            continue;
-
-                        int idx = 3 * ((centerY + y) * fbWidth + (centerX + x));
-                        u8 baseB = buffer[idx + 2];
-                        u8 baseG = buffer[idx + 1];
-                        u8 baseR = buffer[idx];
-
-                        u8 blendedR = std::round(r * intensity + baseR * (1.0f - intensity));
-                        u8 blendedG = std::round(g * intensity + baseG * (1.0f - intensity));
-                        u8 blendedB = std::round(b * intensity + baseB * (1.0f - intensity));
-
-                        drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, blendedR, blendedG, blendedB);
-                    }
-                }
+                int dist2 = x * x + y * y;
+                if (dist2 > radius * radius)
+                    continue;
+                float dist = sqrtf((float)dist2);
+                float coverage = 1.0f - (dist / (float)(radius + 1));
+                int threshold = bayer4[(centerY + y) & 3][(centerX + x) & 3];
+                if ((int)(coverage * 16.0f) > threshold)
+                    drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
             }
         }
     }
@@ -578,6 +788,120 @@ static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint> &points,
     }
 }
 
+static void drawPaletteButton(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h,
+                              const char *label, bool active, bool danger)
+{
+    u8 r = active ? 24 : (danger ? 196 : 230);
+    u8 g = active ? 33 : (danger ? 61 : 235);
+    u8 b = active ? 38 : (danger ? 61 : 240);
+    fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, r, g, b);
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, 104, 114, 124);
+    drawMiniText(framebuffer, fbWidth, fbHeight, x + 14, y + (h / 2) - 3, label,
+                 active || danger ? 245 : 32, active || danger ? 248 : 36, active || danger ? 250 : 42);
+}
+
+static void drawPaletteBrushChoice(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int size, int shape, bool selected)
+{
+    if (selected)
+    {
+        fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x - 13, y - 13, 26, 26, 94, 234, 212);
+        fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x - 10, y - 10, 20, 20, 220, 226, 232);
+    }
+    int radius = std::max(2, size + 2);
+    for (int py = -radius; py <= radius; py++)
+    {
+        for (int px = -radius; px <= radius; px++)
+        {
+            bool draw = shape == 1 || (px * px + py * py <= radius * radius);
+            if (shape == 2 && (abs(px) + abs(py)) % 2 == 1)
+                draw = false;
+            if (draw)
+                putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + px, y + py, 24, 33, 38);
+        }
+    }
+}
+
+static void drawColorSquare(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h,
+                            float hue, float saturation, float value)
+{
+    for (int py = 0; py < h; py++)
+    {
+        float v = 1.0f - ((float)py / (float)std::max(1, h - 1));
+        for (int px = 0; px < w; px++)
+        {
+            float s = (float)px / (float)std::max(1, w - 1);
+            float rr, gg, bb;
+            UIState::HSVtoRGB(hue, s, v, rr, gg, bb);
+            putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + px, y + py,
+                                 (u8)(rr * 255.0f), (u8)(gg * 255.0f), (u8)(bb * 255.0f));
+        }
+    }
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, 24, 33, 38);
+    int knobX = x + std::max(0, std::min(w - 1, (int)(saturation * (float)(w - 1))));
+    int knobY = y + std::max(0, std::min(h - 1, (int)((1.0f - value) * (float)(h - 1))));
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 4, knobY - 4, 9, 9, 245, 248, 250);
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 3, knobY - 3, 7, 7, 24, 33, 38);
+}
+
+static void drawHueStrip(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h, float hue)
+{
+    for (int px = 0; px < w; px++)
+    {
+        float hh = (float)px / (float)std::max(1, w - 1);
+        float rr, gg, bb;
+        UIState::HSVtoRGB(hh, 1.0f, 1.0f, rr, gg, bb);
+        fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x + px, y, 1, h,
+                             (u8)(rr * 255.0f), (u8)(gg * 255.0f), (u8)(bb * 255.0f));
+    }
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, 24, 33, 38);
+    int knobX = x + std::max(0, std::min(w - 1, (int)(hue * (float)(w - 1))));
+    fillBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 2, y - 3, 5, h + 6, 245, 248, 250);
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 2, y - 3, 5, h + 6, 24, 33, 38);
+}
+
+static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int activeTab, bool modAllowed,
+                            Color color, const char *notice)
+{
+    fillBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 220, 226, 232);
+    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 104, 114, 124);
+
+    drawPaletteButton(framebuffer, fbWidth, fbHeight, 14, 14, 88, 28, "COLOR", activeTab == 0, false);
+    drawPaletteButton(framebuffer, fbWidth, fbHeight, 106, 14, 88, 28, "MOD", activeTab == 1, false);
+
+    if (activeTab == 0)
+    {
+        drawMiniText(framebuffer, fbWidth, fbHeight, 26, 52, "BRUSH", 73, 82, 92);
+        const int shapeXs[] = {38, 78, 118};
+        const int sizeYs[] = {70, 92, 114, 136, 158};
+        const int sizes[] = {1, 2, 3, 5, 7};
+        drawMiniText(framebuffer, fbWidth, fbHeight, 26, 184, "CIR", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 66, 184, "BOX", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 106, 184, "DIT", 73, 82, 92);
+        for (int row = 0; row < 5; row++)
+            for (int shape = 0; shape < 3; shape++)
+                drawPaletteBrushChoice(framebuffer, fbWidth, fbHeight, shapeXs[shape], sizeYs[row],
+                                       sizes[row], shape, currentBrushSize == sizes[row] && currentBrushShape == shape);
+
+        float h, s, v;
+        UIState::getHSV(h, s, v);
+        drawColorSquare(framebuffer, fbWidth, fbHeight, 162, 54, 132, 132, h, s, v);
+        drawHueStrip(framebuffer, fbWidth, fbHeight, 162, 198, 132, 14, h);
+    }
+    else
+    {
+        if (!modAllowed)
+        {
+            drawMiniText(framebuffer, fbWidth, fbHeight, 32, 84, "MOD OR ADMIN REQUIRED", 196, 61, 61);
+            drawMiniText(framebuffer, fbWidth, fbHeight, 32, 110, "SET ROLE IN WEB ADMIN", 32, 36, 42);
+            return;
+        }
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 58, 132, 44, "SNAPSHOT", true, false);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 166, 58, 132, 44, "CLEAR", false, true);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 118, 276, 48, "FILL RECT", true, false);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 24, 190, notice && notice[0] ? notice : "DRAG SELECTION TO FILL", 32, 36, 42);
+    }
+}
+
 void handleHexColorInput()
 {
     SwkbdState swkbd;
@@ -596,6 +920,94 @@ void handleHexColorInput()
     }
 }
 
+static bool editDisplayName(int sock, IdentityInfo &identityInfo)
+{
+    SwkbdState swkbd;
+    char inputText[25];
+    snprintf(inputText, sizeof(inputText), "%s", identityInfo.displayName[0] ? identityInfo.displayName : gIdentity.displayName);
+
+    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, 24);
+    swkbdSetHintText(&swkbd, "Display name");
+    swkbdSetInitialText(&swkbd, inputText);
+
+    if (swkbdInputText(&swkbd, inputText, sizeof(inputText)) != SWKBD_BUTTON_CONFIRM)
+        return false;
+
+    trimLine(inputText);
+    if (!inputText[0])
+        return false;
+
+    snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", inputText);
+    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", inputText);
+    saveDeviceIdentity();
+
+    char command[96];
+    Protocol::buildSetDisplayName(command, sizeof(command), inputText);
+    if (sock >= 0)
+        send(sock, command, strlen(command), 0);
+    return true;
+}
+
+static bool readKeyboardText(const char *hint, char *out, size_t outSize, const char *initial = "")
+{
+    SwkbdState swkbd;
+    if (!out || outSize == 0)
+        return false;
+    snprintf(out, outSize, "%s", initial ? initial : "");
+    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, (int)outSize - 1);
+    swkbdSetHintText(&swkbd, hint);
+    swkbdSetInitialText(&swkbd, out);
+    if (swkbdInputText(&swkbd, out, outSize) != SWKBD_BUTTON_CONFIRM)
+        return false;
+    trimLine(out);
+    return out[0] != '\0';
+}
+
+static bool requestBackupCode(int sock)
+{
+    if (sock < 0)
+        return false;
+    char command[48];
+    Protocol::buildRotateBackupCode(command, sizeof(command));
+    return send(sock, command, strlen(command), 0) > 0;
+}
+
+static bool recoverIdentity(int sock)
+{
+    if (sock < 0)
+        return false;
+    char username[25];
+    char backupCode[32];
+    const char *initialUsername = (strcmp(gIdentity.username, "pending") == 0) ? "" : gIdentity.username;
+    if (!readKeyboardText("Account ID", username, sizeof(username), initialUsername))
+        return false;
+    if (!readKeyboardText("Backup code", backupCode, sizeof(backupCode), ""))
+        return false;
+
+    char command[220];
+    Protocol::buildRecoverIdentity(command, sizeof(command), username, backupCode,
+                                   gIdentity.deviceId, gIdentity.deviceSecret);
+    return send(sock, command, strlen(command), 0) > 0;
+}
+
+static void applyIdentityAccepted(const IdentityInfo &identityInfo)
+{
+    if (identityInfo.username[0])
+        snprintf(gIdentity.username, sizeof(gIdentity.username), "%s", identityInfo.username);
+    if (identityInfo.displayName[0])
+        snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", identityInfo.displayName);
+    saveDeviceIdentity();
+}
+
+static void applyBackupCode(const IdentityInfo &identityInfo)
+{
+    if (identityInfo.username[0])
+        snprintf(gIdentity.username, sizeof(gIdentity.username), "%s", identityInfo.username);
+    if (identityInfo.backupCode[0])
+        snprintf(gIdentity.backupCode, sizeof(gIdentity.backupCode), "%s", identityInfo.backupCode);
+    saveDeviceIdentity();
+}
+
 // Function to decompress data
 int main(int argc, char **argv)
 {
@@ -607,6 +1019,9 @@ int main(int argc, char **argv)
     drawStatusScreen("PLEASE WAIT", "CONNECTING", 0, 0);
 
     printf("3DS Collab Doodle\n");
+    loadDeviceIdentity();
+    printf("Identity: %s\n", gIdentity.deviceId);
+    printf("Identity boot: %s\n", gIdentityBootStatus);
 
     if (!NetworkManager::initialize())
     {
@@ -641,7 +1056,7 @@ int main(int argc, char **argv)
     printf("Controls:\n"
            "- Touch the bottom screen to draw\n"
            "- START: Refresh canvas from server\n"
-           "- SELECT: Exit\n"
+           "- SELECT: Menu\n"
            "- Hold LEFT/A + stylus: Pan viewport\n"
            "- DOWN/B: Toggle Color Picker\n"
            "- Hold UP + tap: Sample color\n"
@@ -667,8 +1082,144 @@ int main(int argc, char **argv)
     int topRenderFrame = 10;
     TopScreenMode topMode = TOP_MODE_CANVAS;
     int selectedChannel = 0;
+    int selectedMenuItem = 0;
+    int selectedAdminItem = 0;
+    int pickerTab = 0;
     char availableChannels[8][25];
     int availableChannelCount = 0;
+    char connectedUsers[8][25];
+    int connectedUserCount = 0;
+    IdentityInfo identityInfo;
+    memset(&identityInfo, 0, sizeof(identityInfo));
+    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", gIdentity.displayName);
+    snprintf(identityInfo.username, sizeof(identityInfo.username), "%s", gIdentity.username);
+    snprintf(identityInfo.role, sizeof(identityInfo.role), "user");
+    snprintf(identityInfo.status, sizeof(identityInfo.status), "active");
+    snprintf(identityInfo.backupCode, sizeof(identityInfo.backupCode), "%s", gIdentity.backupCode);
+    char identityNotice[40] = "";
+    int identityNoticeFrames = 0;
+    char adminNotice[40] = "";
+    int adminNoticeFrames = 0;
+    enum AdminRectTool {
+        ADMIN_RECT_NONE = 0,
+        ADMIN_RECT_FILL = 1,
+    };
+    AdminRectTool pendingAdminRectTool = ADMIN_RECT_NONE;
+    bool adminRectDragging = false;
+    int adminRectStartX = 0;
+    int adminRectStartY = 0;
+    int adminRectEndX = 0;
+    int adminRectEndY = 0;
+
+    auto isModOrAdmin = [&]() -> bool
+    {
+        return strcmp(identityInfo.role, "mod") == 0 || strcmp(identityInfo.role, "admin") == 0;
+    };
+
+    auto setIdentityNotice = [&](const char *notice)
+    {
+        snprintf(identityNotice, sizeof(identityNotice), "%s", notice ? notice : "");
+        identityNoticeFrames = identityNotice[0] ? 180 : 0;
+        topRenderFrame = 10;
+    };
+
+    auto setAdminNotice = [&](const char *notice)
+    {
+        snprintf(adminNotice, sizeof(adminNotice), "%s", notice ? notice : "");
+        adminNoticeFrames = adminNotice[0] ? 180 : 0;
+        topRenderFrame = 10;
+    };
+
+    auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
+    {
+        if (!isModOrAdmin())
+        {
+            setAdminNotice("MOD OR ADMIN REQUIRED");
+            return false;
+        }
+        if (!NetworkManager::checkConnection() &&
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())))
+        {
+            setAdminNotice("CONNECTION FAILED");
+            return false;
+        }
+
+        char command[256];
+        Protocol::buildAdminCanvasCommand(command, sizeof(command), action, canvas.channel[0] ? canvas.channel : "main",
+                                          x, y, w, h, color.r, color.g, color.b);
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            setAdminNotice("SEND FAILED");
+            return false;
+        }
+        setAdminNotice("COMMAND SENT");
+        return true;
+    };
+
+    auto syncSelectedChannel = [&]()
+    {
+        if (availableChannelCount <= 0)
+        {
+            selectedChannel = 0;
+            return;
+        }
+
+        selectedChannel = std::max(0, std::min(selectedChannel, availableChannelCount - 1));
+        for (int i = 0; i < availableChannelCount; i++)
+        {
+            if (strcmp(canvas.channel, availableChannels[i]) == 0)
+            {
+                selectedChannel = i;
+                return;
+            }
+        }
+    };
+
+    auto handleJsonControl = [&](const char *jsonLine) -> bool
+    {
+        char currentChannel[25] = "";
+        char recoveryReason[32] = "";
+        if (Protocol::parseChannels(jsonLine, availableChannels, 8, availableChannelCount, currentChannel))
+        {
+            if (currentChannel[0])
+                canvas.setChannel(currentChannel);
+            syncSelectedChannel();
+            topRenderFrame = 10;
+            return true;
+        }
+        if (Protocol::parsePresence(jsonLine, connectedUsers, 8, connectedUserCount))
+        {
+            topRenderFrame = 10;
+            return true;
+        }
+        if (Protocol::parseIdentityAccepted(jsonLine, identityInfo))
+        {
+            applyIdentityAccepted(identityInfo);
+            setIdentityNotice("ACCOUNT OK");
+            return true;
+        }
+        if (Protocol::parseIdentityBackupCode(jsonLine, identityInfo))
+        {
+            applyBackupCode(identityInfo);
+            setIdentityNotice("BACKUP SAVED");
+            return true;
+        }
+        if (Protocol::parseRecoveryFailed(jsonLine, recoveryReason, sizeof(recoveryReason)))
+        {
+            setIdentityNotice("RECOVERY FAILED");
+            printf("Recovery failed: %s\n", recoveryReason);
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"adminCanvasResult\""))
+        {
+            if (strstr(jsonLine, "\"ok\":true"))
+                setAdminNotice("ADMIN ACTION OK");
+            else
+                setAdminNotice("ADMIN ACTION DENIED");
+            return true;
+        }
+        return false;
+    };
 
     if (sock >= 0)
     {
@@ -677,7 +1228,6 @@ int main(int argc, char **argv)
         bool receivedMeta = false;
         while (NetworkManager::readLine(sock, line, sizeof(line)))
         {
-            char currentChannel[25] = "";
             char latestVersion[32] = "";
             char updateReason[48] = "";
             if (Protocol::parseUpdateRequired(line, latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
@@ -696,12 +1246,8 @@ int main(int argc, char **argv)
 #endif
             }
 
-            if (Protocol::parseChannels(line, availableChannels, 8, availableChannelCount, currentChannel))
-            {
-                if (currentChannel[0])
-                    canvas.setChannel(currentChannel);
+            if (handleJsonControl(line))
                 continue;
-            }
 
             if (Protocol::parseCanvasMeta(line, meta))
             {
@@ -763,25 +1309,6 @@ int main(int argc, char **argv)
         canvas.clampOffsets(fbHeight, fbWidth);
         ox = canvas.offsetX;
         oy = canvas.offsetY;
-    };
-
-    auto syncSelectedChannel = [&]()
-    {
-        if (availableChannelCount <= 0)
-        {
-            selectedChannel = 0;
-            return;
-        }
-
-        selectedChannel = std::max(0, std::min(selectedChannel, availableChannelCount - 1));
-        for (int i = 0; i < availableChannelCount; i++)
-        {
-            if (strcmp(canvas.channel, availableChannels[i]) == 0)
-            {
-                selectedChannel = i;
-                return;
-            }
-        }
     };
 
     auto switchToSelectedChannel = [&]() -> bool
@@ -857,20 +1384,10 @@ int main(int argc, char **argv)
 
         if (kDown & KEY_SELECT)
         {
-            printf("Select key pressed. Exiting...\n");
-            
-            // Clear any pending points
-            UIState::clearPoints();
-            
-            // Ensure proper disconnection
-            NetworkManager::disconnect();
-            
-            // Wait briefly to ensure disconnection completes
-            for (int i = 0; i < 30; i++) {
-                gspWaitForVBlank();
-            }
-            
-            break;
+            topMode = TOP_MODE_MENU;
+            selectedMenuItem = 0;
+            topRenderFrame = 10;
+            continue;
         }
 
         if (kDown & KEY_START)
@@ -941,24 +1458,139 @@ int main(int argc, char **argv)
             }
         }
 
-        if (kDown & KEY_R)
+        if (topMode == TOP_MODE_MENU)
         {
-            topMode = (topMode == TOP_MODE_CONTROLS) ? TOP_MODE_CANVAS : TOP_MODE_CONTROLS;
-            topRenderFrame = 10;
-        }
-
-        if (kDown & KEY_L)
-        {
-            if (topMode == TOP_MODE_CHANNELS)
+            const int menuCount = 7;
+            if (kDown & KEY_DUP)
+            {
+                selectedMenuItem = (selectedMenuItem + menuCount - 1) % menuCount;
+                topRenderFrame = 10;
+            }
+            if (kDown & KEY_DDOWN)
+            {
+                selectedMenuItem = (selectedMenuItem + 1) % menuCount;
+                topRenderFrame = 10;
+            }
+            if (kDown & KEY_B)
             {
                 topMode = TOP_MODE_CANVAS;
+                topRenderFrame = 10;
+                continue;
             }
-            else
+            if (kDown & KEY_A)
             {
-                syncSelectedChannel();
-                topMode = TOP_MODE_CHANNELS;
+                if (selectedMenuItem == 0)
+                {
+                    syncSelectedChannel();
+                    topMode = TOP_MODE_CHANNELS;
+                }
+                else if (selectedMenuItem == 1)
+                {
+                    topMode = TOP_MODE_USERS;
+                }
+                else if (selectedMenuItem == 2)
+                {
+                    topMode = TOP_MODE_CONTROLS;
+                }
+                else if (selectedMenuItem == 3)
+                {
+                    topMode = TOP_MODE_STATUS;
+                }
+                else if (selectedMenuItem == 4)
+                {
+                    topMode = TOP_MODE_IDENTITY;
+                }
+                else if (selectedMenuItem == 5)
+                {
+                    topMode = TOP_MODE_ADMIN;
+                    selectedAdminItem = 0;
+                }
+                else if (selectedMenuItem == 6)
+                {
+                    UIState::clearPoints();
+                    NetworkManager::disconnect();
+                    for (int i = 0; i < 30; i++)
+                        gspWaitForVBlank();
+                    break;
+                }
+                topRenderFrame = 10;
+                continue;
             }
+        }
+        else if (topMode == TOP_MODE_ADMIN)
+        {
+            if (kDown & KEY_DUP)
+            {
+                selectedAdminItem = (selectedAdminItem + 2) % 3;
+                topRenderFrame = 10;
+            }
+            if (kDown & KEY_DDOWN)
+            {
+                selectedAdminItem = (selectedAdminItem + 1) % 3;
+                topRenderFrame = 10;
+            }
+            if (kDown & KEY_A)
+            {
+                if (!isModOrAdmin())
+                {
+                    setAdminNotice("MOD OR ADMIN REQUIRED");
+                    continue;
+                }
+                if (selectedAdminItem == 0)
+                {
+                    sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
+                }
+                else if (selectedAdminItem == 1)
+                {
+                    Color white = {255, 255, 255};
+                    if (sendAdminCanvasCommand("clear", 0, 0, canvasWidth, canvasHeight, white))
+                    {
+                        applyCanvasRectLocal(canvas, 0, 0, canvasWidth, canvasHeight, white);
+                        Renderer::invalidateMinimap();
+                    }
+                }
+                else if (selectedAdminItem == 2)
+                {
+                    pendingAdminRectTool = ADMIN_RECT_FILL;
+                    adminRectDragging = false;
+                    topMode = TOP_MODE_CANVAS;
+                    setAdminNotice("DRAG FILL RECT");
+                }
+                topRenderFrame = 10;
+                continue;
+            }
+        }
+        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_ADMIN || topMode == TOP_MODE_STATUS || topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS) && (kDown & KEY_B))
+        {
+            pendingAdminRectTool = ADMIN_RECT_NONE;
+            adminRectDragging = false;
+            topMode = TOP_MODE_MENU;
             topRenderFrame = 10;
+            continue;
+        }
+        else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_A))
+        {
+            if (editDisplayName(NetworkManager::getSocket(), identityInfo))
+            {
+                setIdentityNotice("NAME SENT");
+            }
+            continue;
+        }
+        else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_X))
+        {
+            if (recoverIdentity(NetworkManager::getSocket()))
+            {
+                setIdentityNotice("RECOVERING");
+            }
+            continue;
+        }
+        else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_Y))
+        {
+            if (requestBackupCode(NetworkManager::getSocket()))
+            {
+                setIdentityNotice("CODE SENT");
+            }
+            continue;
         }
 
         if (topMode == TOP_MODE_CHANNELS)
@@ -976,12 +1608,12 @@ int main(int argc, char **argv)
             if (kDown & KEY_A)
             {
                 if (switchToSelectedChannel())
-                    topMode = TOP_MODE_CANVAS;
+                    topMode = TOP_MODE_MENU;
                 topRenderFrame = 10;
             }
             if (kDown & KEY_B)
             {
-                topMode = TOP_MODE_CANVAS;
+                topMode = TOP_MODE_MENU;
                 topRenderFrame = 10;
                 continue;
             }
@@ -992,7 +1624,59 @@ int main(int argc, char **argv)
 
         bool zoomOverlayLeft = (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT);
         bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DRIGHT | KEY_Y));
-        if (zoomOverlayActive && (kDown & KEY_TOUCH))
+        bool blockNormalCanvasInput = false;
+        if (topMode == TOP_MODE_CANVAS && pendingAdminRectTool != ADMIN_RECT_NONE)
+        {
+            blockNormalCanvasInput = true;
+            if (kDown & KEY_B)
+            {
+                pendingAdminRectTool = ADMIN_RECT_NONE;
+                adminRectDragging = false;
+                setAdminNotice("RECT CANCELLED");
+                continue;
+            }
+            if ((kDown & KEY_TOUCH) && !adminRectDragging)
+            {
+                canvas.offsetX = offsetX;
+                canvas.offsetY = offsetY;
+                adminRectStartX = canvas.screenToCanvasX(touch.px);
+                adminRectStartY = canvas.screenToCanvasY(touch.py);
+                adminRectEndX = adminRectStartX;
+                adminRectEndY = adminRectStartY;
+                adminRectDragging = true;
+                setAdminNotice("RELEASE TO FILL");
+            }
+            else if ((kHeld & KEY_TOUCH) && adminRectDragging)
+            {
+                canvas.offsetX = offsetX;
+                canvas.offsetY = offsetY;
+                adminRectEndX = canvas.screenToCanvasX(touch.px);
+                adminRectEndY = canvas.screenToCanvasY(touch.py);
+            }
+            else if (!(kHeld & KEY_TOUCH) && adminRectDragging)
+            {
+                canvas.offsetX = offsetX;
+                canvas.offsetY = offsetY;
+                int endX = adminRectEndX;
+                int endY = adminRectEndY;
+                int minX = std::max(0, std::min(adminRectStartX, endX));
+                int minY = std::max(0, std::min(adminRectStartY, endY));
+                int maxX = std::min(canvasWidth - 1, std::max(adminRectStartX, endX));
+                int maxY = std::min(canvasHeight - 1, std::max(adminRectStartY, endY));
+                int rectW = std::max(1, maxX - minX + 1);
+                int rectH = std::max(1, maxY - minY + 1);
+                Color sendColor = currentColor;
+                bool sent = sendAdminCanvasCommand("fillRect", minX, minY, rectW, rectH, sendColor);
+                if (sent)
+                {
+                    applyCanvasRectLocal(canvas, minX, minY, rectW, rectH, sendColor);
+                    Renderer::invalidateMinimap();
+                }
+                pendingAdminRectTool = ADMIN_RECT_NONE;
+                adminRectDragging = false;
+            }
+        }
+        if (!blockNormalCanvasInput && zoomOverlayActive && (kDown & KEY_TOUCH))
         {
             const int zoomButtonX = zoomOverlayX(zoomOverlayLeft);
             const int zoomButtonW = 42;
@@ -1026,20 +1710,22 @@ int main(int argc, char **argv)
             }
         }
 
-        if (topMode != TOP_MODE_CHANNELS && !(kHeld & (KEY_DRIGHT | KEY_Y)) && (kDown & (KEY_DDOWN | KEY_B)))
+        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && !(kHeld & (KEY_DRIGHT | KEY_Y)) && (kDown & (KEY_DDOWN | KEY_B)))
         {
             UIState::toggleColorPicker();
+            pendingAdminRectTool = ADMIN_RECT_NONE;
+            adminRectDragging = false;
             topMode = TOP_MODE_CANVAS;
             printf(UIState::isColorPickerActive() ? "Color picker activated\n" : "Color picker deactivated\n");
         }
 
-        if (kDown & KEY_X)
+        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && (kDown & KEY_X))
         {
             handleHexColorInput();
         }
 
         // Eye Dropper functionality
-        if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
+        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
         {
             if (kDown & KEY_TOUCH)
             {
@@ -1060,22 +1746,73 @@ int main(int argc, char **argv)
             }
         }
 
-        if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && (kHeld & KEY_TOUCH))
+        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && (kDown & KEY_TOUCH))
+        {
+            if (pointInRect(touch.px, touch.py, 14, 14, 88, 28))
+            {
+                pickerTab = 0;
+                topRenderFrame = 10;
+                continue;
+            }
+            if (pointInRect(touch.px, touch.py, 106, 14, 88, 28))
+            {
+                pickerTab = 1;
+                topRenderFrame = 10;
+                continue;
+            }
+
+            if (pickerTab == 1)
+            {
+                if (!isModOrAdmin())
+                {
+                    setAdminNotice("MOD OR ADMIN REQUIRED");
+                    continue;
+                }
+                if (pointInRect(touch.px, touch.py, 22, 58, 132, 44))
+                {
+                    sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
+                    continue;
+                }
+                if (pointInRect(touch.px, touch.py, 166, 58, 132, 44))
+                {
+                    Color white = {255, 255, 255};
+                    if (sendAdminCanvasCommand("clear", 0, 0, canvasWidth, canvasHeight, white))
+                    {
+                        applyCanvasRectLocal(canvas, 0, 0, canvasWidth, canvasHeight, white);
+                        Renderer::invalidateMinimap();
+                    }
+                    continue;
+                }
+                if (pointInRect(touch.px, touch.py, 22, 118, 276, 48))
+                {
+                    pendingAdminRectTool = ADMIN_RECT_FILL;
+                    adminRectDragging = false;
+                    UIState::setColorPickerActive(false);
+                    setAdminNotice("DRAG SELECTION");
+                    continue;
+                }
+                continue;
+            }
+        }
+
+        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && pickerTab == 0 && (kHeld & KEY_TOUCH))
         {
             float h, s, v;
             UIState::getHSV(h, s, v);
 
-            if (touch.py >= 140 && touch.py < 160)
+            const int colorSquareX = 162;
+            const int colorSquareY = 54;
+            const int colorSquareSize = 132;
+            const int hueStripY = 198;
+            const int hueStripH = 14;
+            if (pointInRect(touch.px, touch.py, colorSquareX, colorSquareY, colorSquareSize, colorSquareSize))
             {
-                h = (float)(touch.px - 20) / 280;
+                s = (float)(touch.px - colorSquareX) / (float)(colorSquareSize - 1);
+                v = 1.0f - ((float)(touch.py - colorSquareY) / (float)(colorSquareSize - 1));
             }
-            else if (touch.py >= 170 && touch.py < 190)
+            else if (pointInRect(touch.px, touch.py, colorSquareX, hueStripY - 4, colorSquareSize, hueStripH + 8))
             {
-                s = (float)(touch.px - 20) / 280;
-            }
-            else if (touch.py >= 200 && touch.py < 220)
-            {
-                v = (float)(touch.px - 20) / 280;
+                h = (float)(touch.px - colorSquareX) / (float)(colorSquareSize - 1);
             }
 
             h = std::max(0.0f, std::min(1.0f, h));
@@ -1091,37 +1828,24 @@ int main(int argc, char **argv)
             currentColor.g = g * 255;
             currentColor.b = b * 255;
 
-            // Check if touch is on brush size selectors
-            std::vector<int> brushSizes = {1, 2, 3, 5, 7};
-            std::vector<int> brushPositions = {30, 60, 90, 120, 150};
-            for (size_t i = 0; i < brushSizes.size(); i++)
+            const int brushSizes[] = {1, 2, 3, 5, 7};
+            const int brushYs[] = {70, 92, 114, 136, 158};
+            const int brushXs[] = {38, 78, 118};
+            for (int i = 0; i < 5; i++)
             {
-                int x = brushPositions[i];
-                if (touch.px >= x - 30 && touch.px <= x + 10)
+                for (int shape = 0; shape < 3; shape++)
                 {
-                    if (touch.py >= 20 && touch.py <= 40)
+                    if (pointInRect(touch.px, touch.py, brushXs[shape] - 14, brushYs[i] - 12, 28, 24))
                     {
                         currentBrushSize = brushSizes[i];
-                        currentBrushShape = 0; // Circle
-                        break;
-                    }
-                    else if (touch.py >= 50 && touch.py <= 70)
-                    {
-                        currentBrushSize = brushSizes[i];
-                        currentBrushShape = 1; // Square
-                        break;
-                    }
-                    else if (touch.py >= 80 && touch.py <= 100)
-                    {
-                        currentBrushSize = brushSizes[i];
-                        currentBrushShape = 2; // Antialiased Circle
+                        currentBrushShape = shape;
                         break;
                     }
                 }
             }
         }
 
-        if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DLEFT | KEY_A)))
+        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DLEFT | KEY_A)))
         {
             // Panning mode
             if (kHeld & KEY_TOUCH)
@@ -1157,7 +1881,7 @@ int main(int argc, char **argv)
                 hasLastStrokePoint = false;
             }
         }
-        else if (!zoomOverlayActive && topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive())
+        else if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive())
         {
             // Normal drawing mode
             if (kHeld & KEY_TOUCH)
@@ -1259,21 +1983,7 @@ int main(int argc, char **argv)
                 {
                     packetBuffer[std::min(recvLen, (int)sizeof(packetBuffer) - 1)] = '\0';
                     CanvasMeta meta;
-                    char currentChannel[25] = "";
-                    if (Protocol::parseChannels((char *)packetBuffer, availableChannels, 8, availableChannelCount, currentChannel))
-                    {
-                        if (currentChannel[0])
-                            canvas.setChannel(currentChannel);
-                        syncSelectedChannel();
-                        topRenderFrame = 10;
-                    }
-                    else if (strstr((char *)packetBuffer, "channelChanged"))
-                    {
-                        char changed[25] = "";
-                        int ignoredCount = 0;
-                        Protocol::parseChannels((char *)packetBuffer, availableChannels, 8, ignoredCount, changed);
-                    }
-                    else if (Protocol::parseCanvasMeta((char *)packetBuffer, meta))
+                    if (Protocol::parseCanvasMeta((char *)packetBuffer, meta))
                     {
                         canvasWidth = meta.width;
                         canvasHeight = meta.height;
@@ -1291,6 +2001,16 @@ int main(int argc, char **argv)
                             }
                             if (compressedCanvas)
                                 free(compressedCanvas);
+                        }
+                    }
+                    else
+                    {
+                        char *savePtr = NULL;
+                        char *line = strtok_r((char *)packetBuffer, "\n", &savePtr);
+                        while (line)
+                        {
+                            handleJsonControl(line);
+                            line = strtok_r(NULL, "\n", &savePtr);
                         }
                     }
                 }
@@ -1316,6 +2036,24 @@ int main(int argc, char **argv)
         Renderer::renderViewport(canvas, buffer, fbWidth, fbHeight, false);
         if (zoomOverlayActive)
             drawZoomOverlay(buffer, fbWidth, fbHeight, zoomOverlayLeft);
+        if (pendingAdminRectTool != ADMIN_RECT_NONE && adminRectDragging)
+        {
+            int startScreenX = (int)((adminRectStartX - canvas.offsetX) * canvas.zoomScale());
+            int startScreenY = (int)((adminRectStartY - canvas.offsetY) * canvas.zoomScale());
+            int endScreenX = (int)((adminRectEndX - canvas.offsetX) * canvas.zoomScale());
+            int endScreenY = (int)((adminRectEndY - canvas.offsetY) * canvas.zoomScale());
+            int rectX = std::max(0, std::min(startScreenX, endScreenX));
+            int rectY = std::max(0, std::min(startScreenY, endScreenY));
+            int rectMaxX = std::min(fbHeight - 1, std::max(startScreenX, endScreenX));
+            int rectMaxY = std::min(fbWidth - 1, std::max(startScreenY, endScreenY));
+            if (rectMaxX >= rectX && rectMaxY >= rectY)
+            {
+                drawRectOutline(buffer, fbWidth, fbHeight, rectX, rectY, rectMaxX - rectX + 1, rectMaxY - rectY + 1, 24, 33, 38);
+                if (rectMaxX - rectX > 4 && rectMaxY - rectY > 4)
+                    drawRectOutline(buffer, fbWidth, fbHeight, rectX + 2, rectY + 2, rectMaxX - rectX - 3, rectMaxY - rectY - 3,
+                                    currentColor.r, currentColor.g, currentColor.b);
+            }
+        }
         canvas.clearDirty();
 
         bool activelyDrawing = !UIState::isColorPickerActive() &&
@@ -1323,11 +2061,29 @@ int main(int argc, char **argv)
                                !(kHeld & (KEY_DLEFT | KEY_A)) &&
                                (kHeld & KEY_TOUCH);
         topRenderFrame++;
+        if (identityNoticeFrames > 0)
+        {
+            identityNoticeFrames--;
+            if (identityNoticeFrames == 0)
+                topRenderFrame = 10;
+        }
+        if (adminNoticeFrames > 0)
+        {
+            adminNoticeFrames--;
+            if (adminNoticeFrames == 0)
+                topRenderFrame = 10;
+        }
         if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
             Renderer::renderTop(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor,
                                 currentBrushSize, currentBrushShape, topMode,
-                                availableChannels, availableChannelCount, selectedChannel);
+                                availableChannels, availableChannelCount, selectedChannel,
+                                selectedMenuItem, connectedUsers, connectedUserCount,
+                                identityInfo.displayName, identityInfo.username,
+                                identityInfo.role, identityInfo.status,
+                                identityInfo.backupCode, identityNoticeFrames > 0 ? identityNotice : "",
+                                gIdentityBootStatus, selectedAdminItem,
+                                adminNoticeFrames > 0 ? adminNotice : "");
             topRenderFrame = 0;
         }
 
@@ -1337,14 +2093,12 @@ int main(int argc, char **argv)
         memcpy(fb, buffer, bufferSize);
         if (UIState::isColorPickerActive())
         {
-            UIInterface::drawUIBackground(fb, fbWidth, fbHeight);
-            float h, s, v;
-            UIState::getHSV(h, s, v);
-            UIInterface::drawHSVSliders(fb, fbWidth, fbHeight, h, s, v);
-            drawBrushSizeSelector(fb, fbWidth, fbHeight);
+            drawToolPalette(fb, fbWidth, fbHeight, pickerTab, isModOrAdmin(), currentColor,
+                            adminNoticeFrames > 0 ? adminNotice : "");
         }
 
-        UIInterface::drawCurrentSelection(fb, fbWidth, fbHeight, currentColor);
+        if (!UIState::isColorPickerActive())
+            UIInterface::drawCurrentSelection(fb, fbWidth, fbHeight, currentColor);
 
         gfxFlushBuffers();
         gfxSwapBuffers();

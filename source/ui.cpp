@@ -27,6 +27,10 @@ void UIState::toggleColorPicker() {
     colorPickerActive = !colorPickerActive;
 }
 
+void UIState::setColorPickerActive(bool active) {
+    colorPickerActive = active;
+}
+
 bool UIState::isColorPickerActive() {
     return colorPickerActive;
 }

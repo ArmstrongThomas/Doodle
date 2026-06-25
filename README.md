@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.1.1`
+- Version: `1.2.0`
 
 ## Features
 
@@ -14,6 +14,9 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Named channels: `main`, `sketch`, and `test`.
 - Channel switch UI on the 3DS.
 - Color picker, color sampling, brush size/shape controls, and hex color entry.
+- Color-square picker with hue strip and circle/box/dither brush modes.
+- Device identity, display name, backup-code recovery, and connected-user list.
+- Mod/admin canvas tools with snapshot, clear, and selection-style fill rectangle.
 - Compressed canvas snapshots using zlib.
 - Server update checks with manifest, size, and SHA-256 verification.
 - App metadata/icon via SMDH, including the visible app version.
@@ -35,12 +38,11 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Hold RIGHT D-Pad or Y + tap `+`: Zoom in.
 - Hold RIGHT D-Pad or Y + tap `-`: Zoom out.
 - START: Refresh canvas from server.
-- SELECT: Exit.
-- L: Open/close channel selector.
-- D-Pad UP/DOWN while channel selector is open: Move channel selection.
-- A while channel selector is open: Switch to selected channel.
-- R: Open/close controls help on top screen.
+- SELECT: Open menu.
+- Menu includes channels, connected users, controls, status, identity, admin tools, and exit.
 - B or D-Pad DOWN: Toggle color picker.
+- Color picker tabs: `COLOR` and `MOD`.
+- MOD tab: Snapshot, clear canvas, and fill rectangle. Fill rectangle arms a selection; release stylus to fill using the selected color.
 - Hold D-Pad UP + tap canvas: Sample color.
 - X: Enter hex color.
 
@@ -76,7 +78,7 @@ make
 The Makefile exposes release/server variables:
 
 ```make
-APP_VERSION ?= 1.1.1
+APP_VERSION ?= 1.2.0
 SERVER_HOST ?= server1.rpgwo.org
 SERVER_TCP_PORT ?= 3030
 SERVER_HTTP_PORT ?= 3000

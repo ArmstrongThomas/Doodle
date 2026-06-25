@@ -157,6 +157,23 @@ static void drawUpperText(u8 *target, int width, int height, int x, int y, const
     drawText(target, width, height, x, y, buffer, r, g, b);
 }
 
+static void drawFooterHint(const char *left, const char *right)
+{
+    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 212, TOP_SCREEN_W, 1, 206, 214, 220);
+    if (left && left[0])
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 18, 224, left, 73, 82, 92);
+    if (right && right[0])
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 224, right, 73, 82, 92);
+}
+
+static void drawMenuRow(int y, const char *label, bool selected, bool current = false)
+{
+    if (selected)
+        fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, y - 5, 220, 17, 24, 33, 38);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 30, y, current ? "*" : selected ? ">" : " ", selected ? 245 : 73, selected ? 248 : 82, selected ? 250 : 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 48, y, label, selected ? 245 : 32, selected ? 248 : 36, selected ? 250 : 42);
+}
+
 static void drawTopChrome(bool connected, bool updateAvailable)
 {
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, TOP_SCREEN_H, 232, 236, 239);
@@ -215,7 +232,7 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 100, "BRUSH", 73, 82, 92);
     char brush[16];
-    snprintf(brush, sizeof(brush), "%d %s", brushSize, brushShape == 1 ? "SQ" : brushShape == 2 ? "SOFT" : "CIR");
+    snprintf(brush, sizeof(brush), "%d %s", brushSize, brushShape == 1 ? "SQ" : brushShape == 2 ? "DIT" : "CIR");
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 112, brush, 32, 36, 42);
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 124, "ZOOM", 73, 82, 92);
@@ -228,8 +245,7 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 152, 42, 42, currentColor.r, currentColor.g, currentColor.b);
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 152, 42, 42, 32, 36, 42);
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 206, "L CH", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 332, 206, "R HELP", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 206, "SELECT MENU", 73, 82, 92);
 
     if (!canvas.pixels || canvas.width <= 0 || canvas.height <= 0)
     {
@@ -269,9 +285,8 @@ static void composeChannelTopFrame(CanvasState &canvas, bool connected, bool upd
 {
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "CHANNELS", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 46, "A SWITCH", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 60, "B CLOSE", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 74, "UP/DOWN", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 46, "CURRENT", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 60, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
 
     int rows = std::min(channelCount, 8);
     for (int i = 0; i < rows; i++)
@@ -279,17 +294,13 @@ static void composeChannelTopFrame(CanvasState &canvas, bool connected, bool upd
         int y = 76 + i * 18;
         bool selected = i == selectedChannel;
         bool current = strcmp(canvas.channel, channels[i]) == 0;
-        if (selected)
-        {
-            fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, y - 5, 190, 17, 24, 33, 38);
-        }
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 34, y, current ? ">" : " ", selected ? 245 : 73, selected ? 248 : 82, selected ? 250 : 92);
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, channels[i], selected ? 245 : 32, selected ? 248 : 36, selected ? 250 : 42);
+        drawMenuRow(y, channels[i], selected, current);
     }
 
     if (rows == 0)
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "NO CHANNELS", 214, 40, 40);
 
+    drawFooterHint("A SWITCH", "B BACK");
     topFrameValid = true;
 }
 
@@ -299,17 +310,155 @@ static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool up
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "CONTROLS", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 74, "TOUCH DRAW", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 92, "LEFT TOUCH PAN", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 110, "L CHANNELS", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 110, "SELECT MENU", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 128, "B COLOR PICKER", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 146, "UP TOUCH SAMPLE", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 164, "X HEX COLOR", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 182, "START REFRESH", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 200, "RIGHT/Y TOUCH ZOOM", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 200, "R CLOSE", 73, 82, 92);
+    drawFooterHint("SELECT MENU", "B BACK");
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 74, "CHANNEL", 73, 82, 92);
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 88, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
 
+    topFrameValid = true;
+}
+
+static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, int selectedMenuItem)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "MAIN MENU", 32, 36, 42);
+
+    const char *items[] = {
+        "CHANNELS",
+        "CONNECTED USERS",
+        "CONTROLS",
+        "STATUS",
+        "IDENTITY",
+        "ADMIN TOOLS",
+        "EXIT APP",
+    };
+    const int itemCount = sizeof(items) / sizeof(items[0]);
+    for (int i = 0; i < itemCount; i++)
+    {
+        int y = 78 + i * 20;
+        drawMenuRow(y, items[i], i == selectedMenuItem);
+    }
+
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "CHANNEL", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 118, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 146, connected ? "ONLINE" : "OFFLINE", connected ? 13 : 196, connected ? 122 : 61, connected ? 117 : 61);
+    drawFooterHint("A OPEN", "B CLOSE");
+    topFrameValid = true;
+}
+
+static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, char users[][25], int userCount)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "CONNECTED USERS", 32, 36, 42);
+    char countText[20];
+    snprintf(countText, sizeof(countText), "%d ONLINE", userCount);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 276, 46, countText, 73, 82, 92);
+
+    int rows = std::min(userCount, 8);
+    for (int i = 0; i < rows; i++)
+    {
+        int y = 78 + i * 18;
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 34, y, "-", 73, 82, 92);
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, users[i], 32, 36, 42);
+    }
+    if (rows == 0)
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "NO USERS YET", 104, 114, 124);
+
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "CHANNEL", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 118, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    drawFooterHint("", "B BACK");
+    topFrameValid = true;
+}
+
+static void composeAdminTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
+                                 const char *role, int selectedAdminItem, const char *adminNotice)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "ADMIN TOOLS", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 264, 46, "ROLE", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 264, 60, role, 32, 36, 42);
+
+    bool allowed = role && (strcmp(role, "mod") == 0 || strcmp(role, "admin") == 0);
+    if (!allowed)
+    {
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 84, "MOD OR ADMIN REQUIRED", 196, 92, 40);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 108, "SET YOUR ROLE IN WEB ADMIN", 104, 114, 124);
+        drawFooterHint("", "B BACK");
+        topFrameValid = true;
+        return;
+    }
+
+    const char *items[] = {
+        "SAVE SNAPSHOT",
+        "CLEAR CANVAS",
+        "FILL RECT",
+    };
+    for (int i = 0; i < 3; i++)
+        drawMenuRow(78 + i * 22, items[i], i == selectedAdminItem);
+
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 132, "CHANNEL", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 146, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    if (adminNotice && adminNotice[0])
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, adminNotice, 196, 92, 40);
+    else
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, "FILL RECT: DRAG ON BOTTOM", 104, 114, 124);
+    drawFooterHint("A USE", "B BACK");
+    topFrameValid = true;
+}
+
+static void composeStatusTopFrame(CanvasState &canvas, bool connected, bool updateAvailable)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "STATUS", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 78, "CONNECTION", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 78, connected ? "ONLINE" : "OFFLINE", connected ? 13 : 196, connected ? 122 : 61, connected ? 117 : 61);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 100, "UPDATE", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 100, updateAvailable ? "AVAILABLE" : "CURRENT", updateAvailable ? 196 : 32, updateAvailable ? 92 : 36, updateAvailable ? 40 : 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 122, "VERSION", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 122, APP_VERSION, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 144, "CHANNEL", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 144, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "ZOOM", 73, 82, 92);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, canvas.zoomLabel(), 32, 36, 42);
+    drawFooterHint("START REFRESH", "B BACK");
+    topFrameValid = true;
+}
+
+static void composeIdentityTopFrame(bool connected, bool updateAvailable,
+                                    const char *displayName, const char *username,
+                                    const char *role, const char *status,
+                                    const char *backupCode,
+                                    const char *identityNotice,
+                                    const char *identityStorage)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "IDENTITY", 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 78, "NAME", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 78, displayName, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 100, "ACCOUNT", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 100, username, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 122, "ROLE", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 122, role, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 144, "STATE", 73, 82, 92);
+    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 144, status, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "BACKUP", 73, 82, 92);
+    if (backupCode && backupCode[0])
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, backupCode, 32, 36, 42);
+    else
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, "PRESS Y", 196, 92, 40);
+    if (identityStorage && identityStorage[0])
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 256, 166, identityStorage, 104, 114, 124);
+    if (identityNotice && identityNotice[0])
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, identityNotice, 196, 92, 40);
+    else
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, "X RECOVER  Y GET CODE", 104, 114, 124);
+    drawFooterHint("A EDIT NAME", "B BACK");
     topFrameValid = true;
 }
 
@@ -340,7 +489,13 @@ static void presentTopFrameToFramebuffer(u8 *fb, u16 fbWidth, u16 fbHeight)
 
 void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
                          int brushSize, int brushShape, TopScreenMode mode,
-                         char channels[][25], int channelCount, int selectedChannel)
+                         char channels[][25], int channelCount, int selectedChannel,
+                         int selectedMenuItem, char users[][25], int userCount,
+                         const char *displayName, const char *username,
+                         const char *role, const char *status,
+                         const char *backupCode, const char *identityNotice,
+                         const char *identityStorage, int selectedAdminItem,
+                         const char *adminNotice)
 {
     minimapFrameCounter++;
     if (mode == TOP_MODE_CANVAS && (!minimapCacheValid || minimapFrameCounter >= 15))
@@ -353,6 +508,17 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
         composeChannelTopFrame(canvas, connected, updateAvailable, channels, channelCount, selectedChannel);
     else if (mode == TOP_MODE_CONTROLS)
         composeControlsTopFrame(canvas, connected, updateAvailable);
+    else if (mode == TOP_MODE_MENU)
+        composeMenuTopFrame(canvas, connected, updateAvailable, selectedMenuItem);
+    else if (mode == TOP_MODE_USERS)
+        composeUsersTopFrame(canvas, connected, updateAvailable, users, userCount);
+    else if (mode == TOP_MODE_ADMIN)
+        composeAdminTopFrame(canvas, connected, updateAvailable, role, selectedAdminItem, adminNotice);
+    else if (mode == TOP_MODE_STATUS)
+        composeStatusTopFrame(canvas, connected, updateAvailable);
+    else if (mode == TOP_MODE_IDENTITY)
+        composeIdentityTopFrame(connected, updateAvailable, displayName, username, role, status, backupCode,
+                                identityNotice, identityStorage);
     else
         composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape);
 }

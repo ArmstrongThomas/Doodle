@@ -22,6 +22,7 @@ class UIState {
 public:
     static void init();
     static void toggleColorPicker();
+    static void setColorPickerActive(bool active);
     static bool isColorPickerActive();
     static void addPoint(int x, int y);
     static void clearPoints();
