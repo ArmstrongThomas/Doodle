@@ -184,7 +184,7 @@ static void drawTopChrome(bool connected, bool updateAvailable)
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 348, 10, "UP", 255, 214, 102);
 
     char version[40];
-    snprintf(version, sizeof(version), "V %s", APP_VERSION);
+    snprintf(version, sizeof(version), "V %s", APP_BUILD_LABEL);
     int versionX = TOP_SCREEN_W - 12 - (int)strlen(version) * 6;
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, versionX, 224, version, 104, 114, 124);
 }
@@ -421,7 +421,7 @@ static void composeStatusTopFrame(CanvasState &canvas, bool connected, bool upda
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 100, "UPDATE", 73, 82, 92);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 100, updateAvailable ? "AVAILABLE" : "CURRENT", updateAvailable ? 196 : 32, updateAvailable ? 92 : 36, updateAvailable ? 40 : 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 122, "VERSION", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 122, APP_VERSION, 32, 36, 42);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 122, APP_BUILD_LABEL, 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 144, "CHANNEL", 73, 82, 92);
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 144, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "ZOOM", 73, 82, 92);

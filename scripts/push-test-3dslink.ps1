@@ -1,7 +1,9 @@
 param(
     [string]$Address = '192.168.1.225',
     [int]$Retries = 10,
-    [string]$ServerHost = '192.168.1.46',
+    [ValidateSet(1, 2)]
+    [int]$TestMode = 1,
+    [string]$ServerHost = '',
     [switch]$Build
 )
 
@@ -14,13 +16,18 @@ $env:PATH = 'C:\devkitPro\msys2\usr\bin;C:\devkitPro\tools\bin;C:\devkitPro\devk
 
 $make = 'C:\devkitPro\msys2\usr\bin\make.exe'
 $link = 'C:\devkitPro\tools\bin\3dslink.exe'
-$testBuild = Join-Path $root 'CollabDoodle-test-local.3dsx'
+$testBuildName = if ($TestMode -eq 2) { 'CollabDoodle-test-server2.3dsx' } else { 'CollabDoodle-test-local.3dsx' }
+$testBuild = Join-Path $root $testBuildName
 
 Push-Location $root
 try {
     if ($Build -or -not (Test-Path $testBuild)) {
         & $make clean
-        & $make TEST_MODE=1 SERVER_HOST=$ServerHost
+        if ($ServerHost) {
+            & $make TEST_MODE=$TestMode SERVER_HOST=$ServerHost
+        } else {
+            & $make TEST_MODE=$TestMode
+        }
         Copy-Item -LiteralPath (Join-Path $root 'Doodle.3dsx') -Destination $testBuild -Force
     }
 

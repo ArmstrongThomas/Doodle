@@ -33,18 +33,52 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
+WIN_CURDIR	:=	$(shell cygpath -w "$(CURDIR)")
 SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_VERSION	?=	1.2.0
-SERVER_HOST	?=	server1.rpgwo.org
-SERVER_TCP_PORT	?=	3030
-SERVER_HTTP_PORT	?=	3000
+APP_VERSION	?=	1.2.2
 TEST_MODE	?=	0
+LOCAL_SERVER_HOST	?=	192.168.1.46
+REMOTE_TEST_SERVER_HOST	?=	server2.rpgwo.org
+LIVE_SERVER_HOST	?=	server1.rpgwo.org
+LOCAL_SERVER_HTTP_PORT	?=	3000
+REMOTE_TEST_SERVER_HTTP_PORT	?=	3000
+LIVE_SERVER_HTTP_PORT	?=	80
+PUBLIC_BUILD_DIR	?=	$(CURDIR)/../Doodle-Server/public/builds
+ifeq ($(origin SERVER_HOST), undefined)
+ifeq ($(TEST_MODE),1)
+SERVER_HOST	:=	$(LOCAL_SERVER_HOST)
+else ifeq ($(TEST_MODE),2)
+SERVER_HOST	:=	$(REMOTE_TEST_SERVER_HOST)
+else
+SERVER_HOST	:=	$(LIVE_SERVER_HOST)
+endif
+endif
+SERVER_TCP_PORT	?=	3030
+ifeq ($(origin SERVER_HTTP_PORT), undefined)
+ifeq ($(TEST_MODE),1)
+SERVER_HTTP_PORT	:=	$(LOCAL_SERVER_HTTP_PORT)
+else ifeq ($(TEST_MODE),2)
+SERVER_HTTP_PORT	:=	$(REMOTE_TEST_SERVER_HTTP_PORT)
+else
+SERVER_HTTP_PORT	:=	$(LIVE_SERVER_HTTP_PORT)
+endif
+endif
+DISABLE_UPDATER	?=	$(TEST_MODE)
+ifneq ($(TEST_MODE),0)
+BUILD_TAG	:=	TEST
+APP_BUILD_LABEL	:=	$(APP_VERSION)-test$(TEST_MODE)
+APP_TITLE	:=	Collab Doodle TEST
+APP_DESCRIPTION	:=	Test $(TEST_MODE) build $(APP_VERSION) for $(SERVER_HOST)
+else
+BUILD_TAG	:=	RELEASE
+APP_BUILD_LABEL	:=	$(APP_VERSION)
 APP_TITLE	:=	Collab Doodle v$(APP_VERSION)
 APP_DESCRIPTION	:=	Shared canvas drawing for Nintendo 3DS - v$(APP_VERSION)
+endif
 APP_AUTHOR	:=	Tommy
 ICON		:=	icon.png
 #ROMFS		:=	romfs
@@ -62,10 +96,12 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 CFLAGS	+=	$(INCLUDE) -D__3DS__ \
 			-DAPP_ID=\"collab-doodle\" \
 			-DAPP_VERSION=\"$(APP_VERSION)\" \
+			-DAPP_BUILD_LABEL=\"$(APP_BUILD_LABEL)\" \
+			-DAPP_BUILD_TAG=\"$(BUILD_TAG)\" \
 			-DSERVER_HOST=\"$(SERVER_HOST)\" \
 			-DSERVER_TCP_PORT=\"$(SERVER_TCP_PORT)\" \
 			-DSERVER_HTTP_PORT=\"$(SERVER_HTTP_PORT)\" \
-			-DTEST_MODE=$(TEST_MODE)
+			-DTEST_MODE=$(DISABLE_UPDATER)
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
@@ -172,11 +208,24 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean
+.PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+ifeq ($(TEST_MODE),2)
+	@mkdir -p "$(PUBLIC_BUILD_DIR)"
+	@cp "$(OUTPUT).3dsx" "$(PUBLIC_BUILD_DIR)/CollabDoodle-test-server2.3dsx"
+	@echo published remote test 3dsx to "$(PUBLIC_BUILD_DIR)/CollabDoodle-test-server2.3dsx"
+endif
+
+cia:
+	@powershell -ExecutionPolicy Bypass -File "$(WIN_CURDIR)\scripts\build-cia.ps1" -ProjectRoot "$(WIN_CURDIR)" -AppVersion "$(APP_VERSION)" -TestMode $(TEST_MODE) -AppTitle "$(APP_TITLE)" -AppDescription "$(APP_DESCRIPTION)" -AppAuthor "$(APP_AUTHOR)"
+ifeq ($(TEST_MODE),2)
+	@mkdir -p "$(PUBLIC_BUILD_DIR)"
+	@cp "$(OUTPUT).cia" "$(PUBLIC_BUILD_DIR)/CollabDoodle-test-server2.cia"
+	@echo published remote test cia to "$(PUBLIC_BUILD_DIR)/CollabDoodle-test-server2.cia"
+endif
 
 $(BUILD):
 	@mkdir -p $@
@@ -194,7 +243,7 @@ endif
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
+	@rm -fr $(BUILD) $(TARGET).3dsx $(TARGET).cia $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
 
 #---------------------------------------------------------------------------------
 $(GFXBUILD)/%.t3x	$(BUILD)/%.h	:	%.t3s

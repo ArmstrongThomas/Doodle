@@ -167,12 +167,13 @@ bool Protocol::parseRecoveryFailed(const char *line, char *reason, size_t reason
 }
 
 void Protocol::buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
-                          const char *deviceId, const char *deviceSecret, const char *displayName)
+                          const char *deviceId, const char *deviceSecret, const char *displayName, const char *packageType)
 {
     snprintf(buffer, size,
              "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":3,\"updaterSupported\":%s,"
-             "\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"displayName\":\"%s\"}\n",
+             "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"displayName\":\"%s\"}\n",
              appId, version, updaterSupported ? "true" : "false",
+             packageType ? packageType : "3dsx",
              deviceId ? deviceId : "", deviceSecret ? deviceSecret : "", displayName ? displayName : "3DS User");
 }
 

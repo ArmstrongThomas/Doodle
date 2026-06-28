@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.2.0`
+- Version: `1.2.1`
 
 ## Features
 
@@ -19,7 +19,8 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Mod/admin canvas tools with snapshot, clear, and selection-style fill rectangle.
 - Compressed canvas snapshots using zlib.
 - Server update checks with manifest, size, and SHA-256 verification.
-- App metadata/icon via SMDH, including the visible app version.
+- App metadata/icon via SMDH, including the visible app version/build label.
+- Optional `.cia` packaging when `makerom.exe` is installed.
 
 ## Screenshots
 
@@ -78,26 +79,82 @@ make
 The Makefile exposes release/server variables:
 
 ```make
-APP_VERSION ?= 1.2.0
-SERVER_HOST ?= server1.rpgwo.org
+APP_VERSION ?= 1.2.1
+TEST_MODE ?= 0
+LOCAL_SERVER_HOST ?= 192.168.1.46
+REMOTE_TEST_SERVER_HOST ?= server2.rpgwo.org
+LIVE_SERVER_HOST ?= server1.rpgwo.org
 SERVER_TCP_PORT ?= 3030
 SERVER_HTTP_PORT ?= 3000
-TEST_MODE ?= 0
 ```
 
-Override them when building local test versions:
+`TEST_MODE` selects the compiled server target:
+
+- `0`: live server, `server1.rpgwo.org`
+- `1`: local LAN server, `192.168.1.46`
+- `2`: remote test server, `server2.rpgwo.org`
+
+Build the normal live release:
 
 ```powershell
-make SERVER_HOST=192.168.1.46 SERVER_TCP_PORT=3030 SERVER_HTTP_PORT=3000
+make TEST_MODE=0
 ```
 
 Local 3dslink test build with updater prompts disabled:
 
 ```powershell
-make TEST_MODE=1 SERVER_HOST=192.168.1.46 SERVER_TCP_PORT=3030 SERVER_HTTP_PORT=3000
+make TEST_MODE=1
 ```
 
-The same values are compiled into networking, updater requests, client hello/version checks, SMDH metadata, and the top-screen version label. `TEST_MODE=1` disables client-side update prompts/downloads so local builds can be sent with `3dslink` without publishing a live update.
+Remote server2 test build with updater prompts disabled:
+
+```powershell
+make TEST_MODE=2
+```
+
+When `TEST_MODE=2`, successful builds are copied into the local web public directory with stable names:
+
+- `../Doodle-Server/public/builds/CollabDoodle-test-server2.3dsx`
+- `../Doodle-Server/public/builds/CollabDoodle-test-server2.cia` after `make cia TEST_MODE=2`
+
+If that public directory is hosted by the server2 web instance, the FBI remote install URL can stay stable:
+
+```text
+http://server2.rpgwo.org/builds/CollabDoodle-test-server2.cia
+```
+
+You can still override the selected host for a one-off build:
+
+```powershell
+make TEST_MODE=1 SERVER_HOST=192.168.4.50
+```
+
+CIA updater test build using the test title ID but keeping update checks enabled:
+
+```powershell
+make TEST_MODE=1 DISABLE_UPDATER=0
+make cia TEST_MODE=1 DISABLE_UPDATER=0
+```
+
+The same values are compiled into networking, updater requests, client hello/version checks, SMDH metadata, and the top-screen version label. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.2.1-test1` or `1.2.1-test2` on the top screen.
+
+## CIA Packaging
+
+The default build still creates `Doodle.3dsx`. To also build `Doodle.cia`, install `makerom.exe` so it is available on PATH or at `C:\devkitPro\tools\bin\makerom.exe`; this setup was verified with Project_CTR `makerom-v0.18.4`. Then build and package:
+
+```powershell
+make
+make cia
+```
+
+Local test CIA build:
+
+```powershell
+make TEST_MODE=1
+make cia TEST_MODE=1
+```
+
+Release and test CIA builds use separate title IDs/product codes so they can be installed side by side. Release uses title ID `000400000CE47500`; test uses `000400000CE47600`.
 
 ## Running on Hardware
 
@@ -121,9 +178,14 @@ When an update is available:
 
 - The client prompts before downloading.
 - The download shows progress.
-- The downloaded `.3dsx` is staged beside the running app.
-- File size and SHA-256 are verified before replacement.
-- After install, close the app and reopen Collab Doodle from the Homebrew Launcher.
+- The client requests the artifact matching the running package type: `3dsx` or `cia`.
+- 3DSX builds stage the downloaded `.3dsx` beside the running app.
+- CIA builds download to `sdmc:/cias/CollabDoodle-update.cia`, verify it, then install it in-app through AM.
+- File size and SHA-256 are verified before replacement/install.
+- After 3DSX install, close the app and reopen Collab Doodle from the Homebrew Launcher.
+- After CIA install, Collab Doodle attempts to relaunch the installed title automatically.
+- If automatic CIA relaunch is refused by APT, close and reopen Collab Doodle from HOME Menu.
+- If in-app CIA install fails repeatedly on hardware, the staged CIA path can still be installed manually with FBI as a fallback.
 
 Homebrew Launcher `.3dsx` apps do not currently support a reliable in-app relaunch of the freshly replaced file, so the final step is manual reopen.
 

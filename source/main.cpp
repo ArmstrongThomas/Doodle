@@ -1,6 +1,7 @@
 #include <3ds.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <malloc.h>
 #include <cstdlib>
 #include <stdarg.h>
@@ -219,11 +220,52 @@ static void failExit(const char *fmt, ...)
     exit(0);
 }
 
-static bool sendClientHello(int sock)
+static const u64 COLLAB_DOODLE_RELEASE_TITLE_ID = 0x000400000CE47500ULL;
+static const u64 COLLAB_DOODLE_TEST_TITLE_ID = 0x000400000CE47600ULL;
+
+static bool pathEndsWithIgnoreCase(const char *text, const char *suffix)
+{
+    if (!text || !suffix)
+        return false;
+    size_t textLen = strlen(text);
+    size_t suffixLen = strlen(suffix);
+    if (suffixLen > textLen)
+        return false;
+    return strcasecmp(text + textLen - suffixLen, suffix) == 0;
+}
+
+static bool isCiaLaunch(const char *appPath)
+{
+    u64 programId = 0;
+    if (R_SUCCEEDED(APT_GetProgramID(&programId)) &&
+        (programId == COLLAB_DOODLE_RELEASE_TITLE_ID || programId == COLLAB_DOODLE_TEST_TITLE_ID))
+    {
+        return true;
+    }
+    return !pathEndsWithIgnoreCase(appPath, ".3dsx");
+}
+
+static u64 currentInstalledTitleId()
+{
+    u64 programId = 0;
+    if (R_SUCCEEDED(APT_GetProgramID(&programId)) &&
+        (programId == COLLAB_DOODLE_RELEASE_TITLE_ID || programId == COLLAB_DOODLE_TEST_TITLE_ID))
+    {
+        return programId;
+    }
+    return 0;
+}
+
+static const char *updateTargetPathForPackage(const char *packageType, const char *appPath)
+{
+    return (packageType && strcmp(packageType, "cia") == 0) ? "sdmc:/cias/CollabDoodle-update.cia" : appPath;
+}
+
+static bool sendClientHello(int sock, const char *packageType)
 {
     char hello[320];
     Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true,
-                         gIdentity.deviceId, gIdentity.deviceSecret, gIdentity.displayName);
+                         gIdentity.deviceId, gIdentity.deviceSecret, gIdentity.displayName, packageType);
     return sock >= 0 && send(sock, hello, strlen(hello), 0) > 0;
 }
 
@@ -424,11 +466,21 @@ static bool waitForUpdateConfirm(const UpdateManifest &manifest)
 
 static void updateProgress(int downloaded, int total, void *)
 {
-    drawStatusScreen("DOWNLOADING UPDATE", "PLEASE WAIT", downloaded, total);
+    if (downloaded >= 1000000)
+        drawStatusScreen("INSTALLING UPDATE", "PLEASE WAIT", downloaded - 1000000, total);
+    else
+        drawStatusScreen("DOWNLOADING UPDATE", "PLEASE WAIT", downloaded, total);
 }
 
-static void exitAfterUpdateInstalled()
+static void exitAfterUpdateInstalled(const char *packageType, u64 titleId)
 {
+    if (packageType && strcmp(packageType, "cia") == 0 && titleId != 0)
+    {
+        drawStatusScreen("UPDATE READY", "RELAUNCHING", 1, 1);
+        if (Updater::relaunchInstalledTitle(titleId))
+            return;
+    }
+
     while (aptMainLoop())
     {
         drawStatusScreen("UPDATE READY", "A CLOSE REOPEN APP", 1, 1);
@@ -708,6 +760,20 @@ void processDrawPacket(const uint8_t *packet, size_t length, u8 *buffer, int fbW
         prevX = x;
         prevY = y;
     }
+}
+
+static bool processRectPacket(const uint8_t *packet, size_t length, CanvasState &canvas)
+{
+    if (length < 12 || packet[0] != 2)
+        return false;
+
+    Color color = { packet[1], packet[2], packet[3] };
+    uint16_t x = *(uint16_t *)(packet + 4);
+    uint16_t y = *(uint16_t *)(packet + 6);
+    uint16_t w = *(uint16_t *)(packet + 8);
+    uint16_t h = *(uint16_t *)(packet + 10);
+    applyCanvasRectLocal(canvas, x, y, w, h, color);
+    return true;
 }
 
 void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
@@ -1015,10 +1081,14 @@ int main(int argc, char **argv)
     gfxSetDoubleBuffering(GFX_TOP, false);
     UIState::init();
     const char *appPath = (argc > 0 && argv && argv[0] && argv[0][0]) ? argv[0] : "sdmc:/3ds/CollabDoodle-current.3dsx";
+    u64 installedTitleId = currentInstalledTitleId();
+    const char *packageType = (installedTitleId != 0 || isCiaLaunch(appPath)) ? "cia" : "3dsx";
+    const char *updateTargetPath = updateTargetPathForPackage(packageType, appPath);
 
     drawStatusScreen("PLEASE WAIT", "CONNECTING", 0, 0);
 
     printf("3DS Collab Doodle\n");
+    printf("Package: %s\n", packageType);
     loadDeviceIdentity();
     printf("Identity: %s\n", gIdentity.deviceId);
     printf("Identity boot: %s\n", gIdentityBootStatus);
@@ -1036,7 +1106,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (!sendClientHello(sock))
+    if (!sendClientHello(sock, packageType))
     {
         failExit("Failed to send client hello.");
     }
@@ -1057,12 +1127,12 @@ int main(int argc, char **argv)
            "- Touch the bottom screen to draw\n"
            "- START: Refresh canvas from server\n"
            "- SELECT: Menu\n"
+           "- Menu > Channels: Switch channel\n"
            "- Hold LEFT/A + stylus: Pan viewport\n"
            "- DOWN/B: Toggle Color Picker\n"
            "- Hold UP + tap: Sample color\n"
            "- X: Input Hex color code\n"
-           "- Hold RIGHT/Y + touch: Zoom buttons\n"
-           "- L: Switch channel\n");
+           "- Hold RIGHT/Y + touch: Zoom buttons\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
     u8 *buffer = (u8 *)malloc(bufferSize);
@@ -1138,7 +1208,7 @@ int main(int argc, char **argv)
             return false;
         }
         if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())))
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
         {
             setAdminNotice("CONNECTION FAILED");
             return false;
@@ -1237,11 +1307,21 @@ int main(int argc, char **argv)
                 failExit("Server requested update to %s.\nTEST_MODE disables updater.", latestVersion);
 #else
                 UpdateManifest manifest;
-                if (Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, manifest) && waitForUpdateConfirm(manifest) &&
-                    Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, appPath, updateProgress, NULL) == UPDATE_DOWNLOAD_OK)
+                UpdateDownloadResult updateResult = UPDATE_DOWNLOAD_FAILED;
+                if (Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, packageType, manifest) && waitForUpdateConfirm(manifest))
                 {
-                    exitAfterUpdateInstalled();
+                    if (strcmp(packageType, "cia") == 0)
+                        updateResult = Updater::downloadAndInstallCia(SERVER_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath,
+                                                                       installedTitleId, updateProgress, NULL);
+                    else
+                        updateResult = Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath, updateProgress, NULL);
                 }
+                if (updateResult == UPDATE_DOWNLOAD_OK)
+                {
+                    exitAfterUpdateInstalled(packageType, installedTitleId);
+                }
+                if (strcmp(packageType, "cia") == 0 && updateResult == UPDATE_DOWNLOAD_INSTALL_FAILED)
+                    failExit("CIA install failed.\n%s", Updater::lastError());
                 failExit("Update required.\nDownload the latest Collab Doodle build to continue.");
 #endif
             }
@@ -1321,7 +1401,7 @@ int main(int argc, char **argv)
             return true;
 
         if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())))
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
         {
             printf("Cannot switch channel - connection failed.\n");
             return false;
@@ -1394,7 +1474,7 @@ int main(int argc, char **argv)
         {
             printf("Refreshing canvas from server...\n");
             if (!NetworkManager::checkConnection() &&
-                (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket()))) {
+                (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))) {
                 printf("Cannot refresh canvas - connection failed!\n");
                 continue;
             }
@@ -1402,7 +1482,7 @@ int main(int argc, char **argv)
             char request[] = "getCanvas\n";
             if (send(NetworkManager::getSocket(), request, strlen(request), 0) <= 0) {
                 printf("Failed to send refresh request. Attempting to reconnect...\n");
-                if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())) {
+                if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)) {
                     printf("Reconnection failed. Please try again later.\n");
                     continue;
                 }
@@ -1926,7 +2006,7 @@ int main(int argc, char **argv)
                     {
                         if (!NetworkManager::checkConnection()) {
                             printf("Connection lost while drawing! Attempting to reconnect...\n");
-                            if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())) {
+                            if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)) {
                                 UIState::clearPoints(); // Clear points if reconnect failed
                                 continue;
                             }
@@ -1957,7 +2037,7 @@ int main(int argc, char **argv)
                 {
                     if (!NetworkManager::checkConnection()) {
                         printf("Connection lost while drawing! Attempting to reconnect...\n");
-                        if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket())) {
+                        if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)) {
                             UIState::clearPoints(); // Clear points if reconnect failed
                             continue;
                         }
@@ -2016,8 +2096,11 @@ int main(int argc, char **argv)
                 }
                 else
                 {
-                    processDrawPacket(packetBuffer, recvLen, buffer, fbWidth, fbHeight, fullCanvas, canvasWidth, canvasHeight);
-                    canvas.markFullDirty();
+                    if (!processRectPacket(packetBuffer, recvLen, canvas))
+                    {
+                        processDrawPacket(packetBuffer, recvLen, buffer, fbWidth, fbHeight, fullCanvas, canvasWidth, canvasHeight);
+                        canvas.markFullDirty();
+                    }
                     Renderer::invalidateMinimap();
                 }
             }

@@ -30,7 +30,7 @@ public:
     static bool parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
                                     char *reason, size_t reasonSize);
     static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
-                           const char *deviceId, const char *deviceSecret, const char *displayName);
+                           const char *deviceId, const char *deviceSecret, const char *displayName, const char *packageType);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
     static void buildSetDisplayName(char *buffer, size_t size, const char *displayName);
     static void buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,

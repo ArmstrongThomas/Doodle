@@ -4,9 +4,22 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <netdb.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 static const char *UPDATE_FINAL_PATH = "sdmc:/3ds/CollabDoodle-update.3dsx";
+static const int INSTALL_PROGRESS_OFFSET = 1000000;
+static char gLastUpdateError[160] = "";
+
+static void setUpdateError(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(gLastUpdateError, sizeof(gLastUpdateError), fmt, ap);
+    va_end(ap);
+}
 
 static unsigned int rotr(unsigned int value, unsigned int bits)
 {
@@ -259,14 +272,22 @@ static const char *httpBody(char *response)
 
 bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, const char *currentVersion, UpdateManifest &manifest)
 {
+    return fetchManifest(serverDomain, httpPort, currentVersion, "3dsx", manifest);
+}
+
+bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, const char *currentVersion,
+                            const char *packageType, UpdateManifest &manifest)
+{
     memset(&manifest, 0, sizeof(manifest));
 
     int sock = -1;
     if (!connectHttp(serverDomain, httpPort, sock))
         return false;
 
-    char request[192];
-    snprintf(request, sizeof(request), "GET /api/updates/latest HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", serverDomain);
+    const char *cleanPackage = (packageType && strcmp(packageType, "cia") == 0) ? "cia" : "3dsx";
+    char request[224];
+    snprintf(request, sizeof(request), "GET /api/updates/latest?package=%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             cleanPackage, serverDomain);
     send(sock, request, strlen(request), 0);
 
     char response[8192];
@@ -283,6 +304,7 @@ bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, cons
     parseJsonString(body, "\"releaseNotes\":\"", manifest.releaseNotes, sizeof(manifest.releaseNotes));
     parseJsonString(body, "\"artifactUrl\":\"", manifest.artifactUrl, sizeof(manifest.artifactUrl));
     parseJsonString(body, "\"artifactName\":\"", manifest.artifactName, sizeof(manifest.artifactName));
+    parseJsonString(body, "\"artifactType\":\"", manifest.artifactType, sizeof(manifest.artifactType));
     parseJsonString(body, "\"sha256\":\"", manifest.sha256, sizeof(manifest.sha256));
     manifest.artifactSize = parseJsonInt(body, "\"artifactSize\":");
     manifest.available = compareVersions(manifest.latestVersion, currentVersion) > 0;
@@ -320,6 +342,182 @@ static bool replaceWithBackup(const char *partPath, const char *targetPath)
     return false;
 }
 
+static const char *sdmcPath(const char *path)
+{
+    if (!path)
+        return "";
+    return strncmp(path, "sdmc:", 5) == 0 ? path + 5 : path;
+}
+
+static FS_MediaType titleDestination(u64 titleId)
+{
+    u16 platform = (u16)((titleId >> 48) & 0xffff);
+    u16 category = (u16)((titleId >> 32) & 0xffff);
+    u8 variation = (u8)(titleId & 0xff);
+    if (platform == 0x0003 || (platform == 0x0004 && ((category & 0x8011) != 0 || (category == 0x0000 && variation == 0x02))))
+        return MEDIATYPE_NAND;
+    return MEDIATYPE_SD;
+}
+
+static bool readCiaInfo(const char *ciaPath, AM_TitleEntry &info, FS_MediaType &media)
+{
+    Handle fileHandle = 0;
+    Result ret = FSUSER_OpenFileDirectly(&fileHandle, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+                                         fsMakePath(PATH_ASCII, sdmcPath(ciaPath)), FS_OPEN_READ, 0);
+    if (R_FAILED(ret))
+    {
+        setUpdateError("OPEN CIA META 0x%08lX", (unsigned long)ret);
+        printf("%s\n", gLastUpdateError);
+        return false;
+    }
+
+    ret = AM_GetCiaFileInfo(MEDIATYPE_SD, &info, fileHandle);
+    FSFILE_Close(fileHandle);
+    if (R_FAILED(ret))
+    {
+        setUpdateError("CIA META 0x%08lX", (unsigned long)ret);
+        printf("%s\n", gLastUpdateError);
+        return false;
+    }
+
+    media = titleDestination(info.titleID);
+    printf("CIA title: 0x%016llx media=%d\n", (unsigned long long)info.titleID, (int)media);
+    return true;
+}
+
+static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned long long expectedTitleId,
+                                               UpdateProgressCallback progress, void *userData)
+{
+    if (!ciaPath || !ciaPath[0])
+    {
+        setUpdateError("NO CIA PATH");
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    FILE *file = fopen(ciaPath, "rb");
+    if (!file)
+    {
+        setUpdateError("OPEN CIA FILE ERR %d", errno);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long fileSize = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (fileSize <= 0)
+    {
+        setUpdateError("CIA SIZE %ld", fileSize);
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    Result ret = amInit();
+    if (R_FAILED(ret))
+    {
+        setUpdateError("AM INIT 0x%08lX", (unsigned long)ret);
+        printf("%s\n", gLastUpdateError);
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    AM_TitleEntry info;
+    memset(&info, 0, sizeof(info));
+    FS_MediaType media = MEDIATYPE_SD;
+    bool haveCiaInfo = readCiaInfo(ciaPath, info, media);
+    if (!haveCiaInfo)
+    {
+        media = MEDIATYPE_SD;
+        printf("CIA metadata unavailable; continuing with SD install.\n");
+    }
+    if (haveCiaInfo && expectedTitleId != 0 && info.titleID != (u64)expectedTitleId)
+    {
+        setUpdateError("TITLE MISMATCH GOT %08lX%08lX EXP %08lX%08lX",
+                       (unsigned long)(info.titleID >> 32), (unsigned long)(info.titleID & 0xffffffff),
+                       (unsigned long)(((u64)expectedTitleId) >> 32), (unsigned long)(((u64)expectedTitleId) & 0xffffffff));
+        printf("%s\n", gLastUpdateError);
+        amExit();
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    Handle ciaHandle = 0;
+    ret = AM_StartCiaInstall(media, &ciaHandle);
+    if (R_FAILED(ret))
+        ret = AM_StartCiaInstallOverwrite(&ciaHandle, media);
+
+    if (R_FAILED(ret))
+    {
+        setUpdateError("AM START 0x%08lX MEDIA %d", (unsigned long)ret, (int)media);
+        printf("%s\n", gLastUpdateError);
+        amExit();
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    unsigned char *buffer = (unsigned char *)malloc(64 * 1024);
+    if (!buffer)
+    {
+        setUpdateError("INSTALL OOM");
+        AM_CancelCIAInstall(ciaHandle);
+        amExit();
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    long offset = 0;
+    bool ok = true;
+    while (offset < fileSize)
+    {
+        size_t read = fread(buffer, 1, 64 * 1024, file);
+        if (read == 0)
+        {
+            ok = false;
+            break;
+        }
+
+        u32 written = 0;
+        ret = FSFILE_Write(ciaHandle, &written, (u64)offset, buffer, (u32)read, FS_WRITE_FLUSH);
+        if (R_FAILED(ret) || written != read)
+        {
+            setUpdateError("CIA WRITE 0x%08lX W%lu R%lu", (unsigned long)ret, (unsigned long)written, (unsigned long)read);
+            printf("%s\n", gLastUpdateError);
+            ok = false;
+            break;
+        }
+
+        offset += (long)read;
+        if (progress)
+            progress(INSTALL_PROGRESS_OFFSET + offset, (int)fileSize, userData);
+    }
+
+    free(buffer);
+    fclose(file);
+
+    if (!ok)
+    {
+        AM_CancelCIAInstall(ciaHandle);
+        amExit();
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    ret = AM_FinishCiaInstall(ciaHandle);
+    amExit();
+    if (R_FAILED(ret))
+    {
+        setUpdateError("AM FINISH 0x%08lX", (unsigned long)ret);
+        printf("%s\n", gLastUpdateError);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
+
+    remove(ciaPath);
+    return UPDATE_DOWNLOAD_OK;
+}
+
+const char *Updater::lastError()
+{
+    return gLastUpdateError[0] ? gLastUpdateError : "NO DETAIL";
+}
+
 UpdateDownloadResult Updater::downloadUpdate(const char *serverDomain, const char *httpPort, const UpdateManifest &manifest,
                                              const char *targetPath, UpdateProgressCallback progress, void *userData)
 {
@@ -337,6 +535,8 @@ UpdateDownloadResult Updater::downloadUpdate(const char *serverDomain, const cha
         return UPDATE_DOWNLOAD_FAILED;
 
     char partPath[320];
+    if (targetPath && strncmp(targetPath, "sdmc:/cias/", 11) == 0)
+        mkdir("sdmc:/cias", 0777);
     makeSiblingPath(targetPath, ".part", partPath, sizeof(partPath));
     remove(partPath);
 
@@ -435,6 +635,16 @@ UpdateDownloadResult Updater::downloadUpdate(const char *serverDomain, const cha
     return UPDATE_DOWNLOAD_OK;
 }
 
+UpdateDownloadResult Updater::downloadAndInstallCia(const char *serverDomain, const char *httpPort, const UpdateManifest &manifest,
+                                                    const char *stagingPath, unsigned long long expectedTitleId,
+                                                    UpdateProgressCallback progress, void *userData)
+{
+    UpdateDownloadResult result = downloadUpdate(serverDomain, httpPort, manifest, stagingPath, progress, userData);
+    if (result != UPDATE_DOWNLOAD_OK)
+        return result;
+    return installCiaFromFile(stagingPath, expectedTitleId, progress, userData);
+}
+
 UpdateDownloadResult Updater::downloadUpdate(const char *serverDomain, const char *httpPort, const UpdateManifest &manifest)
 {
     return downloadUpdate(serverDomain, httpPort, manifest, UPDATE_FINAL_PATH, NULL, NULL);
@@ -464,5 +674,29 @@ bool Updater::checkForUpdate(const char *serverDomain, const char *httpPort, con
     }
 
     printf("Update download failed: %d\n", result);
+    return true;
+}
+
+bool Updater::relaunchInstalledTitle(unsigned long long titleId)
+{
+    unsigned char param[0x300];
+    unsigned char hmac[0x20];
+    memset(param, 0, sizeof(param));
+    memset(hmac, 0, sizeof(hmac));
+
+    Result ret = APT_PrepareToDoApplicationJump(0, (u64)titleId, MEDIATYPE_SD);
+    if (R_FAILED(ret))
+    {
+        printf("APT prepare jump failed: 0x%08lx\n", (unsigned long)ret);
+        return false;
+    }
+
+    ret = APT_DoApplicationJump(param, sizeof(param), hmac);
+    if (R_FAILED(ret))
+    {
+        printf("APT jump failed: 0x%08lx\n", (unsigned long)ret);
+        return false;
+    }
+
     return true;
 }
