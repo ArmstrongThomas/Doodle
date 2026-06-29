@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.2.1`
+- Version: `1.3.0`
 
 ## Features
 
@@ -84,13 +84,14 @@ LOCAL_SERVER_HOST ?= 192.168.1.46
 REMOTE_TEST_SERVER_HOST ?= server2.rpgwo.org
 LIVE_SERVER_HOST ?= doodle.7db.pw
 LIVE_SERVER_TCP_HOST ?= tcp.doodle.7db.pw
+LIVE_SERVER_HTTP_HOST ?= server1.rpgwo.org
 SERVER_TCP_PORT ?= 3030
 SERVER_HTTP_PORT ?= 3000
 ```
 
 `TEST_MODE` selects the compiled server target:
 
-- `0`: live server, `doodle.7db.pw` for HTTP/update checks and `tcp.doodle.7db.pw` for raw TCP drawing
+- `0`: live server, `server1.rpgwo.org` for HTTP/update checks and `tcp.doodle.7db.pw` for raw TCP drawing
 - `1`: local LAN server, `192.168.1.46`
 - `2`: remote test server, `server2.rpgwo.org`
 
