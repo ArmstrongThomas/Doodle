@@ -30,15 +30,19 @@ struct DeviceIdentity {
     char displayName[32];
     char username[25];
     char backupCode[32];
+    bool chatSoundEnabled;
 };
 
-static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", ""};
+static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", "", true};
 static char gIdentityStorageStatus[64] = "STORE UNKNOWN";
 static char gIdentityBootStatus[64] = "BOOT UNKNOWN";
 static const char *IDENTITY_PRIMARY_PATH = "sdmc:/3ds/CollabDoodle/identity.txt";
 static const char *IDENTITY_FALLBACK_PATH = "sdmc:/3ds/CollabDoodle.identity.txt";
 static int gLastPrimaryReadErr = 0;
 static int gLastFallbackReadErr = 0;
+static s16 *gBoopBuffer = NULL;
+static size_t gBoopBufferSize = 0;
+static bool gSoundReady = false;
 
 static void randomHex(char *out, size_t outSize)
 {
@@ -84,11 +88,13 @@ static bool readIdentityFile(const char *path)
     char displayName[64] = "";
     char username[64] = "";
     char backupCode[64] = "";
+    char chatSound[16] = "";
     fgets(deviceId, sizeof(deviceId), file);
     fgets(deviceSecret, sizeof(deviceSecret), file);
     fgets(displayName, sizeof(displayName), file);
     fgets(username, sizeof(username), file);
     fgets(backupCode, sizeof(backupCode), file);
+    fgets(chatSound, sizeof(chatSound), file);
     fclose(file);
 
     trimLine(deviceId);
@@ -96,11 +102,13 @@ static bool readIdentityFile(const char *path)
     trimLine(displayName);
     trimLine(username);
     trimLine(backupCode);
+    trimLine(chatSound);
     snprintf(gIdentity.deviceId, sizeof(gIdentity.deviceId), "%s", deviceId);
     snprintf(gIdentity.deviceSecret, sizeof(gIdentity.deviceSecret), "%s", deviceSecret);
     snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", displayName);
     snprintf(gIdentity.username, sizeof(gIdentity.username), "%s", username);
     snprintf(gIdentity.backupCode, sizeof(gIdentity.backupCode), "%s", backupCode);
+    gIdentity.chatSoundEnabled = chatSound[0] ? strcmp(chatSound, "0") != 0 : true;
     if (!gIdentity.displayName[0])
         strcpy(gIdentity.displayName, "3DS User");
     if (!gIdentity.username[0])
@@ -115,8 +123,8 @@ static bool writeIdentityFile(const char *path)
     FILE *file = fopen(path, "w");
     if (!file)
         return false;
-    fprintf(file, "%s\n%s\n%s\n%s\n%s\n", gIdentity.deviceId, gIdentity.deviceSecret,
-            gIdentity.displayName, gIdentity.username, gIdentity.backupCode);
+    fprintf(file, "%s\n%s\n%s\n%s\n%s\n%d\n", gIdentity.deviceId, gIdentity.deviceSecret,
+            gIdentity.displayName, gIdentity.username, gIdentity.backupCode, gIdentity.chatSoundEnabled ? 1 : 0);
     fflush(file);
     bool ok = fclose(file) == 0;
     return ok;
@@ -137,6 +145,37 @@ static const char *deviceIdSuffix()
 {
     size_t len = strlen(gIdentity.deviceId);
     return len > 6 ? gIdentity.deviceId + len - 6 : gIdentity.deviceId;
+}
+
+static void initChatSound()
+{
+    if (gSoundReady)
+        return;
+    const int sampleRate = 22050;
+    const int samples = sampleRate / 8;
+    gBoopBufferSize = samples * sizeof(s16);
+    gBoopBuffer = (s16 *)linearAlloc(gBoopBufferSize);
+    if (!gBoopBuffer)
+        return;
+    for (int i = 0; i < samples; i++)
+    {
+        float t = (float)i / (float)sampleRate;
+        float fade = 1.0f - ((float)i / (float)samples);
+        float wave = sinf(2.0f * (float)M_PI * 440.0f * t);
+        gBoopBuffer[i] = (s16)(wave * fade * 2200.0f);
+    }
+    if (R_SUCCEEDED(csndInit()))
+    {
+        GSPGPU_FlushDataCache(gBoopBuffer, gBoopBufferSize);
+        gSoundReady = true;
+    }
+}
+
+static void playChatBoop()
+{
+    if (!gIdentity.chatSoundEnabled || !gSoundReady || !gBoopBuffer)
+        return;
+    csndPlaySound(0x8, SOUND_ONE_SHOT | SOUND_FORMAT_16BIT, 22050, 0.28f, 0.0f, gBoopBuffer, NULL, (u32)gBoopBufferSize);
 }
 
 static void saveDeviceIdentity()
@@ -309,6 +348,119 @@ static void drawRectOutline(u8 *fb, int fbWidth, int fbHeight, int x, int y, int
             putScreenPixel(fb, fbWidth, fbHeight, x + inset, py, r, g, b);
             putScreenPixel(fb, fbWidth, fbHeight, x + w - 1 - inset, py, r, g, b);
         }
+    }
+}
+
+static void drawMiniText(u8 *fb, int width, int height, int x, int y, const char *text, u8 r, u8 g, u8 b);
+
+static void drawBottomButton(u8 *fb, int fbWidth, int fbHeight, int x, int y, int w, int h, const char *label,
+                             bool danger = false)
+{
+    fillRect(fb, fbWidth, fbHeight, x, y, w, h, danger ? 196 : 24, danger ? 61 : 33, danger ? 61 : 38);
+    drawRectOutline(fb, fbWidth, fbHeight, x, y, w, h, 216, 224, 232);
+    drawMiniText(fb, fbWidth, fbHeight, x + 12, y + h / 2 - 4, label, 245, 248, 250);
+}
+
+static void formatModerationTime(int seconds, char *out, size_t outSize)
+{
+    if (!out || outSize == 0)
+        return;
+    if (seconds <= 0)
+    {
+        out[0] = '\0';
+        return;
+    }
+    int minutes = (seconds + 59) / 60;
+    if (minutes < 60)
+        snprintf(out, outSize, "%dm", minutes);
+    else
+        snprintf(out, outSize, "%dh", (minutes + 59) / 60);
+}
+
+static void drawChatBottomPanel(u8 *fb, int fbWidth, int fbHeight, PresenceUser *users, int userCount, int userScroll,
+                                int selectedUser, bool modOrAdmin, const char *targetName, const IdentityInfo &self)
+{
+    fillRect(fb, fbWidth, fbHeight, 0, 0, 320, 240, 232, 236, 239);
+    fillRect(fb, fbWidth, fbHeight, 0, 0, 218, 28, 24, 33, 38);
+    fillRect(fb, fbWidth, fbHeight, 218, 0, 102, 28, 13, 122, 117);
+    drawMiniText(fb, fbWidth, fbHeight, 14, 10, "PUBLIC CHAT", 245, 248, 250);
+    drawMiniText(fb, fbWidth, fbHeight, 230, 10, "ONLINE", 245, 248, 250);
+
+    drawBottomButton(fb, fbWidth, fbHeight, 12, 42, 92, 32, "SEND");
+    drawBottomButton(fb, fbWidth, fbHeight, 114, 42, 92, 32, "REFRESH");
+    drawBottomButton(fb, fbWidth, fbHeight, 12, 82, 92, 32, "BACK");
+    drawBottomButton(fb, fbWidth, fbHeight, 114, 82, 92, 32, gIdentity.chatSoundEnabled ? "SOUND ON" : "SOUND OFF");
+    drawBottomButton(fb, fbWidth, fbHeight, 12, 122, 92, 32, "REPORT");
+    if (modOrAdmin)
+    {
+        const PresenceUser *selected = (selectedUser >= 0 && selectedUser < userCount) ? &users[selectedUser] : NULL;
+        drawBottomButton(fb, fbWidth, fbHeight, 114, 122, 92, 32, "DELETE");
+        drawBottomButton(fb, fbWidth, fbHeight, 12, 162, 92, 32,
+                         selected && strcmp(selected->status, "muted") == 0 ? "UNMUTE" : "MUTE");
+        drawBottomButton(fb, fbWidth, fbHeight, 114, 162, 92, 32, "BAN", true);
+    }
+    else
+    {
+        drawMiniText(fb, fbWidth, fbHeight, 114, 132, "Tap a name", 104, 114, 124);
+        drawMiniText(fb, fbWidth, fbHeight, 114, 146, "for details", 104, 114, 124);
+    }
+
+    drawMiniText(fb, fbWidth, fbHeight, 12, 202, "TARGET", 73, 82, 92);
+    drawMiniText(fb, fbWidth, fbHeight, 62, 202, targetName && targetName[0] ? targetName : "LATEST MESSAGE", 32, 36, 42);
+
+    fillRect(fb, fbWidth, fbHeight, 218, 28, 102, 212, 248, 250, 251);
+    drawRectOutline(fb, fbWidth, fbHeight, 218, 28, 102, 212, 196, 204, 212);
+    drawBottomButton(fb, fbWidth, fbHeight, 226, 34, 38, 20, "UP");
+    drawBottomButton(fb, fbWidth, fbHeight, 270, 34, 40, 20, "DN");
+
+    int maxScroll = userCount > 10 ? userCount - 10 : 0;
+    userScroll = std::max(0, std::min(userScroll, maxScroll));
+    int rows = std::min(userCount - userScroll, 10);
+    for (int i = 0; i < rows; i++)
+    {
+        int userIndex = userScroll + i;
+        PresenceUser &user = users[userIndex];
+        int y = 62 + i * 14;
+        if (userIndex == selectedUser)
+        {
+            fillRect(fb, fbWidth, fbHeight, 222, y - 3, 94, 13, 224, 242, 238);
+            drawRectOutline(fb, fbWidth, fbHeight, 222, y - 3, 94, 13, 13, 122, 117);
+        }
+        drawMiniText(fb, fbWidth, fbHeight, 226, y, user.displayName[0] ? user.displayName : user.username, 32, 36, 42);
+        if (strcmp(user.role, "admin") == 0 || strcmp(user.role, "mod") == 0)
+            drawMiniText(fb, fbWidth, fbHeight, 282, y, user.role, 13, 122, 117);
+        else if (strcmp(user.status, "muted") == 0)
+            drawMiniText(fb, fbWidth, fbHeight, 282, y, "mut", 196, 92, 40);
+        else if (strcmp(user.status, "banned") == 0)
+            drawMiniText(fb, fbWidth, fbHeight, 282, y, "ban", 196, 61, 61);
+    }
+    if (rows == 0)
+        drawMiniText(fb, fbWidth, fbHeight, 232, 92, "NO USERS", 104, 114, 124);
+
+    const PresenceUser *detail = (selectedUser >= 0 && selectedUser < userCount) ? &users[selectedUser] : NULL;
+    fillRect(fb, fbWidth, fbHeight, 222, 205, 94, 31, 232, 236, 239);
+    if (detail)
+    {
+        drawMiniText(fb, fbWidth, fbHeight, 226, 210, detail->role, 13, 122, 117);
+        if (strcmp(detail->status, "muted") == 0)
+        {
+            char timeText[12];
+            formatModerationTime(detail->muteSecondsRemaining, timeText, sizeof(timeText));
+            drawMiniText(fb, fbWidth, fbHeight, 226, 224, timeText[0] ? timeText : "muted", 196, 92, 40);
+        }
+        else if (strcmp(detail->status, "banned") == 0)
+            drawMiniText(fb, fbWidth, fbHeight, 226, 224, "banned", 196, 61, 61);
+        else
+            drawMiniText(fb, fbWidth, fbHeight, 226, 224, "active", 104, 114, 124);
+    }
+
+    if (strcmp(self.status, "muted") == 0)
+    {
+        char muteText[24];
+        char timeText[12];
+        formatModerationTime(self.muteSecondsRemaining, timeText, sizeof(timeText));
+        snprintf(muteText, sizeof(muteText), "YOU MUTED %s", timeText);
+        drawMiniText(fb, fbWidth, fbHeight, 12, 220, muteText, 196, 92, 40);
     }
 }
 
@@ -932,7 +1084,8 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 104, 114, 124);
 
     drawPaletteButton(framebuffer, fbWidth, fbHeight, 14, 14, 88, 28, "COLOR", activeTab == 0, false);
-    drawPaletteButton(framebuffer, fbWidth, fbHeight, 106, 14, 88, 28, "MOD", activeTab == 1, false);
+    if (modAllowed)
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 106, 14, 88, 28, "MOD", activeTab == 1, false);
 
     if (activeTab == 0)
     {
@@ -956,11 +1109,7 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     else
     {
         if (!modAllowed)
-        {
-            drawMiniText(framebuffer, fbWidth, fbHeight, 32, 84, "MOD OR ADMIN REQUIRED", 196, 61, 61);
-            drawMiniText(framebuffer, fbWidth, fbHeight, 32, 110, "SET ROLE IN WEB ADMIN", 32, 36, 42);
             return;
-        }
         drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 58, 132, 44, "SNAPSHOT", true, false);
         drawPaletteButton(framebuffer, fbWidth, fbHeight, 166, 58, 132, 44, "CLEAR", false, true);
         drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 118, 276, 48, "FILL RECT", true, false);
@@ -1090,6 +1239,7 @@ int main(int argc, char **argv)
     printf("3DS Collab Doodle\n");
     printf("Package: %s\n", packageType);
     loadDeviceIdentity();
+    initChatSound();
     printf("Identity: %s\n", gIdentity.deviceId);
     printf("Identity boot: %s\n", gIdentityBootStatus);
 
@@ -1157,8 +1307,15 @@ int main(int argc, char **argv)
     int pickerTab = 0;
     char availableChannels[8][25];
     int availableChannelCount = 0;
-    char connectedUsers[8][25];
+    PresenceUser connectedUsers[24];
     int connectedUserCount = 0;
+    ChatLine chatLines[15];
+    int chatCount = 0;
+    int chatScroll = 0;
+    int chatSelected = 0;
+    int chatUnread = 0;
+    int chatUserScroll = 0;
+    int chatSelectedUser = -1;
     IdentityInfo identityInfo;
     memset(&identityInfo, 0, sizeof(identityInfo));
     snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", gIdentity.displayName);
@@ -1170,6 +1327,9 @@ int main(int argc, char **argv)
     int identityNoticeFrames = 0;
     char adminNotice[40] = "";
     int adminNoticeFrames = 0;
+    char chatNotice[40] = "";
+    int chatNoticeFrames = 0;
+    u64 lastChatSendAt = 0;
     enum AdminRectTool {
         ADMIN_RECT_NONE = 0,
         ADMIN_RECT_FILL = 1,
@@ -1198,6 +1358,299 @@ int main(int argc, char **argv)
         snprintf(adminNotice, sizeof(adminNotice), "%s", notice ? notice : "");
         adminNoticeFrames = adminNotice[0] ? 180 : 0;
         topRenderFrame = 10;
+    };
+
+    auto setChatNotice = [&](const char *notice)
+    {
+        snprintf(chatNotice, sizeof(chatNotice), "%s", notice ? notice : "");
+        chatNoticeFrames = chatNotice[0] ? 180 : 0;
+        topRenderFrame = 10;
+    };
+
+    auto chatNewestScroll = [&]() -> int
+    {
+        return chatCount > 9 ? chatCount - 9 : 0;
+    };
+
+    auto chatRowHeight = [&](const ChatLine &line) -> int
+    {
+        char prefix[72];
+        const char *name = line.displayName[0] ? line.displayName : line.username[0] ? line.username : "user";
+        if (strcmp(line.role, "admin") == 0 || strcmp(line.role, "mod") == 0)
+            snprintf(prefix, sizeof(prefix), "<00:00>[%s]%s:", line.role, name);
+        else
+            snprintf(prefix, sizeof(prefix), "<00:00>%s:", name);
+        int messageX = std::min(214, 18 + (int)strlen(prefix) * 6 + 6);
+        int maxChars = std::max(8, (388 - messageX) / 6);
+        int lineCount = 0;
+        const char *start = line.message[0] ? line.message : " ";
+        while (*start && lineCount < 3)
+        {
+            int lastSpaceCol = -1;
+            int len = 0;
+            const char *ptr = start;
+            while (*ptr && len < maxChars)
+            {
+                if (*ptr == ' ')
+                    lastSpaceCol = len;
+                len++;
+                ptr++;
+            }
+            if (*ptr && lastSpaceCol > 8)
+                len = lastSpaceCol;
+            if (len <= 0)
+                len = 1;
+            start += len;
+            while (*start == ' ')
+                start++;
+            lineCount++;
+        }
+        lineCount = std::max(1, lineCount);
+        return std::max(15, lineCount * 10 + 5) + 1;
+    };
+
+    auto chatScrollForNewest = [&]() -> int
+    {
+        const int paneHeight = 152;
+        int used = 0;
+        int start = chatCount;
+        for (int i = chatCount - 1; i >= 0; i--)
+        {
+            int h = chatRowHeight(chatLines[i]);
+            if (used > 0 && used + h > paneHeight)
+                break;
+            used += h;
+            start = i;
+        }
+        return std::max(0, start);
+    };
+
+    auto clampChatSelection = [&]()
+    {
+        if (chatCount <= 0)
+        {
+            chatSelected = 0;
+            chatScroll = 0;
+            return;
+        }
+        chatSelected = std::max(0, std::min(chatSelected, chatCount - 1));
+        chatScroll = std::max(0, std::min(chatScroll, std::max(chatNewestScroll(), chatScrollForNewest())));
+        while (chatSelected < chatScroll)
+            chatScroll--;
+        const int paneHeight = 152;
+        int used = 0;
+        bool selectedVisible = false;
+        for (int i = chatScroll; i < chatCount; i++)
+        {
+            int h = chatRowHeight(chatLines[i]);
+            if (used > 0 && used + h > paneHeight)
+                break;
+            if (i == chatSelected)
+            {
+                selectedVisible = true;
+                break;
+            }
+            used += h;
+        }
+        while (!selectedVisible && chatScroll < chatSelected)
+        {
+            chatScroll++;
+            used = 0;
+            selectedVisible = false;
+            for (int i = chatScroll; i < chatCount; i++)
+            {
+                int h = chatRowHeight(chatLines[i]);
+                if (used > 0 && used + h > paneHeight)
+                    break;
+                if (i == chatSelected)
+                {
+                    selectedVisible = true;
+                    break;
+                }
+                used += h;
+            }
+        }
+    };
+
+    auto clampChatUserScroll = [&]()
+    {
+        if (connectedUserCount <= 0)
+        {
+            chatUserScroll = 0;
+            chatSelectedUser = -1;
+            return;
+        }
+        if (chatSelectedUser < 0 || chatSelectedUser >= connectedUserCount)
+            chatSelectedUser = 0;
+        int maxScroll = connectedUserCount > 10 ? connectedUserCount - 10 : 0;
+        chatUserScroll = std::max(0, std::min(chatUserScroll, maxScroll));
+        if (chatSelectedUser < chatUserScroll)
+            chatUserScroll = chatSelectedUser;
+        if (chatSelectedUser >= chatUserScroll + 10)
+            chatUserScroll = chatSelectedUser - 9;
+    };
+
+    auto setChatErrorNotice = [&](const char *error)
+    {
+        if (!error || !error[0])
+            setChatNotice("CHAT FAILED");
+        else if (strcmp(error, "chat-disabled") == 0)
+            setChatNotice("CHAT DISABLED");
+        else if (strcmp(error, "rate-limited") == 0)
+            setChatNotice("SLOW DOWN");
+        else if (strcmp(error, "chat-cooldown") == 0)
+            setChatNotice("WAIT 2 SEC");
+        else if (strcmp(error, "muted") == 0)
+            setChatNotice("YOU ARE MUTED");
+        else if (strcmp(error, "banned") == 0)
+            setChatNotice("BANNED");
+        else if (strcmp(error, "identity-required") == 0)
+            setChatNotice("ACCOUNT REQUIRED");
+        else
+            setChatNotice(error);
+    };
+
+    auto appendChatLines = [&](ChatLine *lines, int count, bool countUnread)
+    {
+        int addedCount = 0;
+        for (int i = 0; i < count; i++)
+        {
+            bool replaced = false;
+            if (lines[i].id > 0)
+            {
+                for (int existing = 0; existing < chatCount; existing++)
+                {
+                    if (chatLines[existing].id == lines[i].id)
+                    {
+                        chatLines[existing] = lines[i];
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+            if (replaced)
+                continue;
+
+            if (chatCount >= 15)
+            {
+                memmove(&chatLines[0], &chatLines[1], sizeof(ChatLine) * 14);
+                chatCount = 14;
+            }
+            chatLines[chatCount] = lines[i];
+            chatCount++;
+            addedCount++;
+        }
+        chatScroll = chatScrollForNewest();
+        chatSelected = chatCount > 0 ? chatCount - 1 : 0;
+        clampChatSelection();
+        if (countUnread && topMode != TOP_MODE_CHAT && addedCount > 0)
+        {
+            chatUnread = std::min(99, chatUnread + addedCount);
+            playChatBoop();
+        }
+        topRenderFrame = 10;
+    };
+
+    auto requestChatHistory = [&]() -> bool
+    {
+        if (!NetworkManager::checkConnection() &&
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
+        {
+            setChatNotice("CONNECTION FAILED");
+            return false;
+        }
+        char command[96];
+        Protocol::buildChatHistory(command, sizeof(command), "public");
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            setChatNotice("SEND FAILED");
+            return false;
+        }
+        setChatNotice("REFRESHING");
+        return true;
+    };
+
+    auto sendChatMessage = [&](const char *message) -> bool
+    {
+        if (!message || !message[0])
+            return false;
+        if (!isModOrAdmin() && lastChatSendAt && osGetTime() - lastChatSendAt < 2000)
+        {
+            setChatNotice("WAIT 2 SEC");
+            return false;
+        }
+        if (!NetworkManager::checkConnection() &&
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
+        {
+            setChatNotice("CONNECTION FAILED");
+            return false;
+        }
+        char command[384];
+        Protocol::buildChatSend(command, sizeof(command), "public", message);
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            setChatNotice("SEND FAILED");
+            return false;
+        }
+        setChatNotice("SENDING");
+        lastChatSendAt = osGetTime();
+        return true;
+    };
+
+    auto sendChatReport = [&](int messageId, const char *reason) -> bool
+    {
+        if (messageId <= 0)
+        {
+            setChatNotice("SELECT MESSAGE");
+            return false;
+        }
+        if (!NetworkManager::checkConnection() &&
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
+        {
+            setChatNotice("CONNECTION FAILED");
+            return false;
+        }
+        char command[160];
+        Protocol::buildChatReport(command, sizeof(command), messageId, reason);
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            setChatNotice("SEND FAILED");
+            return false;
+        }
+        setChatNotice("REPORT SENT");
+        return true;
+    };
+
+    auto currentChatTarget = [&]() -> ChatLine *
+    {
+        if (chatCount <= 0)
+            return NULL;
+        clampChatSelection();
+        return &chatLines[chatSelected];
+    };
+
+    auto sendModerationCommand = [&](const char *action, const char *identityId, int messageId, const char *reason) -> bool
+    {
+        if (!isModOrAdmin())
+        {
+            setChatNotice("MOD REQUIRED");
+            return false;
+        }
+        if (!NetworkManager::checkConnection() &&
+            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
+        {
+            setChatNotice("CONNECTION FAILED");
+            return false;
+        }
+        char command[256];
+        Protocol::buildModerationCommand(command, sizeof(command), action, identityId, messageId, reason);
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            setChatNotice("SEND FAILED");
+            return false;
+        }
+        setChatNotice("MOD ACTION SENT");
+        return true;
     };
 
     auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
@@ -1249,6 +1702,11 @@ int main(int argc, char **argv)
     {
         char currentChannel[25] = "";
         char recoveryReason[32] = "";
+        char chatChannel[25] = "";
+        ChatLine parsedChat[15];
+        int parsedChatCount = 0;
+        bool chatOk = false;
+        char chatError[32] = "";
         if (Protocol::parseChannels(jsonLine, availableChannels, 8, availableChannelCount, currentChannel))
         {
             if (currentChannel[0])
@@ -1257,8 +1715,9 @@ int main(int argc, char **argv)
             topRenderFrame = 10;
             return true;
         }
-        if (Protocol::parsePresence(jsonLine, connectedUsers, 8, connectedUserCount))
+        if (Protocol::parsePresence(jsonLine, connectedUsers, 24, connectedUserCount))
         {
+            clampChatUserScroll();
             topRenderFrame = 10;
             return true;
         }
@@ -1280,12 +1739,56 @@ int main(int argc, char **argv)
             printf("Recovery failed: %s\n", recoveryReason);
             return true;
         }
+        if (Protocol::parseChatMessages(jsonLine, parsedChat, 15, parsedChatCount, chatChannel, sizeof(chatChannel)))
+        {
+            bool isHistory = strstr(jsonLine, "\"type\":\"chatHistory\"") != NULL;
+            if (isHistory)
+            {
+                chatCount = 0;
+                chatScroll = 0;
+                chatSelected = 0;
+                if (topMode == TOP_MODE_CHAT)
+                    chatUnread = 0;
+            }
+            appendChatLines(parsedChat, parsedChatCount, !isHistory);
+            if (parsedChatCount > 0)
+                setChatNotice("");
+            return true;
+        }
+        if (Protocol::parseChatResult(jsonLine, chatOk, chatError, sizeof(chatError)))
+        {
+            if (chatOk)
+                setChatNotice("CHAT SENT");
+            else
+                setChatErrorNotice(chatError);
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"chatReportResult\""))
+        {
+            if (strstr(jsonLine, "\"ok\":true"))
+                setChatNotice("REPORT SENT");
+            else if (strstr(jsonLine, "rate-limited"))
+                setChatNotice("SLOW DOWN");
+            else
+                setChatNotice("REPORT FAILED");
+            return true;
+        }
         if (strstr(jsonLine, "\"type\":\"adminCanvasResult\""))
         {
             if (strstr(jsonLine, "\"ok\":true"))
                 setAdminNotice("ADMIN ACTION OK");
             else
                 setAdminNotice("ADMIN ACTION DENIED");
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"moderationResult\""))
+        {
+            if (strstr(jsonLine, "\"ok\":true"))
+                setChatNotice("MOD ACTION OK");
+            else if (strstr(jsonLine, "admin-required"))
+                setChatNotice("ADMIN REQUIRED");
+            else
+                setChatNotice("MOD ACTION DENIED");
             return true;
         }
         return false;
@@ -1308,13 +1811,13 @@ int main(int argc, char **argv)
 #else
                 UpdateManifest manifest;
                 UpdateDownloadResult updateResult = UPDATE_DOWNLOAD_FAILED;
-                if (Updater::fetchManifest(SERVER_HOST, SERVER_HTTP_PORT, APP_VERSION, packageType, manifest) && waitForUpdateConfirm(manifest))
+                if (Updater::fetchManifest(SERVER_HTTP_HOST, SERVER_HTTP_PORT, APP_VERSION, packageType, manifest) && waitForUpdateConfirm(manifest))
                 {
                     if (strcmp(packageType, "cia") == 0)
-                        updateResult = Updater::downloadAndInstallCia(SERVER_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath,
+                        updateResult = Updater::downloadAndInstallCia(SERVER_HTTP_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath,
                                                                        installedTitleId, updateProgress, NULL);
                     else
-                        updateResult = Updater::downloadUpdate(SERVER_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath, updateProgress, NULL);
+                        updateResult = Updater::downloadUpdate(SERVER_HTTP_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath, updateProgress, NULL);
                 }
                 if (updateResult == UPDATE_DOWNLOAD_OK)
                 {
@@ -1451,6 +1954,10 @@ int main(int argc, char **argv)
 
         free(compressedCanvas);
         syncSelectedChannel();
+        chatCount = 0;
+        chatScroll = 0;
+        chatSelected = 0;
+        requestChatHistory();
         return switched;
     };
 
@@ -1461,6 +1968,8 @@ int main(int argc, char **argv)
         hidScanInput();
         u32 kDown = hidKeysDown();
         u32 kHeld = hidKeysHeld();
+        touchPosition touch;
+        hidTouchRead(&touch);
 
         if (kDown & KEY_SELECT)
         {
@@ -1540,7 +2049,9 @@ int main(int argc, char **argv)
 
         if (topMode == TOP_MODE_MENU)
         {
-            const int menuCount = 7;
+            const bool staffMenu = isModOrAdmin();
+            const int menuCount = staffMenu ? 8 : 7;
+            selectedMenuItem = std::max(0, std::min(selectedMenuItem, menuCount - 1));
             if (kDown & KEY_DUP)
             {
                 selectedMenuItem = (selectedMenuItem + menuCount - 1) % menuCount;
@@ -1570,22 +2081,28 @@ int main(int argc, char **argv)
                 }
                 else if (selectedMenuItem == 2)
                 {
-                    topMode = TOP_MODE_CONTROLS;
+                    topMode = TOP_MODE_CHAT;
+                    chatUnread = 0;
+                    requestChatHistory();
                 }
                 else if (selectedMenuItem == 3)
                 {
-                    topMode = TOP_MODE_STATUS;
+                    topMode = TOP_MODE_CONTROLS;
                 }
                 else if (selectedMenuItem == 4)
                 {
-                    topMode = TOP_MODE_IDENTITY;
+                    topMode = TOP_MODE_STATUS;
                 }
                 else if (selectedMenuItem == 5)
+                {
+                    topMode = TOP_MODE_IDENTITY;
+                }
+                else if (staffMenu && selectedMenuItem == 6)
                 {
                     topMode = TOP_MODE_ADMIN;
                     selectedAdminItem = 0;
                 }
-                else if (selectedMenuItem == 6)
+                else if (selectedMenuItem == (staffMenu ? 7 : 6))
                 {
                     UIState::clearPoints();
                     NetworkManager::disconnect();
@@ -1640,11 +2157,106 @@ int main(int argc, char **argv)
                 continue;
             }
         }
-        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_ADMIN || topMode == TOP_MODE_STATUS || topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS) && (kDown & KEY_B))
+        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_TOUCH))
+        {
+            if (pointInRect(touch.px, touch.py, 12, 42, 92, 32))
+            {
+                char message[241];
+                if (readKeyboardText("Public chat message", message, sizeof(message), ""))
+                    sendChatMessage(message);
+            }
+            else if (pointInRect(touch.px, touch.py, 114, 42, 92, 32))
+            {
+                chatUnread = 0;
+                requestChatHistory();
+            }
+            else if (pointInRect(touch.px, touch.py, 12, 82, 92, 32))
+            {
+                topMode = TOP_MODE_MENU;
+            }
+            else if (pointInRect(touch.px, touch.py, 114, 82, 92, 32))
+            {
+                gIdentity.chatSoundEnabled = !gIdentity.chatSoundEnabled;
+                saveDeviceIdentity();
+                setChatNotice(gIdentity.chatSoundEnabled ? "SOUND ON" : "SOUND OFF");
+            }
+            else if (pointInRect(touch.px, touch.py, 12, 122, 92, 32))
+            {
+                ChatLine *target = currentChatTarget();
+                sendChatReport(target ? target->id : 0, "Reported from 3DS chat");
+            }
+            else if (pointInRect(touch.px, touch.py, 226, 34, 38, 20))
+            {
+                chatUserScroll = std::max(0, chatUserScroll - 1);
+            }
+            else if (pointInRect(touch.px, touch.py, 270, 34, 40, 20))
+            {
+                chatUserScroll++;
+                clampChatUserScroll();
+            }
+            else if (pointInRect(touch.px, touch.py, 222, 58, 94, 144))
+            {
+                int row = (touch.py - 58) / 14;
+                int index = chatUserScroll + row;
+                if (index >= 0 && index < connectedUserCount)
+                    chatSelectedUser = index;
+                clampChatUserScroll();
+            }
+            else if (pointInRect(touch.px, touch.py, 12, 162, 92, 32) && isModOrAdmin())
+            {
+                PresenceUser *targetUser = (chatSelectedUser >= 0 && chatSelectedUser < connectedUserCount) ? &connectedUsers[chatSelectedUser] : NULL;
+                if (targetUser && strcmp(targetUser->status, "muted") == 0)
+                    sendModerationCommand("unmute", targetUser->identityId, 0, "Unmuted from 3DS chat");
+                else
+                    sendModerationCommand("mute", targetUser ? targetUser->identityId : "", 0, "Muted from 3DS chat");
+            }
+            else if (pointInRect(touch.px, touch.py, 114, 122, 92, 32) && isModOrAdmin())
+            {
+                ChatLine *target = currentChatTarget();
+                sendModerationCommand("deleteChat", "", target ? target->id : 0, "Deleted from 3DS chat");
+            }
+            else if (pointInRect(touch.px, touch.py, 114, 162, 92, 32) && isModOrAdmin())
+            {
+                PresenceUser *targetUser = (chatSelectedUser >= 0 && chatSelectedUser < connectedUserCount) ? &connectedUsers[chatSelectedUser] : NULL;
+                sendModerationCommand("ban", targetUser ? targetUser->identityId : "", 0, "Banned from 3DS chat");
+            }
+            topRenderFrame = 10;
+            continue;
+        }
+        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_CHAT || topMode == TOP_MODE_ADMIN || topMode == TOP_MODE_STATUS || topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS) && (kDown & KEY_B))
         {
             pendingAdminRectTool = ADMIN_RECT_NONE;
             adminRectDragging = false;
             topMode = TOP_MODE_MENU;
+            topRenderFrame = 10;
+            continue;
+        }
+        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_A))
+        {
+            char message[241];
+            if (readKeyboardText("Chat message", message, sizeof(message), ""))
+                sendChatMessage(message);
+            topRenderFrame = 10;
+            continue;
+        }
+        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_DUP))
+        {
+            chatSelected = std::max(0, chatSelected - 1);
+            clampChatSelection();
+            topRenderFrame = 10;
+            continue;
+        }
+        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_DDOWN))
+        {
+            chatSelected = std::min(std::max(0, chatCount - 1), chatSelected + 1);
+            clampChatSelection();
+            topRenderFrame = 10;
+            continue;
+        }
+        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_X))
+        {
+            chatUnread = 0;
+            requestChatHistory();
             topRenderFrame = 10;
             continue;
         }
@@ -1698,9 +2310,6 @@ int main(int argc, char **argv)
                 continue;
             }
         }
-
-        touchPosition touch;
-        hidTouchRead(&touch);
 
         bool zoomOverlayLeft = (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT);
         bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DRIGHT | KEY_Y));
@@ -1834,7 +2443,7 @@ int main(int argc, char **argv)
                 topRenderFrame = 10;
                 continue;
             }
-            if (pointInRect(touch.px, touch.py, 106, 14, 88, 28))
+            if (isModOrAdmin() && pointInRect(touch.px, touch.py, 106, 14, 88, 28))
             {
                 pickerTab = 1;
                 topRenderFrame = 10;
@@ -2055,7 +2664,7 @@ int main(int argc, char **argv)
         // Server messages
         if (sock >= 0)
         {
-            uint8_t packetBuffer[1024];
+            uint8_t packetBuffer[4096];
             int recvLen = recv(sock, packetBuffer, sizeof(packetBuffer), 0);
             if (recvLen > 0)
             {
@@ -2156,6 +2765,12 @@ int main(int argc, char **argv)
             if (adminNoticeFrames == 0)
                 topRenderFrame = 10;
         }
+        if (chatNoticeFrames > 0)
+        {
+            chatNoticeFrames--;
+            if (chatNoticeFrames == 0)
+                topRenderFrame = 10;
+        }
         if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
             Renderer::renderTop(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor,
@@ -2166,7 +2781,9 @@ int main(int argc, char **argv)
                                 identityInfo.role, identityInfo.status,
                                 identityInfo.backupCode, identityNoticeFrames > 0 ? identityNotice : "",
                                 gIdentityBootStatus, selectedAdminItem,
-                                adminNoticeFrames > 0 ? adminNotice : "");
+                                adminNoticeFrames > 0 ? adminNotice : "",
+                                chatLines, chatCount, chatScroll, chatSelected, chatUnread,
+                                chatNoticeFrames > 0 ? chatNotice : "");
             topRenderFrame = 0;
         }
 
@@ -2174,13 +2791,27 @@ int main(int argc, char **argv)
         Renderer::presentTopFrame();
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
         memcpy(fb, buffer, bufferSize);
+        if (topMode == TOP_MODE_CHAT)
+        {
+            char targetLabel[32] = "";
+            ChatLine *target = currentChatTarget();
+            if (target)
+                snprintf(targetLabel, sizeof(targetLabel), "%s", target->displayName[0] ? target->displayName : target->username);
+            if (chatSelectedUser >= 0 && chatSelectedUser < connectedUserCount)
+                snprintf(targetLabel, sizeof(targetLabel), "%s",
+                         connectedUsers[chatSelectedUser].displayName[0] ? connectedUsers[chatSelectedUser].displayName : connectedUsers[chatSelectedUser].username);
+            drawChatBottomPanel(fb, fbWidth, fbHeight, connectedUsers, connectedUserCount, chatUserScroll,
+                                chatSelectedUser, isModOrAdmin(), targetLabel, identityInfo);
+        }
         if (UIState::isColorPickerActive())
         {
+            if (!isModOrAdmin() && pickerTab == 1)
+                pickerTab = 0;
             drawToolPalette(fb, fbWidth, fbHeight, pickerTab, isModOrAdmin(), currentColor,
                             adminNoticeFrames > 0 ? adminNotice : "");
         }
 
-        if (!UIState::isColorPickerActive())
+        if (!UIState::isColorPickerActive() && topMode != TOP_MODE_CHAT)
             UIInterface::drawCurrentSelection(fb, fbWidth, fbHeight, currentColor);
 
         gfxFlushBuffers();
@@ -2189,6 +2820,10 @@ int main(int argc, char **argv)
 
     if (sock >= 0)
         close(sock);
+    if (gSoundReady)
+        csndExit();
+    if (gBoopBuffer)
+        linearFree(gBoopBuffer);
     free(buffer);
     gfxExit();
     return 0;

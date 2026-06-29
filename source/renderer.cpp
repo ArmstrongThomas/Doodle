@@ -125,6 +125,39 @@ static void drawGlyph(u8 *target, int width, int height, int x, int y, char c, u
         case '/': { u8 g[7] = {0x01,0x01,0x02,0x04,0x08,0x10,0x10}; memcpy(glyph,g,7); break; }
         case '<': { u8 g[7] = {0x02,0x04,0x08,0x10,0x08,0x04,0x02}; memcpy(glyph,g,7); break; }
         case '>': { u8 g[7] = {0x08,0x04,0x02,0x01,0x02,0x04,0x08}; memcpy(glyph,g,7); break; }
+        case '[': { u8 g[7] = {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}; memcpy(glyph,g,7); break; }
+        case ']': { u8 g[7] = {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E}; memcpy(glyph,g,7); break; }
+        case '_': { u8 g[7] = {0x00,0x00,0x00,0x00,0x00,0x00,0x1F}; memcpy(glyph,g,7); break; }
+        case '!': { u8 g[7] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04}; memcpy(glyph,g,7); break; }
+        case '?': { u8 g[7] = {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}; memcpy(glyph,g,7); break; }
+        case ',': { u8 g[7] = {0x00,0x00,0x00,0x00,0x00,0x04,0x08}; memcpy(glyph,g,7); break; }
+        case '\'': { u8 g[7] = {0x04,0x04,0x08,0x00,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
+        case 'a': { u8 g[7] = {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F}; memcpy(glyph,g,7); break; }
+        case 'b': { u8 g[7] = {0x10,0x10,0x16,0x19,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
+        case 'c': { u8 g[7] = {0x00,0x00,0x0E,0x10,0x10,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'd': { u8 g[7] = {0x01,0x01,0x0D,0x13,0x11,0x11,0x0F}; memcpy(glyph,g,7); break; }
+        case 'e': { u8 g[7] = {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E}; memcpy(glyph,g,7); break; }
+        case 'f': { u8 g[7] = {0x06,0x08,0x08,0x1C,0x08,0x08,0x08}; memcpy(glyph,g,7); break; }
+        case 'g': { u8 g[7] = {0x00,0x00,0x0F,0x11,0x0F,0x01,0x0E}; memcpy(glyph,g,7); break; }
+        case 'h': { u8 g[7] = {0x10,0x10,0x16,0x19,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'i': { u8 g[7] = {0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case 'j': { u8 g[7] = {0x02,0x00,0x06,0x02,0x02,0x12,0x0C}; memcpy(glyph,g,7); break; }
+        case 'k': { u8 g[7] = {0x10,0x10,0x12,0x14,0x18,0x14,0x12}; memcpy(glyph,g,7); break; }
+        case 'l': { u8 g[7] = {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case 'm': { u8 g[7] = {0x00,0x00,0x1A,0x15,0x15,0x15,0x15}; memcpy(glyph,g,7); break; }
+        case 'n': { u8 g[7] = {0x00,0x00,0x16,0x19,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'o': { u8 g[7] = {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'p': { u8 g[7] = {0x00,0x00,0x1E,0x11,0x1E,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 'q': { u8 g[7] = {0x00,0x00,0x0D,0x13,0x0F,0x01,0x01}; memcpy(glyph,g,7); break; }
+        case 'r': { u8 g[7] = {0x00,0x00,0x16,0x19,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 's': { u8 g[7] = {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E}; memcpy(glyph,g,7); break; }
+        case 't': { u8 g[7] = {0x08,0x08,0x1C,0x08,0x08,0x09,0x06}; memcpy(glyph,g,7); break; }
+        case 'u': { u8 g[7] = {0x00,0x00,0x11,0x11,0x11,0x13,0x0D}; memcpy(glyph,g,7); break; }
+        case 'v': { u8 g[7] = {0x00,0x00,0x11,0x11,0x11,0x0A,0x04}; memcpy(glyph,g,7); break; }
+        case 'w': { u8 g[7] = {0x00,0x00,0x11,0x15,0x15,0x15,0x0A}; memcpy(glyph,g,7); break; }
+        case 'x': { u8 g[7] = {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11}; memcpy(glyph,g,7); break; }
+        case 'y': { u8 g[7] = {0x00,0x00,0x11,0x11,0x0F,0x01,0x0E}; memcpy(glyph,g,7); break; }
+        case 'z': { u8 g[7] = {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F}; memcpy(glyph,g,7); break; }
         default: return;
     }
 
@@ -144,6 +177,65 @@ static void drawText(u8 *target, int width, int height, int x, int y, const char
         cursor += 6;
         text++;
     }
+}
+
+static int drawWrappedText(u8 *target, int width, int height, int x, int y, int maxChars, int maxLines, const char *text, u8 r, u8 g, u8 b)
+{
+    int line = 0;
+    int lastSpaceCol = -1;
+    const char *start = text ? text : "";
+    char buffer[80];
+    while (*start && line < maxLines)
+    {
+        lastSpaceCol = -1;
+        int len = 0;
+        const char *ptr = start;
+        while (*ptr && len < maxChars)
+        {
+            buffer[len] = *ptr;
+            if (*ptr == ' ')
+                lastSpaceCol = len;
+            len++;
+            ptr++;
+        }
+        if (*ptr && lastSpaceCol > 8)
+            len = lastSpaceCol;
+        buffer[len] = '\0';
+        drawText(target, width, height, x, y + line * 10, buffer, r, g, b);
+        start += len;
+        while (*start == ' ')
+            start++;
+        line++;
+    }
+    return line;
+}
+
+static int wrappedLineCount(int maxChars, int maxLines, const char *text)
+{
+    int line = 0;
+    const char *start = text ? text : "";
+    while (*start && line < maxLines)
+    {
+        int lastSpaceCol = -1;
+        int len = 0;
+        const char *ptr = start;
+        while (*ptr && len < maxChars)
+        {
+            if (*ptr == ' ')
+                lastSpaceCol = len;
+            len++;
+            ptr++;
+        }
+        if (*ptr && lastSpaceCol > 8)
+            len = lastSpaceCol;
+        if (len <= 0)
+            len = 1;
+        start += len;
+        while (*start == ' ')
+            start++;
+        line++;
+    }
+    return std::max(1, line);
 }
 
 static void drawUpperText(u8 *target, int width, int height, int x, int y, const char *text, u8 r, u8 g, u8 b)
@@ -216,7 +308,8 @@ static void updateMinimapCache(CanvasState &canvas)
     minimapCacheValid = true;
 }
 
-static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor, int brushSize, int brushShape)
+static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
+                                  int brushSize, int brushShape, int chatUnread)
 {
     drawTopChrome(connected, updateAvailable);
 
@@ -246,6 +339,12 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 152, 42, 42, 32, 36, 42);
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 206, "SELECT MENU", 73, 82, 92);
+    if (chatUnread > 0)
+    {
+        fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 354, 38, 34, 20, 255, 255, 255);
+        strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 354, 38, 34, 20, 196, 92, 40);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 360, 45, "MSG", 196, 92, 40);
+    }
 
     if (!canvas.pixels || canvas.width <= 0 || canvas.height <= 0)
     {
@@ -324,25 +423,44 @@ static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool up
     topFrameValid = true;
 }
 
-static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, int selectedMenuItem)
+static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, int selectedMenuItem,
+                                int chatUnread, bool showAdminTools)
 {
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "MAIN MENU", 32, 36, 42);
 
-    const char *items[] = {
+    const char *regularItems[] = {
         "CHANNELS",
         "CONNECTED USERS",
+        "CHAT",
+        "CONTROLS",
+        "STATUS",
+        "IDENTITY",
+        "EXIT APP",
+    };
+    const char *staffItems[] = {
+        "CHANNELS",
+        "CONNECTED USERS",
+        "CHAT",
         "CONTROLS",
         "STATUS",
         "IDENTITY",
         "ADMIN TOOLS",
         "EXIT APP",
     };
-    const int itemCount = sizeof(items) / sizeof(items[0]);
+    const char **items = showAdminTools ? staffItems : regularItems;
+    const int itemCount = showAdminTools ? (int)(sizeof(staffItems) / sizeof(staffItems[0]))
+                                         : (int)(sizeof(regularItems) / sizeof(regularItems[0]));
     for (int i = 0; i < itemCount; i++)
     {
         int y = 78 + i * 20;
         drawMenuRow(y, items[i], i == selectedMenuItem);
+        if (i == 2 && chatUnread > 0)
+        {
+            char unreadText[16];
+            snprintf(unreadText, sizeof(unreadText), "%d", std::min(chatUnread, 99));
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 208, y + 2, unreadText, 196, 92, 40);
+        }
     }
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "CHANNEL", 73, 82, 92);
@@ -352,7 +470,7 @@ static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool update
     topFrameValid = true;
 }
 
-static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, char users[][25], int userCount)
+static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, PresenceUser *users, int userCount)
 {
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "CONNECTED USERS", 32, 36, 42);
@@ -365,7 +483,9 @@ static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updat
     {
         int y = 78 + i * 18;
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 34, y, "-", 73, 82, 92);
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, users[i], 32, 36, 42);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, users[i].displayName, 32, 36, 42);
+        if (strcmp(users[i].role, "admin") == 0 || strcmp(users[i].role, "mod") == 0)
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 206, y, users[i].role, 13, 122, 117);
     }
     if (rows == 0)
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "NO USERS YET", 104, 114, 124);
@@ -373,6 +493,76 @@ static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updat
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "CHANNEL", 73, 82, 92);
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 118, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
     drawFooterHint("", "B BACK");
+    topFrameValid = true;
+}
+
+static void composeChatTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
+                                ChatLine *chatLines, int chatCount,
+                                int chatScroll, int chatSelected, int chatUnread, const char *chatNotice)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 10, 34, "Public chat", 32, 36, 42);
+    if (chatUnread > 0)
+    {
+        char unreadText[24];
+        snprintf(unreadText, sizeof(unreadText), "%d NEW", std::min(chatUnread, 99));
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 88, 34, unreadText, 196, 92, 40);
+    }
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 346, 34, "global", 73, 82, 92);
+
+    int maxStart = chatCount > 0 ? chatCount - 1 : 0;
+    int start = std::max(0, std::min(chatScroll, maxStart));
+    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 8, 48, 384, 158, 248, 250, 251);
+    strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 8, 48, 384, 158, 196, 204, 212);
+    int y = 54;
+    int lastRendered = start - 1;
+    for (int i = start; chatLines && i < chatCount && y < 204; i++)
+    {
+        ChatLine &line = chatLines[i];
+        char timeText[6] = "--:--";
+        if (line.timestamp[11] && line.timestamp[12] && line.timestamp[14] && line.timestamp[15])
+            snprintf(timeText, sizeof(timeText), "%.2s:%.2s", line.timestamp + 11, line.timestamp + 14);
+        char prefix[72];
+        const char *name = line.displayName[0] ? line.displayName : line.username[0] ? line.username : "user";
+        if (strcmp(line.role, "admin") == 0 || strcmp(line.role, "mod") == 0)
+            snprintf(prefix, sizeof(prefix), "<%s>[%s]%s:", timeText, line.role, name);
+        else
+            snprintf(prefix, sizeof(prefix), "<%s>%s:", timeText, name);
+        int used = (int)strlen(prefix) * 6 + 6;
+        int messageX = std::min(214, 18 + used);
+        int maxChars = std::max(8, (388 - messageX) / 6);
+        int lineCount = wrappedLineCount(maxChars, 3, line.message);
+        int rowHeight = std::max(15, lineCount * 10 + 5);
+        if (y + rowHeight > 206)
+            break;
+
+        if (i == chatSelected)
+        {
+            fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, y - 3, 376, rowHeight, 224, 242, 238);
+            strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, y - 3, 376, rowHeight, 13, 122, 117);
+        }
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 14, y, prefix,
+                 line.deleted ? 104 : 13, line.deleted ? 114 : 122, line.deleted ? 124 : 117);
+        drawWrappedText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, messageX, y, maxChars, 3,
+                        line.message, line.deleted ? 104 : 32, line.deleted ? 114 : 36, line.deleted ? 124 : 42);
+        y += rowHeight + 1;
+        lastRendered = i;
+    }
+    if (chatCount == 0)
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 40, 96, "No public chat messages yet", 104, 114, 124);
+    else if (lastRendered >= start)
+    {
+        char pageText[24];
+        int total = std::max(0, std::min(chatCount, 99));
+        int first = std::max(1, std::min(start + 1, 99));
+        int last = std::max(first, std::min(lastRendered + 1, 99));
+        snprintf(pageText, sizeof(pageText), "%02d-%02d/%02d", first, last, total);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 316, 203, pageText, 104, 114, 124);
+    }
+
+    if (chatNotice && chatNotice[0])
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 203, chatNotice, 196, 92, 40);
+    drawFooterHint("A SEND  UP/DOWN SELECT", "B MENU");
     topFrameValid = true;
 }
 
@@ -490,12 +680,14 @@ static void presentTopFrameToFramebuffer(u8 *fb, u16 fbWidth, u16 fbHeight)
 void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
                          int brushSize, int brushShape, TopScreenMode mode,
                          char channels[][25], int channelCount, int selectedChannel,
-                         int selectedMenuItem, char users[][25], int userCount,
+                         int selectedMenuItem, PresenceUser *users, int userCount,
                          const char *displayName, const char *username,
                          const char *role, const char *status,
                          const char *backupCode, const char *identityNotice,
                          const char *identityStorage, int selectedAdminItem,
-                         const char *adminNotice)
+                         const char *adminNotice,
+                         ChatLine *chatLines, int chatCount, int chatScroll, int chatSelected, int chatUnread,
+                         const char *chatNotice)
 {
     minimapFrameCounter++;
     if (mode == TOP_MODE_CANVAS && (!minimapCacheValid || minimapFrameCounter >= 15))
@@ -509,9 +701,12 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
     else if (mode == TOP_MODE_CONTROLS)
         composeControlsTopFrame(canvas, connected, updateAvailable);
     else if (mode == TOP_MODE_MENU)
-        composeMenuTopFrame(canvas, connected, updateAvailable, selectedMenuItem);
+        composeMenuTopFrame(canvas, connected, updateAvailable, selectedMenuItem, chatUnread,
+                            role && (strcmp(role, "mod") == 0 || strcmp(role, "admin") == 0));
     else if (mode == TOP_MODE_USERS)
         composeUsersTopFrame(canvas, connected, updateAvailable, users, userCount);
+    else if (mode == TOP_MODE_CHAT)
+        composeChatTopFrame(canvas, connected, updateAvailable, chatLines, chatCount, chatScroll, chatSelected, chatUnread, chatNotice);
     else if (mode == TOP_MODE_ADMIN)
         composeAdminTopFrame(canvas, connected, updateAvailable, role, selectedAdminItem, adminNotice);
     else if (mode == TOP_MODE_STATUS)
@@ -520,7 +715,7 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
         composeIdentityTopFrame(connected, updateAvailable, displayName, username, role, status, backupCode,
                                 identityNotice, identityStorage);
     else
-        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape);
+        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape, chatUnread);
 }
 
 void Renderer::presentTopFrame()

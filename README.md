@@ -49,9 +49,8 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Server Links
 
-- Live canvas viewer: [http://server1.rpgwo.org:3000/](http://server1.rpgwo.org:3000/)
-- Gallery: [http://server1.rpgwo.org:3000/gallery.html](http://server1.rpgwo.org:3000/gallery.html)
-- Legacy gallery redirect: [http://server1.rpgwo.org/](http://server1.rpgwo.org/)
+- Live canvas viewer: [https://doodle.7db.pw/](https://doodle.7db.pw/)
+- Gallery: [https://doodle.7db.pw/gallery.html](https://doodle.7db.pw/gallery.html)
 
 ## Build Requirements
 
@@ -79,18 +78,19 @@ make
 The Makefile exposes release/server variables:
 
 ```make
-APP_VERSION ?= 1.2.1
+APP_VERSION ?= 1.3.0
 TEST_MODE ?= 0
 LOCAL_SERVER_HOST ?= 192.168.1.46
 REMOTE_TEST_SERVER_HOST ?= server2.rpgwo.org
-LIVE_SERVER_HOST ?= server1.rpgwo.org
+LIVE_SERVER_HOST ?= doodle.7db.pw
+LIVE_SERVER_TCP_HOST ?= tcp.doodle.7db.pw
 SERVER_TCP_PORT ?= 3030
 SERVER_HTTP_PORT ?= 3000
 ```
 
 `TEST_MODE` selects the compiled server target:
 
-- `0`: live server, `server1.rpgwo.org`
+- `0`: live server, `doodle.7db.pw` for HTTP/update checks and `tcp.doodle.7db.pw` for raw TCP drawing
 - `1`: local LAN server, `192.168.1.46`
 - `2`: remote test server, `server2.rpgwo.org`
 
@@ -129,6 +129,12 @@ You can still override the selected host for a one-off build:
 make TEST_MODE=1 SERVER_HOST=192.168.4.50
 ```
 
+For split-host builds, override the HTTP and TCP targets separately:
+
+```powershell
+make TEST_MODE=0 SERVER_HTTP_HOST=doodle.7db.pw SERVER_TCP_HOST=tcp.doodle.7db.pw
+```
+
 CIA updater test build using the test title ID but keeping update checks enabled:
 
 ```powershell
@@ -136,7 +142,7 @@ make TEST_MODE=1 DISABLE_UPDATER=0
 make cia TEST_MODE=1 DISABLE_UPDATER=0
 ```
 
-The same values are compiled into networking, updater requests, client hello/version checks, SMDH metadata, and the top-screen version label. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.2.1-test1` or `1.2.1-test2` on the top screen.
+The selected TCP host is compiled into drawing/presence networking. The selected HTTP host is compiled into updater requests. Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.3.0-test1` or `1.3.0-test2` on the top screen.
 
 ## CIA Packaging
 
