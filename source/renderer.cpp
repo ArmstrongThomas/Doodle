@@ -429,6 +429,7 @@ static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool update
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "MAIN MENU", 32, 36, 42);
 
+#if CHAT_ENABLED
     const char *regularItems[] = {
         "CHANNELS",
         "CONNECTED USERS",
@@ -448,6 +449,25 @@ static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool update
         "ADMIN TOOLS",
         "EXIT APP",
     };
+#else
+    const char *regularItems[] = {
+        "CHANNELS",
+        "CONNECTED USERS",
+        "CONTROLS",
+        "STATUS",
+        "IDENTITY",
+        "EXIT APP",
+    };
+    const char *staffItems[] = {
+        "CHANNELS",
+        "CONNECTED USERS",
+        "CONTROLS",
+        "STATUS",
+        "IDENTITY",
+        "ADMIN TOOLS",
+        "EXIT APP",
+    };
+#endif
     const char **items = showAdminTools ? staffItems : regularItems;
     const int itemCount = showAdminTools ? (int)(sizeof(staffItems) / sizeof(staffItems[0]))
                                          : (int)(sizeof(regularItems) / sizeof(regularItems[0]));
@@ -455,12 +475,14 @@ static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool update
     {
         int y = 78 + i * 20;
         drawMenuRow(y, items[i], i == selectedMenuItem);
+#if CHAT_ENABLED
         if (i == 2 && chatUnread > 0)
         {
             char unreadText[16];
             snprintf(unreadText, sizeof(unreadText), "%d", std::min(chatUnread, 99));
             drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 208, y + 2, unreadText, 196, 92, 40);
         }
+#endif
     }
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "CHANNEL", 73, 82, 92);

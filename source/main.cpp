@@ -1954,10 +1954,12 @@ int main(int argc, char **argv)
 
         free(compressedCanvas);
         syncSelectedChannel();
+#if CHAT_ENABLED
         chatCount = 0;
         chatScroll = 0;
         chatSelected = 0;
         requestChatHistory();
+#endif
         return switched;
     };
 
@@ -2050,7 +2052,11 @@ int main(int argc, char **argv)
         if (topMode == TOP_MODE_MENU)
         {
             const bool staffMenu = isModOrAdmin();
+#if CHAT_ENABLED
             const int menuCount = staffMenu ? 8 : 7;
+#else
+            const int menuCount = staffMenu ? 7 : 6;
+#endif
             selectedMenuItem = std::max(0, std::min(selectedMenuItem, menuCount - 1));
             if (kDown & KEY_DUP)
             {
@@ -2081,10 +2087,15 @@ int main(int argc, char **argv)
                 }
                 else if (selectedMenuItem == 2)
                 {
+#if CHAT_ENABLED
                     topMode = TOP_MODE_CHAT;
                     chatUnread = 0;
                     requestChatHistory();
+#else
+                    topMode = TOP_MODE_CONTROLS;
+#endif
                 }
+#if CHAT_ENABLED
                 else if (selectedMenuItem == 3)
                 {
                     topMode = TOP_MODE_CONTROLS;
@@ -2110,6 +2121,29 @@ int main(int argc, char **argv)
                         gspWaitForVBlank();
                     break;
                 }
+#else
+                else if (selectedMenuItem == 3)
+                {
+                    topMode = TOP_MODE_STATUS;
+                }
+                else if (selectedMenuItem == 4)
+                {
+                    topMode = TOP_MODE_IDENTITY;
+                }
+                else if (staffMenu && selectedMenuItem == 5)
+                {
+                    topMode = TOP_MODE_ADMIN;
+                    selectedAdminItem = 0;
+                }
+                else if (selectedMenuItem == (staffMenu ? 6 : 5))
+                {
+                    UIState::clearPoints();
+                    NetworkManager::disconnect();
+                    for (int i = 0; i < 30; i++)
+                        gspWaitForVBlank();
+                    break;
+                }
+#endif
                 topRenderFrame = 10;
                 continue;
             }
