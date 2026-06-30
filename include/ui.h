@@ -30,6 +30,7 @@ public:
     static void updateHSV(float h, float s, float v);
     static void getHSV(float& h, float& s, float& v);
     static void HSVtoRGB(float h, float s, float v, float& r, float& g, float& b);
+    static void RGBtoHSV(float r, float g, float b, float& h, float& s, float& v);
 
     static const int UI_MARGIN_X = 20;
     static const int UI_MARGIN_Y = 10;

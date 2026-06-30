@@ -173,65 +173,33 @@ bool Protocol::parseRecoveryFailed(const char *line, char *reason, size_t reason
     return true;
 }
 
-bool Protocol::parseChatMessages(const char *line, ChatLine *messages, int maxMessages, int &count, char *channel, size_t channelSize)
+bool Protocol::parseRulesRequired(const char *line, char *version, size_t versionSize)
 {
-    if (!line || (!strstr(line, "\"type\":\"chatHistory\"") && !strstr(line, "\"type\":\"chatMessage\"")))
+    if (!line || !strstr(line, "\"type\":\"rulesRequired\""))
         return false;
-
-    count = 0;
-    if (channel && channelSize > 0)
-        jsonString(line, "\"channel\":\"", channel, channelSize);
-
-    const char *ptr = line;
-    while (count < maxMessages)
-    {
-        const char *idPtr = strstr(ptr, "\"id\":");
-        const char *identityPtr = strstr(ptr, "\"identityId\":\"");
-        const char *timePtr = strstr(ptr, "\"timestamp\":\"");
-        const char *userPtr = strstr(ptr, "\"username\":\"");
-        const char *namePtr = strstr(ptr, "\"displayName\":\"");
-        const char *rolePtr = strstr(ptr, "\"role\":\"");
-        const char *deletedPtr = strstr(ptr, "\"deleted\":true");
-        const char *msgPtr = strstr(ptr, "\"message\":\"");
-        if (!msgPtr)
-            break;
-
-        memset(&messages[count], 0, sizeof(messages[count]));
-        messages[count].id = idPtr && idPtr < msgPtr ? jsonInt(idPtr, "\"id\":") : 0;
-        messages[count].deleted = deletedPtr && deletedPtr < msgPtr;
-        if (identityPtr && identityPtr < msgPtr)
-            jsonString(identityPtr, "\"identityId\":\"", messages[count].identityId, sizeof(messages[count].identityId));
-        if (timePtr && timePtr < msgPtr)
-            jsonString(timePtr, "\"timestamp\":\"", messages[count].timestamp, sizeof(messages[count].timestamp));
-        if (userPtr && userPtr < msgPtr)
-            jsonString(userPtr, "\"username\":\"", messages[count].username, sizeof(messages[count].username));
-        if (namePtr && namePtr < msgPtr)
-            jsonString(namePtr, "\"displayName\":\"", messages[count].displayName, sizeof(messages[count].displayName));
-        else
-            snprintf(messages[count].displayName, sizeof(messages[count].displayName), "USER");
-        if (rolePtr && rolePtr < msgPtr)
-            jsonString(rolePtr, "\"role\":\"", messages[count].role, sizeof(messages[count].role));
-        if (!messages[count].role[0])
-            snprintf(messages[count].role, sizeof(messages[count].role), "user");
-        jsonString(msgPtr, "\"message\":\"", messages[count].message, sizeof(messages[count].message));
-        if (messages[count].message[0])
-            count++;
-        ptr = msgPtr + strlen("\"message\":\"");
-    }
+    jsonString(line, "\"version\":\"", version, versionSize);
+    if (version && versionSize > 0 && !version[0])
+        snprintf(version, versionSize, "1");
     return true;
 }
 
-bool Protocol::parseChatResult(const char *line, bool &ok, char *error, size_t errorSize)
+bool Protocol::parseDisplayNameRejected(const char *line, char *reason, size_t reasonSize)
 {
-    if (!line || !strstr(line, "\"type\":\"chatResult\""))
+    if (!line || !strstr(line, "\"type\":\"displayNameRejected\""))
         return false;
-    ok = strstr(line, "\"ok\":true") != NULL;
-    if (error && errorSize > 0)
-    {
-        jsonString(line, "\"error\":\"", error, errorSize);
-        if (!error[0] && !ok)
-            snprintf(error, errorSize, "failed");
-    }
+    jsonString(line, "\"reason\":\"", reason, reasonSize);
+    if (reason && reasonSize > 0 && !reason[0])
+        snprintf(reason, reasonSize, "invalid-name");
+    return true;
+}
+
+bool Protocol::parseDisconnected(const char *line, char *reason, size_t reasonSize)
+{
+    if (!line || (!strstr(line, "\"type\":\"disconnected\"") && !strstr(line, "\"type\":\"banned\"") && !strstr(line, "\"type\":\"serverRestarting\"")))
+        return false;
+    jsonString(line, "\"reason\":\"", reason, reasonSize);
+    if (reason && reasonSize > 0 && !reason[0])
+        snprintf(reason, reasonSize, strstr(line, "\"type\":\"banned\"") ? "banned" : "disconnected");
     return true;
 }
 
@@ -258,6 +226,13 @@ void Protocol::buildSetDisplayName(char *buffer, size_t size, const char *displa
     snprintf(buffer, size, "{\"type\":\"setDisplayName\",\"displayName\":\"%s\"}\n", safeName);
 }
 
+void Protocol::buildRulesAccepted(char *buffer, size_t size, const char *version)
+{
+    char safeVersion[32];
+    jsonSafeString(version, safeVersion, sizeof(safeVersion));
+    snprintf(buffer, size, "{\"type\":\"rulesAccepted\",\"version\":\"%s\"}\n", safeVersion[0] ? safeVersion : "1");
+}
+
 void Protocol::buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,
                                     const char *deviceId, const char *deviceSecret)
 {
@@ -278,25 +253,6 @@ void Protocol::buildRecoverIdentity(char *buffer, size_t size, const char *usern
 void Protocol::buildRotateBackupCode(char *buffer, size_t size)
 {
     snprintf(buffer, size, "{\"type\":\"rotateBackupCode\"}\n");
-}
-
-void Protocol::buildChatHistory(char *buffer, size_t size, const char *channel)
-{
-    snprintf(buffer, size, "{\"type\":\"chatHistory\",\"channel\":\"public\"}\n");
-}
-
-void Protocol::buildChatSend(char *buffer, size_t size, const char *channel, const char *message)
-{
-    char safeMessage[241];
-    jsonSafeString(message, safeMessage, sizeof(safeMessage));
-    snprintf(buffer, size, "{\"type\":\"chatSend\",\"channel\":\"public\",\"message\":\"%s\"}\n", safeMessage);
-}
-
-void Protocol::buildChatReport(char *buffer, size_t size, int messageId, const char *reason)
-{
-    char safeReason[80];
-    jsonSafeString(reason, safeReason, sizeof(safeReason));
-    snprintf(buffer, size, "{\"type\":\"chatReport\",\"messageId\":%d,\"reason\":\"%s\"}\n", messageId, safeReason);
 }
 
 void Protocol::buildModerationCommand(char *buffer, size_t size, const char *action, const char *identityId,

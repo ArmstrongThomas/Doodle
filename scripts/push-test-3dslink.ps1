@@ -16,7 +16,7 @@ $env:PATH = 'C:\devkitPro\msys2\usr\bin;C:\devkitPro\tools\bin;C:\devkitPro\devk
 
 $make = 'C:\devkitPro\msys2\usr\bin\make.exe'
 $link = 'C:\devkitPro\tools\bin\3dslink.exe'
-$testBuildName = if ($TestMode -eq 2) { 'CollabDoodle-test-server2.3dsx' } else { 'CollabDoodle-test-local.3dsx' }
+$testBuildName = if ($TestMode -eq 2) { 'Doodle.3dsx' } else { 'Doodle.3dsx' }
 $testBuild = Join-Path $root $testBuildName
 
 Push-Location $root

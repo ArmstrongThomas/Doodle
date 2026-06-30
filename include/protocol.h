@@ -50,20 +50,19 @@ public:
     static bool parseIdentityAccepted(const char *line, IdentityInfo &identity);
     static bool parseIdentityBackupCode(const char *line, IdentityInfo &identity);
     static bool parseRecoveryFailed(const char *line, char *reason, size_t reasonSize);
-    static bool parseChatMessages(const char *line, ChatLine *messages, int maxMessages, int &count, char *channel, size_t channelSize);
-    static bool parseChatResult(const char *line, bool &ok, char *error, size_t errorSize);
+    static bool parseRulesRequired(const char *line, char *version, size_t versionSize);
+    static bool parseDisplayNameRejected(const char *line, char *reason, size_t reasonSize);
+    static bool parseDisconnected(const char *line, char *reason, size_t reasonSize);
     static bool parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
                                     char *reason, size_t reasonSize);
     static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
                            const char *deviceId, const char *deviceSecret, const char *displayName, const char *packageType);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
     static void buildSetDisplayName(char *buffer, size_t size, const char *displayName);
+    static void buildRulesAccepted(char *buffer, size_t size, const char *version);
     static void buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,
                                      const char *deviceId, const char *deviceSecret);
     static void buildRotateBackupCode(char *buffer, size_t size);
-    static void buildChatHistory(char *buffer, size_t size, const char *channel);
-    static void buildChatSend(char *buffer, size_t size, const char *channel, const char *message);
-    static void buildChatReport(char *buffer, size_t size, int messageId, const char *reason);
     static void buildModerationCommand(char *buffer, size_t size, const char *action, const char *identityId,
                                        int messageId, const char *reason);
     static void buildAdminCanvasCommand(char *buffer, size_t size, const char *action, const char *channel,

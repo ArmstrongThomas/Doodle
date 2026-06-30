@@ -23,6 +23,10 @@
 Color currentColor = {255, 0, 0}; // Red by default
 int currentBrushSize = 1;
 int currentBrushShape = 0;
+static const int BRUSH_CIRCLE = 0;
+static const int BRUSH_SQUARE = 1;
+static const int BRUSH_DITHER = 2;
+static const int BRUSH_ERASER = 3;
 
 struct DeviceIdentity {
     char deviceId[48];
@@ -30,34 +34,54 @@ struct DeviceIdentity {
     char displayName[32];
     char username[25];
     char backupCode[32];
-    bool chatSoundEnabled;
+    char rulesAcceptedVersion[32];
 };
 
-static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", "", true};
+static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", "", ""};
 static char gIdentityStorageStatus[64] = "STORE UNKNOWN";
 static char gIdentityBootStatus[64] = "BOOT UNKNOWN";
 static const char *IDENTITY_PRIMARY_PATH = "sdmc:/3ds/CollabDoodle/identity.txt";
 static const char *IDENTITY_FALLBACK_PATH = "sdmc:/3ds/CollabDoodle.identity.txt";
 static int gLastPrimaryReadErr = 0;
 static int gLastFallbackReadErr = 0;
-static s16 *gBoopBuffer = NULL;
-static size_t gBoopBufferSize = 0;
-static bool gSoundReady = false;
+static char gRequiredRulesVersion[32] = "";
+static bool gNeedsDisplayName = false;
+static bool gNeedsRules = false;
+static char gDisconnectReason[80] = "";
 
-static void randomHex(char *out, size_t outSize)
+static void seedRandom()
 {
-    static const char *hex = "0123456789abcdef";
     static bool seeded = false;
-    if (!out || outSize == 0)
-        return;
     if (!seeded)
     {
         srand((unsigned int)(osGetTime() ^ svcGetSystemTick()));
         seeded = true;
     }
+}
+
+static void randomHex(char *out, size_t outSize)
+{
+    static const char *hex = "0123456789abcdef";
+    if (!out || outSize == 0)
+        return;
+    seedRandom();
     for (size_t i = 0; i + 1 < outSize; i++)
         out[i] = hex[rand() & 15];
     out[outSize - 1] = '\0';
+}
+
+static void chooseRandomDrawingColor()
+{
+    seedRandom();
+    float h = (float)(rand() % 360) / 360.0f;
+    float s = 0.72f + ((float)(rand() % 24) / 100.0f);
+    float v = 0.78f + ((float)(rand() % 20) / 100.0f);
+    float r, g, b;
+    UIState::HSVtoRGB(h, s, v, r, g, b);
+    currentColor.r = (u8)(r * 255.0f);
+    currentColor.g = (u8)(g * 255.0f);
+    currentColor.b = (u8)(b * 255.0f);
+    UIState::updateHSV(h, s, v);
 }
 
 static void trimLine(char *text)
@@ -88,13 +112,13 @@ static bool readIdentityFile(const char *path)
     char displayName[64] = "";
     char username[64] = "";
     char backupCode[64] = "";
-    char chatSound[16] = "";
+    char rulesAcceptedVersion[32] = "";
     fgets(deviceId, sizeof(deviceId), file);
     fgets(deviceSecret, sizeof(deviceSecret), file);
     fgets(displayName, sizeof(displayName), file);
     fgets(username, sizeof(username), file);
     fgets(backupCode, sizeof(backupCode), file);
-    fgets(chatSound, sizeof(chatSound), file);
+    fgets(rulesAcceptedVersion, sizeof(rulesAcceptedVersion), file);
     fclose(file);
 
     trimLine(deviceId);
@@ -102,13 +126,13 @@ static bool readIdentityFile(const char *path)
     trimLine(displayName);
     trimLine(username);
     trimLine(backupCode);
-    trimLine(chatSound);
+    trimLine(rulesAcceptedVersion);
     snprintf(gIdentity.deviceId, sizeof(gIdentity.deviceId), "%s", deviceId);
     snprintf(gIdentity.deviceSecret, sizeof(gIdentity.deviceSecret), "%s", deviceSecret);
     snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", displayName);
     snprintf(gIdentity.username, sizeof(gIdentity.username), "%s", username);
     snprintf(gIdentity.backupCode, sizeof(gIdentity.backupCode), "%s", backupCode);
-    gIdentity.chatSoundEnabled = chatSound[0] ? strcmp(chatSound, "0") != 0 : true;
+    snprintf(gIdentity.rulesAcceptedVersion, sizeof(gIdentity.rulesAcceptedVersion), "%s", rulesAcceptedVersion);
     if (!gIdentity.displayName[0])
         strcpy(gIdentity.displayName, "3DS User");
     if (!gIdentity.username[0])
@@ -123,8 +147,8 @@ static bool writeIdentityFile(const char *path)
     FILE *file = fopen(path, "w");
     if (!file)
         return false;
-    fprintf(file, "%s\n%s\n%s\n%s\n%s\n%d\n", gIdentity.deviceId, gIdentity.deviceSecret,
-            gIdentity.displayName, gIdentity.username, gIdentity.backupCode, gIdentity.chatSoundEnabled ? 1 : 0);
+    fprintf(file, "%s\n%s\n%s\n%s\n%s\n%s\n", gIdentity.deviceId, gIdentity.deviceSecret,
+            gIdentity.displayName, gIdentity.username, gIdentity.backupCode, gIdentity.rulesAcceptedVersion);
     fflush(file);
     bool ok = fclose(file) == 0;
     return ok;
@@ -145,37 +169,6 @@ static const char *deviceIdSuffix()
 {
     size_t len = strlen(gIdentity.deviceId);
     return len > 6 ? gIdentity.deviceId + len - 6 : gIdentity.deviceId;
-}
-
-static void initChatSound()
-{
-    if (gSoundReady)
-        return;
-    const int sampleRate = 22050;
-    const int samples = sampleRate / 8;
-    gBoopBufferSize = samples * sizeof(s16);
-    gBoopBuffer = (s16 *)linearAlloc(gBoopBufferSize);
-    if (!gBoopBuffer)
-        return;
-    for (int i = 0; i < samples; i++)
-    {
-        float t = (float)i / (float)sampleRate;
-        float fade = 1.0f - ((float)i / (float)samples);
-        float wave = sinf(2.0f * (float)M_PI * 440.0f * t);
-        gBoopBuffer[i] = (s16)(wave * fade * 2200.0f);
-    }
-    if (R_SUCCEEDED(csndInit()))
-    {
-        GSPGPU_FlushDataCache(gBoopBuffer, gBoopBufferSize);
-        gSoundReady = true;
-    }
-}
-
-static void playChatBoop()
-{
-    if (!gIdentity.chatSoundEnabled || !gSoundReady || !gBoopBuffer)
-        return;
-    csndPlaySound(0x8, SOUND_ONE_SHOT | SOUND_FORMAT_16BIT, 22050, 0.28f, 0.0f, gBoopBuffer, NULL, (u32)gBoopBufferSize);
 }
 
 static void saveDeviceIdentity()
@@ -231,6 +224,7 @@ static void loadDeviceIdentity()
         strcpy(gIdentity.displayName, "3DS User");
         strcpy(gIdentity.username, "pending");
         gIdentity.backupCode[0] = '\0';
+        gIdentity.rulesAcceptedVersion[0] = '\0';
         snprintf(gIdentityBootStatus, sizeof(gIdentityBootStatus), "NEW %s R%d/%d",
                  deviceIdSuffix(), primaryErr, fallbackErr);
         snprintf(gIdentityStorageStatus, sizeof(gIdentityStorageStatus), "%s", gIdentityBootStatus);
@@ -352,117 +346,6 @@ static void drawRectOutline(u8 *fb, int fbWidth, int fbHeight, int x, int y, int
 }
 
 static void drawMiniText(u8 *fb, int width, int height, int x, int y, const char *text, u8 r, u8 g, u8 b);
-
-static void drawBottomButton(u8 *fb, int fbWidth, int fbHeight, int x, int y, int w, int h, const char *label,
-                             bool danger = false)
-{
-    fillRect(fb, fbWidth, fbHeight, x, y, w, h, danger ? 196 : 24, danger ? 61 : 33, danger ? 61 : 38);
-    drawRectOutline(fb, fbWidth, fbHeight, x, y, w, h, 216, 224, 232);
-    drawMiniText(fb, fbWidth, fbHeight, x + 12, y + h / 2 - 4, label, 245, 248, 250);
-}
-
-static void formatModerationTime(int seconds, char *out, size_t outSize)
-{
-    if (!out || outSize == 0)
-        return;
-    if (seconds <= 0)
-    {
-        out[0] = '\0';
-        return;
-    }
-    int minutes = (seconds + 59) / 60;
-    if (minutes < 60)
-        snprintf(out, outSize, "%dm", minutes);
-    else
-        snprintf(out, outSize, "%dh", (minutes + 59) / 60);
-}
-
-static void drawChatBottomPanel(u8 *fb, int fbWidth, int fbHeight, PresenceUser *users, int userCount, int userScroll,
-                                int selectedUser, bool modOrAdmin, const char *targetName, const IdentityInfo &self)
-{
-    fillRect(fb, fbWidth, fbHeight, 0, 0, 320, 240, 232, 236, 239);
-    fillRect(fb, fbWidth, fbHeight, 0, 0, 218, 28, 24, 33, 38);
-    fillRect(fb, fbWidth, fbHeight, 218, 0, 102, 28, 13, 122, 117);
-    drawMiniText(fb, fbWidth, fbHeight, 14, 10, "PUBLIC CHAT", 245, 248, 250);
-    drawMiniText(fb, fbWidth, fbHeight, 230, 10, "ONLINE", 245, 248, 250);
-
-    drawBottomButton(fb, fbWidth, fbHeight, 12, 42, 92, 32, "SEND");
-    drawBottomButton(fb, fbWidth, fbHeight, 114, 42, 92, 32, "REFRESH");
-    drawBottomButton(fb, fbWidth, fbHeight, 12, 82, 92, 32, "BACK");
-    drawBottomButton(fb, fbWidth, fbHeight, 114, 82, 92, 32, gIdentity.chatSoundEnabled ? "SOUND ON" : "SOUND OFF");
-    drawBottomButton(fb, fbWidth, fbHeight, 12, 122, 92, 32, "REPORT");
-    if (modOrAdmin)
-    {
-        const PresenceUser *selected = (selectedUser >= 0 && selectedUser < userCount) ? &users[selectedUser] : NULL;
-        drawBottomButton(fb, fbWidth, fbHeight, 114, 122, 92, 32, "DELETE");
-        drawBottomButton(fb, fbWidth, fbHeight, 12, 162, 92, 32,
-                         selected && strcmp(selected->status, "muted") == 0 ? "UNMUTE" : "MUTE");
-        drawBottomButton(fb, fbWidth, fbHeight, 114, 162, 92, 32, "BAN", true);
-    }
-    else
-    {
-        drawMiniText(fb, fbWidth, fbHeight, 114, 132, "Tap a name", 104, 114, 124);
-        drawMiniText(fb, fbWidth, fbHeight, 114, 146, "for details", 104, 114, 124);
-    }
-
-    drawMiniText(fb, fbWidth, fbHeight, 12, 202, "TARGET", 73, 82, 92);
-    drawMiniText(fb, fbWidth, fbHeight, 62, 202, targetName && targetName[0] ? targetName : "LATEST MESSAGE", 32, 36, 42);
-
-    fillRect(fb, fbWidth, fbHeight, 218, 28, 102, 212, 248, 250, 251);
-    drawRectOutline(fb, fbWidth, fbHeight, 218, 28, 102, 212, 196, 204, 212);
-    drawBottomButton(fb, fbWidth, fbHeight, 226, 34, 38, 20, "UP");
-    drawBottomButton(fb, fbWidth, fbHeight, 270, 34, 40, 20, "DN");
-
-    int maxScroll = userCount > 10 ? userCount - 10 : 0;
-    userScroll = std::max(0, std::min(userScroll, maxScroll));
-    int rows = std::min(userCount - userScroll, 10);
-    for (int i = 0; i < rows; i++)
-    {
-        int userIndex = userScroll + i;
-        PresenceUser &user = users[userIndex];
-        int y = 62 + i * 14;
-        if (userIndex == selectedUser)
-        {
-            fillRect(fb, fbWidth, fbHeight, 222, y - 3, 94, 13, 224, 242, 238);
-            drawRectOutline(fb, fbWidth, fbHeight, 222, y - 3, 94, 13, 13, 122, 117);
-        }
-        drawMiniText(fb, fbWidth, fbHeight, 226, y, user.displayName[0] ? user.displayName : user.username, 32, 36, 42);
-        if (strcmp(user.role, "admin") == 0 || strcmp(user.role, "mod") == 0)
-            drawMiniText(fb, fbWidth, fbHeight, 282, y, user.role, 13, 122, 117);
-        else if (strcmp(user.status, "muted") == 0)
-            drawMiniText(fb, fbWidth, fbHeight, 282, y, "mut", 196, 92, 40);
-        else if (strcmp(user.status, "banned") == 0)
-            drawMiniText(fb, fbWidth, fbHeight, 282, y, "ban", 196, 61, 61);
-    }
-    if (rows == 0)
-        drawMiniText(fb, fbWidth, fbHeight, 232, 92, "NO USERS", 104, 114, 124);
-
-    const PresenceUser *detail = (selectedUser >= 0 && selectedUser < userCount) ? &users[selectedUser] : NULL;
-    fillRect(fb, fbWidth, fbHeight, 222, 205, 94, 31, 232, 236, 239);
-    if (detail)
-    {
-        drawMiniText(fb, fbWidth, fbHeight, 226, 210, detail->role, 13, 122, 117);
-        if (strcmp(detail->status, "muted") == 0)
-        {
-            char timeText[12];
-            formatModerationTime(detail->muteSecondsRemaining, timeText, sizeof(timeText));
-            drawMiniText(fb, fbWidth, fbHeight, 226, 224, timeText[0] ? timeText : "muted", 196, 92, 40);
-        }
-        else if (strcmp(detail->status, "banned") == 0)
-            drawMiniText(fb, fbWidth, fbHeight, 226, 224, "banned", 196, 61, 61);
-        else
-            drawMiniText(fb, fbWidth, fbHeight, 226, 224, "active", 104, 114, 124);
-    }
-
-    if (strcmp(self.status, "muted") == 0)
-    {
-        char muteText[24];
-        char timeText[12];
-        formatModerationTime(self.muteSecondsRemaining, timeText, sizeof(timeText));
-        snprintf(muteText, sizeof(muteText), "YOU MUTED %s", timeText);
-        drawMiniText(fb, fbWidth, fbHeight, 12, 220, muteText, 196, 92, 40);
-    }
-}
 
 static void applyCanvasRectLocal(CanvasState &canvas, int x, int y, int w, int h, Color color)
 {
@@ -750,6 +633,21 @@ static bool pointInRect(int px, int py, int x, int y, int w, int h)
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
+static int brushSizeForShapeRow(int shape, int row)
+{
+    static const int normalSizes[] = {1, 2, 3, 5, 7};
+    static const int largeSizes[] = {3, 5, 7, 9, 12};
+    row = std::max(0, std::min(4, row));
+    return (shape == BRUSH_DITHER || shape == BRUSH_ERASER) ? largeSizes[row] : normalSizes[row];
+}
+
+static int clampBrushSizeForShape(int shape, int size)
+{
+    if (shape == BRUSH_DITHER || shape == BRUSH_ERASER)
+        return std::max(3, std::min(12, size));
+    return std::max(1, std::min(7, size));
+}
+
 void drawPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight, int x, int y, u8 r, u8 g, u8 b)
 {
     if (x >= 0 && x < fbWidth && y >= 0 && y < fbHeight)
@@ -760,6 +658,22 @@ void drawPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight, int x, int y, u8 r
         buffer[idx + 2] = b; // Blue
     }
 }
+
+static Color effectiveDrawColor()
+{
+    if (currentBrushShape == BRUSH_ERASER)
+    {
+        Color white = {255, 255, 255};
+        return white;
+    }
+    return currentColor;
+}
+
+static int effectiveBrushShape()
+{
+    return currentBrushShape == BRUSH_ERASER ? BRUSH_CIRCLE : currentBrushShape;
+}
+
 u8 clampColor(float colorValue)
 {
     return static_cast<u8>(std::max(0.0f, std::min(255.0f, colorValue)));
@@ -812,9 +726,10 @@ static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
     if (canvasX < 0 || canvasX >= canvasWidth || canvasY < 0 || canvasY >= canvasHeight)
         return;
 
+    Color drawColor = effectiveDrawColor();
     drawBrush(fullCanvas, canvasWidth, canvasHeight, canvasX, canvasY,
-              currentBrushSize, currentBrushShape,
-              currentColor.r, currentColor.g, currentColor.b);
+              currentBrushSize, effectiveBrushShape(),
+              drawColor.r, drawColor.g, drawColor.b);
     canvas.markDirty(canvasX, canvasY, currentBrushSize);
     UIState::addPoint(canvasX, canvasY);
 }
@@ -836,9 +751,10 @@ static void drawStrokeLine(u8 *fullCanvas, int canvasWidth, int canvasHeight,
         int y = (int)std::round(cy0 + (cy1 - cy0) * t);
         if (x < 0 || x >= canvasWidth || y < 0 || y >= canvasHeight)
             continue;
+        Color drawColor = effectiveDrawColor();
         drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
-                  currentBrushSize, currentBrushShape,
-                  currentColor.r, currentColor.g, currentColor.b);
+                  currentBrushSize, effectiveBrushShape(),
+                  drawColor.r, drawColor.g, drawColor.b);
         canvas.markDirty(x, y, currentBrushSize);
         UIState::addPoint(x, y);
     }
@@ -865,9 +781,10 @@ static void drawStrokeCurve(u8 *fullCanvas, int canvasWidth, int canvasHeight,
         int y = (int)std::round(inv * inv * c0y + 2.0f * inv * t * ccy + t * t * c1y);
         if (x < 0 || x >= canvasWidth || y < 0 || y >= canvasHeight)
             continue;
+        Color drawColor = effectiveDrawColor();
         drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
-                  currentBrushSize, currentBrushShape,
-                  currentColor.r, currentColor.g, currentColor.b);
+                  currentBrushSize, effectiveBrushShape(),
+                  drawColor.r, drawColor.g, drawColor.b);
         canvas.markDirty(x, y, currentBrushSize);
         UIState::addPoint(x, y);
     }
@@ -930,8 +847,8 @@ static bool processRectPacket(const uint8_t *packet, size_t length, CanvasState 
 
 void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
 {
-    std::vector<int> brushSizes = {1, 2, 3, 5, 7};
-    std::vector<int> brushPositions = {30, 60, 90, 120, 150};
+    std::vector<int> brushSizes = {1, 2, 3, 5, 7, 9, 12};
+    std::vector<int> brushPositions = {24, 46, 68, 90, 112, 134, 156};
 
     for (size_t i = 0; i < brushSizes.size(); i++)
     {
@@ -1030,12 +947,21 @@ static void drawPaletteBrushChoice(u8 *framebuffer, int fbWidth, int fbHeight, i
     {
         for (int px = -radius; px <= radius; px++)
         {
-            bool draw = shape == 1 || (px * px + py * py <= radius * radius);
+            bool draw = shape == BRUSH_SQUARE || (px * px + py * py <= radius * radius);
             if (shape == 2 && (abs(px) + abs(py)) % 2 == 1)
                 draw = false;
             if (draw)
-                putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + px, y + py, 24, 33, 38);
+                putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + px, y + py,
+                                     shape == BRUSH_ERASER ? 255 : 24,
+                                     shape == BRUSH_ERASER ? 255 : 33,
+                                     shape == BRUSH_ERASER ? 255 : 38);
         }
+    }
+    if (shape == BRUSH_ERASER)
+    {
+        strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x - radius, y - radius, radius * 2 + 1, radius * 2 + 1, 196, 61, 61);
+        for (int i = -radius; i <= radius; i++)
+            putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + i, y - i, 196, 61, 61);
     }
 }
 
@@ -1090,16 +1016,17 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     if (activeTab == 0)
     {
         drawMiniText(framebuffer, fbWidth, fbHeight, 26, 52, "BRUSH", 73, 82, 92);
-        const int shapeXs[] = {38, 78, 118};
+        const int shapeXs[] = {30, 60, 90, 120};
         const int sizeYs[] = {70, 92, 114, 136, 158};
-        const int sizes[] = {1, 2, 3, 5, 7};
-        drawMiniText(framebuffer, fbWidth, fbHeight, 26, 184, "CIR", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 66, 184, "BOX", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 106, 184, "DIT", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 16, 184, "CIR", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 48, 184, "BOX", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 78, 184, "DIT", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 108, 184, "ERS", 196, 61, 61);
         for (int row = 0; row < 5; row++)
-            for (int shape = 0; shape < 3; shape++)
+            for (int shape = 0; shape < 4; shape++)
                 drawPaletteBrushChoice(framebuffer, fbWidth, fbHeight, shapeXs[shape], sizeYs[row],
-                                       sizes[row], shape, currentBrushSize == sizes[row] && currentBrushShape == shape);
+                                       brushSizeForShapeRow(shape, row), shape,
+                                       currentBrushSize == brushSizeForShapeRow(shape, row) && currentBrushShape == shape);
 
         float h, s, v;
         UIState::getHSV(h, s, v);
@@ -1152,15 +1079,9 @@ static bool editDisplayName(int sock, IdentityInfo &identityInfo)
     if (!inputText[0])
         return false;
 
-    snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", inputText);
-    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", inputText);
-    saveDeviceIdentity();
-
     char command[96];
     Protocol::buildSetDisplayName(command, sizeof(command), inputText);
-    if (sock >= 0)
-        send(sock, command, strlen(command), 0);
-    return true;
+    return sock >= 0 && send(sock, command, strlen(command), 0) > 0;
 }
 
 static bool readKeyboardText(const char *hint, char *out, size_t outSize, const char *initial = "")
@@ -1205,6 +1126,15 @@ static bool recoverIdentity(int sock)
     return send(sock, command, strlen(command), 0) > 0;
 }
 
+static bool acceptRules(int sock, const char *version)
+{
+    if (sock < 0)
+        return false;
+    char command[96];
+    Protocol::buildRulesAccepted(command, sizeof(command), version && version[0] ? version : "1");
+    return send(sock, command, strlen(command), 0) > 0;
+}
+
 static void applyIdentityAccepted(const IdentityInfo &identityInfo)
 {
     if (identityInfo.username[0])
@@ -1229,6 +1159,7 @@ int main(int argc, char **argv)
     gfxInitDefault();
     gfxSetDoubleBuffering(GFX_TOP, false);
     UIState::init();
+    chooseRandomDrawingColor();
     const char *appPath = (argc > 0 && argv && argv[0] && argv[0][0]) ? argv[0] : "sdmc:/3ds/CollabDoodle-current.3dsx";
     u64 installedTitleId = currentInstalledTitleId();
     const char *packageType = (installedTitleId != 0 || isCiaLaunch(appPath)) ? "cia" : "3dsx";
@@ -1239,7 +1170,6 @@ int main(int argc, char **argv)
     printf("3DS Collab Doodle\n");
     printf("Package: %s\n", packageType);
     loadDeviceIdentity();
-    initChatSound();
     printf("Identity: %s\n", gIdentity.deviceId);
     printf("Identity boot: %s\n", gIdentityBootStatus);
 
@@ -1262,7 +1192,7 @@ int main(int argc, char **argv)
     }
     printf("Client hello sent: %s\n", APP_VERSION);
 
-    std::vector<int> brushSizes = {1, 2, 3, 5, 7}; // Define your brush sizes
+    std::vector<int> brushSizes = {1, 2, 3, 5, 7, 9, 12}; // Define your brush sizes
     initializeGaussianFalloff(brushSizes);
 
     u16 fbWidth, fbHeight;
@@ -1272,16 +1202,16 @@ int main(int argc, char **argv)
         printf("Failed to get framebuffer\n");
         gfxExit();
         return 1;
-    }    
+    }
     printf("Controls:\n"
            "- Touch the bottom screen to draw\n"
            "- START: Refresh canvas from server\n"
            "- SELECT: Menu\n"
            "- Menu > Channels: Switch channel\n"
-           "- Hold LEFT/A + stylus: Pan viewport\n"
+           "- Circle Pad or hold LEFT/A + stylus: Pan viewport\n"
            "- DOWN/B: Toggle Color Picker\n"
-           "- Hold UP + tap: Sample color\n"
-           "- X: Input Hex color code\n"
+           "- Hold UP/X + tap: Sample color\n"
+           "- Hold L/R: Temporary eraser\n"
            "- Hold RIGHT/Y + touch: Zoom buttons\n");
 
     size_t bufferSize = fbWidth * fbHeight * 3;
@@ -1305,17 +1235,13 @@ int main(int argc, char **argv)
     int selectedMenuItem = 0;
     int selectedAdminItem = 0;
     int pickerTab = 0;
+    bool shoulderEraserActive = false;
+    int shoulderSavedBrushShape = currentBrushShape;
+    int shoulderSavedBrushSize = currentBrushSize;
     char availableChannels[8][25];
     int availableChannelCount = 0;
     PresenceUser connectedUsers[24];
     int connectedUserCount = 0;
-    ChatLine chatLines[15];
-    int chatCount = 0;
-    int chatScroll = 0;
-    int chatSelected = 0;
-    int chatUnread = 0;
-    int chatUserScroll = 0;
-    int chatSelectedUser = -1;
     IdentityInfo identityInfo;
     memset(&identityInfo, 0, sizeof(identityInfo));
     snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", gIdentity.displayName);
@@ -1327,9 +1253,6 @@ int main(int argc, char **argv)
     int identityNoticeFrames = 0;
     char adminNotice[40] = "";
     int adminNoticeFrames = 0;
-    char chatNotice[40] = "";
-    int chatNoticeFrames = 0;
-    u64 lastChatSendAt = 0;
     enum AdminRectTool {
         ADMIN_RECT_NONE = 0,
         ADMIN_RECT_FILL = 1,
@@ -1340,6 +1263,7 @@ int main(int argc, char **argv)
     int adminRectStartY = 0;
     int adminRectEndX = 0;
     int adminRectEndY = 0;
+    bool exitRequested = false;
 
     auto isModOrAdmin = [&]() -> bool
     {
@@ -1355,302 +1279,9 @@ int main(int argc, char **argv)
 
     auto setAdminNotice = [&](const char *notice)
     {
-        snprintf(adminNotice, sizeof(adminNotice), "%s", notice ? notice : "");
+        snprintf(adminNotice, sizeof(adminNotice), "%.39s", notice ? notice : "");
         adminNoticeFrames = adminNotice[0] ? 180 : 0;
         topRenderFrame = 10;
-    };
-
-    auto setChatNotice = [&](const char *notice)
-    {
-        snprintf(chatNotice, sizeof(chatNotice), "%s", notice ? notice : "");
-        chatNoticeFrames = chatNotice[0] ? 180 : 0;
-        topRenderFrame = 10;
-    };
-
-    auto chatNewestScroll = [&]() -> int
-    {
-        return chatCount > 9 ? chatCount - 9 : 0;
-    };
-
-    auto chatRowHeight = [&](const ChatLine &line) -> int
-    {
-        char prefix[72];
-        const char *name = line.displayName[0] ? line.displayName : line.username[0] ? line.username : "user";
-        if (strcmp(line.role, "admin") == 0 || strcmp(line.role, "mod") == 0)
-            snprintf(prefix, sizeof(prefix), "<00:00>[%s]%s:", line.role, name);
-        else
-            snprintf(prefix, sizeof(prefix), "<00:00>%s:", name);
-        int messageX = std::min(214, 18 + (int)strlen(prefix) * 6 + 6);
-        int maxChars = std::max(8, (388 - messageX) / 6);
-        int lineCount = 0;
-        const char *start = line.message[0] ? line.message : " ";
-        while (*start && lineCount < 3)
-        {
-            int lastSpaceCol = -1;
-            int len = 0;
-            const char *ptr = start;
-            while (*ptr && len < maxChars)
-            {
-                if (*ptr == ' ')
-                    lastSpaceCol = len;
-                len++;
-                ptr++;
-            }
-            if (*ptr && lastSpaceCol > 8)
-                len = lastSpaceCol;
-            if (len <= 0)
-                len = 1;
-            start += len;
-            while (*start == ' ')
-                start++;
-            lineCount++;
-        }
-        lineCount = std::max(1, lineCount);
-        return std::max(15, lineCount * 10 + 5) + 1;
-    };
-
-    auto chatScrollForNewest = [&]() -> int
-    {
-        const int paneHeight = 152;
-        int used = 0;
-        int start = chatCount;
-        for (int i = chatCount - 1; i >= 0; i--)
-        {
-            int h = chatRowHeight(chatLines[i]);
-            if (used > 0 && used + h > paneHeight)
-                break;
-            used += h;
-            start = i;
-        }
-        return std::max(0, start);
-    };
-
-    auto clampChatSelection = [&]()
-    {
-        if (chatCount <= 0)
-        {
-            chatSelected = 0;
-            chatScroll = 0;
-            return;
-        }
-        chatSelected = std::max(0, std::min(chatSelected, chatCount - 1));
-        chatScroll = std::max(0, std::min(chatScroll, std::max(chatNewestScroll(), chatScrollForNewest())));
-        while (chatSelected < chatScroll)
-            chatScroll--;
-        const int paneHeight = 152;
-        int used = 0;
-        bool selectedVisible = false;
-        for (int i = chatScroll; i < chatCount; i++)
-        {
-            int h = chatRowHeight(chatLines[i]);
-            if (used > 0 && used + h > paneHeight)
-                break;
-            if (i == chatSelected)
-            {
-                selectedVisible = true;
-                break;
-            }
-            used += h;
-        }
-        while (!selectedVisible && chatScroll < chatSelected)
-        {
-            chatScroll++;
-            used = 0;
-            selectedVisible = false;
-            for (int i = chatScroll; i < chatCount; i++)
-            {
-                int h = chatRowHeight(chatLines[i]);
-                if (used > 0 && used + h > paneHeight)
-                    break;
-                if (i == chatSelected)
-                {
-                    selectedVisible = true;
-                    break;
-                }
-                used += h;
-            }
-        }
-    };
-
-    auto clampChatUserScroll = [&]()
-    {
-        if (connectedUserCount <= 0)
-        {
-            chatUserScroll = 0;
-            chatSelectedUser = -1;
-            return;
-        }
-        if (chatSelectedUser < 0 || chatSelectedUser >= connectedUserCount)
-            chatSelectedUser = 0;
-        int maxScroll = connectedUserCount > 10 ? connectedUserCount - 10 : 0;
-        chatUserScroll = std::max(0, std::min(chatUserScroll, maxScroll));
-        if (chatSelectedUser < chatUserScroll)
-            chatUserScroll = chatSelectedUser;
-        if (chatSelectedUser >= chatUserScroll + 10)
-            chatUserScroll = chatSelectedUser - 9;
-    };
-
-    auto setChatErrorNotice = [&](const char *error)
-    {
-        if (!error || !error[0])
-            setChatNotice("CHAT FAILED");
-        else if (strcmp(error, "chat-disabled") == 0)
-            setChatNotice("CHAT DISABLED");
-        else if (strcmp(error, "rate-limited") == 0)
-            setChatNotice("SLOW DOWN");
-        else if (strcmp(error, "chat-cooldown") == 0)
-            setChatNotice("WAIT 2 SEC");
-        else if (strcmp(error, "muted") == 0)
-            setChatNotice("YOU ARE MUTED");
-        else if (strcmp(error, "banned") == 0)
-            setChatNotice("BANNED");
-        else if (strcmp(error, "identity-required") == 0)
-            setChatNotice("ACCOUNT REQUIRED");
-        else
-            setChatNotice(error);
-    };
-
-    auto appendChatLines = [&](ChatLine *lines, int count, bool countUnread)
-    {
-        int addedCount = 0;
-        for (int i = 0; i < count; i++)
-        {
-            bool replaced = false;
-            if (lines[i].id > 0)
-            {
-                for (int existing = 0; existing < chatCount; existing++)
-                {
-                    if (chatLines[existing].id == lines[i].id)
-                    {
-                        chatLines[existing] = lines[i];
-                        replaced = true;
-                        break;
-                    }
-                }
-            }
-            if (replaced)
-                continue;
-
-            if (chatCount >= 15)
-            {
-                memmove(&chatLines[0], &chatLines[1], sizeof(ChatLine) * 14);
-                chatCount = 14;
-            }
-            chatLines[chatCount] = lines[i];
-            chatCount++;
-            addedCount++;
-        }
-        chatScroll = chatScrollForNewest();
-        chatSelected = chatCount > 0 ? chatCount - 1 : 0;
-        clampChatSelection();
-        if (countUnread && topMode != TOP_MODE_CHAT && addedCount > 0)
-        {
-            chatUnread = std::min(99, chatUnread + addedCount);
-            playChatBoop();
-        }
-        topRenderFrame = 10;
-    };
-
-    auto requestChatHistory = [&]() -> bool
-    {
-        if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
-        {
-            setChatNotice("CONNECTION FAILED");
-            return false;
-        }
-        char command[96];
-        Protocol::buildChatHistory(command, sizeof(command), "public");
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
-        {
-            setChatNotice("SEND FAILED");
-            return false;
-        }
-        setChatNotice("REFRESHING");
-        return true;
-    };
-
-    auto sendChatMessage = [&](const char *message) -> bool
-    {
-        if (!message || !message[0])
-            return false;
-        if (!isModOrAdmin() && lastChatSendAt && osGetTime() - lastChatSendAt < 2000)
-        {
-            setChatNotice("WAIT 2 SEC");
-            return false;
-        }
-        if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
-        {
-            setChatNotice("CONNECTION FAILED");
-            return false;
-        }
-        char command[384];
-        Protocol::buildChatSend(command, sizeof(command), "public", message);
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
-        {
-            setChatNotice("SEND FAILED");
-            return false;
-        }
-        setChatNotice("SENDING");
-        lastChatSendAt = osGetTime();
-        return true;
-    };
-
-    auto sendChatReport = [&](int messageId, const char *reason) -> bool
-    {
-        if (messageId <= 0)
-        {
-            setChatNotice("SELECT MESSAGE");
-            return false;
-        }
-        if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
-        {
-            setChatNotice("CONNECTION FAILED");
-            return false;
-        }
-        char command[160];
-        Protocol::buildChatReport(command, sizeof(command), messageId, reason);
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
-        {
-            setChatNotice("SEND FAILED");
-            return false;
-        }
-        setChatNotice("REPORT SENT");
-        return true;
-    };
-
-    auto currentChatTarget = [&]() -> ChatLine *
-    {
-        if (chatCount <= 0)
-            return NULL;
-        clampChatSelection();
-        return &chatLines[chatSelected];
-    };
-
-    auto sendModerationCommand = [&](const char *action, const char *identityId, int messageId, const char *reason) -> bool
-    {
-        if (!isModOrAdmin())
-        {
-            setChatNotice("MOD REQUIRED");
-            return false;
-        }
-        if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
-        {
-            setChatNotice("CONNECTION FAILED");
-            return false;
-        }
-        char command[256];
-        Protocol::buildModerationCommand(command, sizeof(command), action, identityId, messageId, reason);
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
-        {
-            setChatNotice("SEND FAILED");
-            return false;
-        }
-        setChatNotice("MOD ACTION SENT");
-        return true;
     };
 
     auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
@@ -1702,11 +1333,9 @@ int main(int argc, char **argv)
     {
         char currentChannel[25] = "";
         char recoveryReason[32] = "";
-        char chatChannel[25] = "";
-        ChatLine parsedChat[15];
-        int parsedChatCount = 0;
-        bool chatOk = false;
-        char chatError[32] = "";
+        char gateVersion[32] = "";
+        char rejectionReason[48] = "";
+        char disconnectReason[80] = "";
         if (Protocol::parseChannels(jsonLine, availableChannels, 8, availableChannelCount, currentChannel))
         {
             if (currentChannel[0])
@@ -1717,14 +1346,66 @@ int main(int argc, char **argv)
         }
         if (Protocol::parsePresence(jsonLine, connectedUsers, 24, connectedUserCount))
         {
-            clampChatUserScroll();
             topRenderFrame = 10;
             return true;
         }
         if (Protocol::parseIdentityAccepted(jsonLine, identityInfo))
         {
             applyIdentityAccepted(identityInfo);
+            gNeedsDisplayName = false;
             setIdentityNotice("ACCOUNT OK");
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"identityNeedsDisplayName\""))
+        {
+            gNeedsDisplayName = true;
+            topMode = TOP_MODE_IDENTITY;
+            setIdentityNotice("CHOOSE A NAME");
+            return true;
+        }
+        if (Protocol::parseDisplayNameRejected(jsonLine, rejectionReason, sizeof(rejectionReason)))
+        {
+            gNeedsDisplayName = true;
+            topMode = TOP_MODE_IDENTITY;
+            if (strcmp(rejectionReason, "display-name-taken") == 0)
+                setIdentityNotice("NAME TAKEN");
+            else if (strcmp(rejectionReason, "display-name-reserved") == 0)
+                setIdentityNotice("NAME RESERVED");
+            else
+                setIdentityNotice("NAME REJECTED");
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"displayNameChanged\""))
+        {
+            gNeedsDisplayName = false;
+            setIdentityNotice("NAME SAVED");
+            return true;
+        }
+        if (Protocol::parseRulesRequired(jsonLine, gateVersion, sizeof(gateVersion)))
+        {
+            snprintf(gRequiredRulesVersion, sizeof(gRequiredRulesVersion), "%s", gateVersion[0] ? gateVersion : "1");
+            gNeedsRules = true;
+            topMode = TOP_MODE_RULES;
+            topRenderFrame = 10;
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"rulesAccepted\""))
+        {
+            if (Protocol::parseRulesRequired(jsonLine, gateVersion, sizeof(gateVersion)) && gateVersion[0])
+                snprintf(gRequiredRulesVersion, sizeof(gRequiredRulesVersion), "%s", gateVersion);
+            if (gRequiredRulesVersion[0])
+                snprintf(gIdentity.rulesAcceptedVersion, sizeof(gIdentity.rulesAcceptedVersion), "%s", gRequiredRulesVersion);
+            gNeedsRules = false;
+            saveDeviceIdentity();
+            setIdentityNotice("RULES OK");
+            topMode = TOP_MODE_CANVAS;
+            return true;
+        }
+        if (Protocol::parseDisconnected(jsonLine, disconnectReason, sizeof(disconnectReason)))
+        {
+            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "%s", disconnectReason);
+            setAdminNotice(gDisconnectReason);
+            topMode = TOP_MODE_STATUS;
             return true;
         }
         if (Protocol::parseIdentityBackupCode(jsonLine, identityInfo))
@@ -1739,40 +1420,6 @@ int main(int argc, char **argv)
             printf("Recovery failed: %s\n", recoveryReason);
             return true;
         }
-        if (Protocol::parseChatMessages(jsonLine, parsedChat, 15, parsedChatCount, chatChannel, sizeof(chatChannel)))
-        {
-            bool isHistory = strstr(jsonLine, "\"type\":\"chatHistory\"") != NULL;
-            if (isHistory)
-            {
-                chatCount = 0;
-                chatScroll = 0;
-                chatSelected = 0;
-                if (topMode == TOP_MODE_CHAT)
-                    chatUnread = 0;
-            }
-            appendChatLines(parsedChat, parsedChatCount, !isHistory);
-            if (parsedChatCount > 0)
-                setChatNotice("");
-            return true;
-        }
-        if (Protocol::parseChatResult(jsonLine, chatOk, chatError, sizeof(chatError)))
-        {
-            if (chatOk)
-                setChatNotice("CHAT SENT");
-            else
-                setChatErrorNotice(chatError);
-            return true;
-        }
-        if (strstr(jsonLine, "\"type\":\"chatReportResult\""))
-        {
-            if (strstr(jsonLine, "\"ok\":true"))
-                setChatNotice("REPORT SENT");
-            else if (strstr(jsonLine, "rate-limited"))
-                setChatNotice("SLOW DOWN");
-            else
-                setChatNotice("REPORT FAILED");
-            return true;
-        }
         if (strstr(jsonLine, "\"type\":\"adminCanvasResult\""))
         {
             if (strstr(jsonLine, "\"ok\":true"))
@@ -1784,11 +1431,11 @@ int main(int argc, char **argv)
         if (strstr(jsonLine, "\"type\":\"moderationResult\""))
         {
             if (strstr(jsonLine, "\"ok\":true"))
-                setChatNotice("MOD ACTION OK");
+                setAdminNotice("MOD ACTION OK");
             else if (strstr(jsonLine, "admin-required"))
-                setChatNotice("ADMIN REQUIRED");
+                setAdminNotice("ADMIN REQUIRED");
             else
-                setChatNotice("MOD ACTION DENIED");
+                setAdminNotice("MOD ACTION DENIED");
             return true;
         }
         return false;
@@ -1894,6 +1541,59 @@ int main(int argc, char **argv)
         oy = canvas.offsetY;
     };
 
+    auto receiveCanvasSnapshot = [&](int activeSock, const char *context) -> bool
+    {
+        char response[1024];
+        CanvasMeta snapshotMeta;
+        bool gotMeta = false;
+        while (NetworkManager::readLine(activeSock, response, sizeof(response)))
+        {
+            if (handleJsonControl(response))
+                continue;
+            if (Protocol::parseCanvasMeta(response, snapshotMeta))
+            {
+                gotMeta = true;
+                break;
+            }
+        }
+        if (!gotMeta)
+        {
+            printf("%s: failed to read canvas metadata.\n", context ? context : "canvas");
+            return false;
+        }
+
+        if (snapshotMeta.compressedSize <= 0 || snapshotMeta.compressedSize > 10000000)
+        {
+            printf("%s: invalid compressed size %d.\n", context ? context : "canvas", snapshotMeta.compressedSize);
+            return false;
+        }
+
+        u8 *compressedCanvas = (u8 *)malloc(snapshotMeta.compressedSize);
+        if (!compressedCanvas)
+            return false;
+        bool ok = false;
+        if (NetworkManager::readExact(activeSock, compressedCanvas, snapshotMeta.compressedSize))
+        {
+            canvasWidth = snapshotMeta.width;
+            canvasHeight = snapshotMeta.height;
+            canvas.setChannel(snapshotMeta.channel);
+            if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, snapshotMeta.compressedSize))
+            {
+                fullCanvas = canvas.pixels;
+                offsetX = 0;
+                offsetY = 0;
+                clampOffsets(offsetX, offsetY);
+                canvas.markFullDirty();
+                Renderer::invalidateMinimap();
+                syncSelectedChannel();
+                ok = true;
+            }
+        }
+        free(compressedCanvas);
+        printf("%s: canvas snapshot %s.\n", context ? context : "canvas", ok ? "loaded" : "failed");
+        return ok;
+    };
+
     auto switchToSelectedChannel = [&]() -> bool
     {
         if (availableChannelCount <= 0)
@@ -1954,24 +1654,21 @@ int main(int argc, char **argv)
 
         free(compressedCanvas);
         syncSelectedChannel();
-#if CHAT_ENABLED
-        chatCount = 0;
-        chatScroll = 0;
-        chatSelected = 0;
-        requestChatHistory();
-#endif
         return switched;
     };
 
     syncSelectedChannel();
 
-    while (aptMainLoop())
+    while (aptMainLoop() && !exitRequested)
     {
         hidScanInput();
         u32 kDown = hidKeysDown();
         u32 kHeld = hidKeysHeld();
+        u32 kUp = hidKeysUp();
         touchPosition touch;
+        circlePosition circle;
         hidTouchRead(&touch);
+        hidCircleRead(&circle);
 
         if (kDown & KEY_SELECT)
         {
@@ -2043,20 +1740,63 @@ int main(int argc, char **argv)
             }
 
             free(compressedCanvas);
-            
+
             if (!success) {
                 printf("Canvas refresh failed. Try again?\n");
             }
         }
 
+        if (gDisconnectReason[0])
+        {
+            if (kDown & KEY_A)
+            {
+                setAdminNotice("RECONNECTING");
+                if (NetworkManager::reconnect() && sendClientHello(NetworkManager::getSocket(), packageType))
+                {
+                    sock = NetworkManager::getSocket();
+                    if (receiveCanvasSnapshot(sock, "reconnect"))
+                    {
+                        int flags = fcntl(sock, F_GETFL, 0);
+                        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+                        gDisconnectReason[0] = '\0';
+                        setAdminNotice("RECONNECTED");
+                        topMode = TOP_MODE_CANVAS;
+                    }
+                    else
+                    {
+                        snprintf(gDisconnectReason, sizeof(gDisconnectReason), "REFRESH FAILED");
+                    }
+                }
+                else
+                {
+                    sock = -1;
+                    snprintf(gDisconnectReason, sizeof(gDisconnectReason), "RECONNECT FAILED");
+                }
+                topRenderFrame = 10;
+            }
+            else if (kDown & KEY_B)
+            {
+                topMode = TOP_MODE_MENU;
+                topRenderFrame = 10;
+            }
+        }
+
+        if (gNeedsDisplayName && topMode == TOP_MODE_CANVAS)
+        {
+            topMode = TOP_MODE_IDENTITY;
+            setIdentityNotice("CHOOSE A NAME");
+            topRenderFrame = 10;
+        }
+        else if (gNeedsRules && topMode == TOP_MODE_CANVAS)
+        {
+            topMode = TOP_MODE_RULES;
+            topRenderFrame = 10;
+        }
+
         if (topMode == TOP_MODE_MENU)
         {
             const bool staffMenu = isModOrAdmin();
-#if CHAT_ENABLED
             const int menuCount = staffMenu ? 8 : 7;
-#else
-            const int menuCount = staffMenu ? 7 : 6;
-#endif
             selectedMenuItem = std::max(0, std::min(selectedMenuItem, menuCount - 1));
             if (kDown & KEY_DUP)
             {
@@ -2086,19 +1826,10 @@ int main(int argc, char **argv)
                     topMode = TOP_MODE_USERS;
                 }
                 else if (selectedMenuItem == 2)
-                {
-#if CHAT_ENABLED
-                    topMode = TOP_MODE_CHAT;
-                    chatUnread = 0;
-                    requestChatHistory();
-#else
                     topMode = TOP_MODE_CONTROLS;
-#endif
-                }
-#if CHAT_ENABLED
                 else if (selectedMenuItem == 3)
                 {
-                    topMode = TOP_MODE_CONTROLS;
+                    topMode = TOP_MODE_RULES;
                 }
                 else if (selectedMenuItem == 4)
                 {
@@ -2121,29 +1852,6 @@ int main(int argc, char **argv)
                         gspWaitForVBlank();
                     break;
                 }
-#else
-                else if (selectedMenuItem == 3)
-                {
-                    topMode = TOP_MODE_STATUS;
-                }
-                else if (selectedMenuItem == 4)
-                {
-                    topMode = TOP_MODE_IDENTITY;
-                }
-                else if (staffMenu && selectedMenuItem == 5)
-                {
-                    topMode = TOP_MODE_ADMIN;
-                    selectedAdminItem = 0;
-                }
-                else if (selectedMenuItem == (staffMenu ? 6 : 5))
-                {
-                    UIState::clearPoints();
-                    NetworkManager::disconnect();
-                    for (int i = 0; i < 30; i++)
-                        gspWaitForVBlank();
-                    break;
-                }
-#endif
                 topRenderFrame = 10;
                 continue;
             }
@@ -2191,106 +1899,16 @@ int main(int argc, char **argv)
                 continue;
             }
         }
-        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_TOUCH))
+        else if (topMode == TOP_MODE_RULES && (kDown & KEY_B) && gNeedsRules)
         {
-            if (pointInRect(touch.px, touch.py, 12, 42, 92, 32))
-            {
-                char message[241];
-                if (readKeyboardText("Public chat message", message, sizeof(message), ""))
-                    sendChatMessage(message);
-            }
-            else if (pointInRect(touch.px, touch.py, 114, 42, 92, 32))
-            {
-                chatUnread = 0;
-                requestChatHistory();
-            }
-            else if (pointInRect(touch.px, touch.py, 12, 82, 92, 32))
-            {
-                topMode = TOP_MODE_MENU;
-            }
-            else if (pointInRect(touch.px, touch.py, 114, 82, 92, 32))
-            {
-                gIdentity.chatSoundEnabled = !gIdentity.chatSoundEnabled;
-                saveDeviceIdentity();
-                setChatNotice(gIdentity.chatSoundEnabled ? "SOUND ON" : "SOUND OFF");
-            }
-            else if (pointInRect(touch.px, touch.py, 12, 122, 92, 32))
-            {
-                ChatLine *target = currentChatTarget();
-                sendChatReport(target ? target->id : 0, "Reported from 3DS chat");
-            }
-            else if (pointInRect(touch.px, touch.py, 226, 34, 38, 20))
-            {
-                chatUserScroll = std::max(0, chatUserScroll - 1);
-            }
-            else if (pointInRect(touch.px, touch.py, 270, 34, 40, 20))
-            {
-                chatUserScroll++;
-                clampChatUserScroll();
-            }
-            else if (pointInRect(touch.px, touch.py, 222, 58, 94, 144))
-            {
-                int row = (touch.py - 58) / 14;
-                int index = chatUserScroll + row;
-                if (index >= 0 && index < connectedUserCount)
-                    chatSelectedUser = index;
-                clampChatUserScroll();
-            }
-            else if (pointInRect(touch.px, touch.py, 12, 162, 92, 32) && isModOrAdmin())
-            {
-                PresenceUser *targetUser = (chatSelectedUser >= 0 && chatSelectedUser < connectedUserCount) ? &connectedUsers[chatSelectedUser] : NULL;
-                if (targetUser && strcmp(targetUser->status, "muted") == 0)
-                    sendModerationCommand("unmute", targetUser->identityId, 0, "Unmuted from 3DS chat");
-                else
-                    sendModerationCommand("mute", targetUser ? targetUser->identityId : "", 0, "Muted from 3DS chat");
-            }
-            else if (pointInRect(touch.px, touch.py, 114, 122, 92, 32) && isModOrAdmin())
-            {
-                ChatLine *target = currentChatTarget();
-                sendModerationCommand("deleteChat", "", target ? target->id : 0, "Deleted from 3DS chat");
-            }
-            else if (pointInRect(touch.px, touch.py, 114, 162, 92, 32) && isModOrAdmin())
-            {
-                PresenceUser *targetUser = (chatSelectedUser >= 0 && chatSelectedUser < connectedUserCount) ? &connectedUsers[chatSelectedUser] : NULL;
-                sendModerationCommand("ban", targetUser ? targetUser->identityId : "", 0, "Banned from 3DS chat");
-            }
-            topRenderFrame = 10;
+            exitRequested = true;
             continue;
         }
-        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_CHAT || topMode == TOP_MODE_ADMIN || topMode == TOP_MODE_STATUS || topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS) && (kDown & KEY_B))
+        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_ADMIN || topMode == TOP_MODE_STATUS || topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS || topMode == TOP_MODE_RULES) && (kDown & KEY_B))
         {
             pendingAdminRectTool = ADMIN_RECT_NONE;
             adminRectDragging = false;
             topMode = TOP_MODE_MENU;
-            topRenderFrame = 10;
-            continue;
-        }
-        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_A))
-        {
-            char message[241];
-            if (readKeyboardText("Chat message", message, sizeof(message), ""))
-                sendChatMessage(message);
-            topRenderFrame = 10;
-            continue;
-        }
-        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_DUP))
-        {
-            chatSelected = std::max(0, chatSelected - 1);
-            clampChatSelection();
-            topRenderFrame = 10;
-            continue;
-        }
-        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_DDOWN))
-        {
-            chatSelected = std::min(std::max(0, chatCount - 1), chatSelected + 1);
-            clampChatSelection();
-            topRenderFrame = 10;
-            continue;
-        }
-        else if (topMode == TOP_MODE_CHAT && (kDown & KEY_X))
-        {
-            chatUnread = 0;
-            requestChatHistory();
             topRenderFrame = 10;
             continue;
         }
@@ -2316,6 +1934,15 @@ int main(int argc, char **argv)
             {
                 setIdentityNotice("CODE SENT");
             }
+            continue;
+        }
+        else if (topMode == TOP_MODE_RULES && (kDown & KEY_A))
+        {
+            if (gRequiredRulesVersion[0] && acceptRules(NetworkManager::getSocket(), gRequiredRulesVersion))
+                setIdentityNotice("RULES SENT");
+            else if (!gRequiredRulesVersion[0])
+                topMode = TOP_MODE_MENU;
+            topRenderFrame = 10;
             continue;
         }
 
@@ -2347,7 +1974,41 @@ int main(int argc, char **argv)
 
         bool zoomOverlayLeft = (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT);
         bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DRIGHT | KEY_Y));
-        bool blockNormalCanvasInput = false;
+        bool blockNormalCanvasInput = gDisconnectReason[0] || gNeedsDisplayName || gNeedsRules;
+        if (!shoulderEraserActive && !blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && (kDown & (KEY_L | KEY_R)))
+        {
+            shoulderSavedBrushShape = currentBrushShape;
+            shoulderSavedBrushSize = currentBrushSize;
+            currentBrushShape = BRUSH_ERASER;
+            currentBrushSize = 7;
+            shoulderEraserActive = true;
+            topRenderFrame = 10;
+        }
+        if (shoulderEraserActive && (!(kHeld & (KEY_L | KEY_R)) || (kUp & (KEY_L | KEY_R))))
+        {
+            currentBrushShape = shoulderSavedBrushShape;
+            currentBrushSize = shoulderSavedBrushSize;
+            shoulderEraserActive = false;
+            topRenderFrame = 10;
+        }
+        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive())
+        {
+            const int deadzone = 18;
+            if (abs(circle.dx) > deadzone || abs(circle.dy) > deadzone)
+            {
+                offsetX += canvas.screenDeltaToCanvas(circle.dx / 12);
+                offsetY -= canvas.screenDeltaToCanvas(circle.dy / 12);
+                clampOffsets(offsetX, offsetY);
+                canvas.offsetX = offsetX;
+                canvas.offsetY = offsetY;
+                canvas.markFullDirty();
+                Renderer::invalidateMinimap();
+                topRenderFrame = 10;
+                prevTouchX = prevTouchY = -1;
+                prevPrevTouchX = prevPrevTouchY = -1;
+                hasLastStrokePoint = false;
+            }
+        }
         if (topMode == TOP_MODE_CANVAS && pendingAdminRectTool != ADMIN_RECT_NONE)
         {
             blockNormalCanvasInput = true;
@@ -2442,11 +2103,6 @@ int main(int argc, char **argv)
             printf(UIState::isColorPickerActive() ? "Color picker activated\n" : "Color picker deactivated\n");
         }
 
-        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && (kDown & KEY_X))
-        {
-            handleHexColorInput();
-        }
-
         // Eye Dropper functionality
         if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
         {
@@ -2463,6 +2119,9 @@ int main(int argc, char **argv)
                     currentColor.r = fullCanvas[idx];
                     currentColor.g = fullCanvas[idx + 1];
                     currentColor.b = fullCanvas[idx + 2];
+                    float h, s, v;
+                    UIState::RGBtoHSV(currentColor.r / 255.0f, currentColor.g / 255.0f, currentColor.b / 255.0f, h, s, v);
+                    UIState::updateHSV(h, s, v);
 
                     printf("Color picked: R=%d, G=%d, B=%d\n", currentColor.r, currentColor.g, currentColor.b);
                 }
@@ -2551,16 +2210,15 @@ int main(int argc, char **argv)
             currentColor.g = g * 255;
             currentColor.b = b * 255;
 
-            const int brushSizes[] = {1, 2, 3, 5, 7};
             const int brushYs[] = {70, 92, 114, 136, 158};
-            const int brushXs[] = {38, 78, 118};
+            const int brushXs[] = {30, 60, 90, 120};
             for (int i = 0; i < 5; i++)
             {
-                for (int shape = 0; shape < 3; shape++)
+                for (int shape = 0; shape < 4; shape++)
                 {
                     if (pointInRect(touch.px, touch.py, brushXs[shape] - 14, brushYs[i] - 12, 28, 24))
                     {
-                        currentBrushSize = brushSizes[i];
+                        currentBrushSize = clampBrushSizeForShape(shape, brushSizeForShapeRow(shape, i));
                         currentBrushShape = shape;
                         break;
                     }
@@ -2654,8 +2312,9 @@ int main(int argc, char **argv)
                                 continue;
                             }
                         }
-                        sendDrawBatchCommand(sock, UIState::getPoints(), currentColor,
-                                             currentBrushSize, currentBrushShape);
+                        Color drawColor = effectiveDrawColor();
+                        sendDrawBatchCommand(sock, UIState::getPoints(), drawColor,
+                                             currentBrushSize, effectiveBrushShape());
                         UIState::clearPoints();
                     }
 
@@ -2685,8 +2344,9 @@ int main(int argc, char **argv)
                             continue;
                         }
                     }
-                    sendDrawBatchCommand(sock, UIState::getPoints(), currentColor,
-                                         currentBrushSize, currentBrushShape);
+                    Color drawColor = effectiveDrawColor();
+                    sendDrawBatchCommand(sock, UIState::getPoints(), drawColor,
+                                         currentBrushSize, effectiveBrushShape());
                     UIState::clearPoints();
                 }
                 prevTouchX = prevTouchY = -1;
@@ -2749,9 +2409,20 @@ int main(int argc, char **argv)
             }
             else if (recvLen == 0)
             {
-                close(sock);
+                NetworkManager::disconnect();
                 sock = -1;
+                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "CONNECTION LOST");
+                topMode = TOP_MODE_STATUS;
+                topRenderFrame = 10;
                 printf("Server disconnected.\n");
+            }
+            else if (errno != EWOULDBLOCK && errno != EAGAIN)
+            {
+                NetworkManager::disconnect();
+                sock = -1;
+                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "NETWORK ERROR");
+                topMode = TOP_MODE_STATUS;
+                topRenderFrame = 10;
             }
         }
 
@@ -2780,6 +2451,14 @@ int main(int argc, char **argv)
                                     currentColor.r, currentColor.g, currentColor.b);
             }
         }
+        if (gDisconnectReason[0])
+        {
+            fillRect(buffer, fbWidth, fbHeight, 28, 74, 264, 88, 248, 250, 251);
+            drawRectOutline(buffer, fbWidth, fbHeight, 28, 74, 264, 88, 196, 204, 212);
+            drawMiniText(buffer, fbWidth, fbHeight, 48, 92, "DISCONNECTED", 196, 61, 61);
+            drawMiniText(buffer, fbWidth, fbHeight, 48, 110, gDisconnectReason, 32, 36, 42);
+            drawMiniText(buffer, fbWidth, fbHeight, 48, 136, "A RECONNECT   B MENU", 13, 122, 117);
+        }
         canvas.clearDirty();
 
         bool activelyDrawing = !UIState::isColorPickerActive() &&
@@ -2799,12 +2478,6 @@ int main(int argc, char **argv)
             if (adminNoticeFrames == 0)
                 topRenderFrame = 10;
         }
-        if (chatNoticeFrames > 0)
-        {
-            chatNoticeFrames--;
-            if (chatNoticeFrames == 0)
-                topRenderFrame = 10;
-        }
         if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
             Renderer::renderTop(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor,
@@ -2816,8 +2489,8 @@ int main(int argc, char **argv)
                                 identityInfo.backupCode, identityNoticeFrames > 0 ? identityNotice : "",
                                 gIdentityBootStatus, selectedAdminItem,
                                 adminNoticeFrames > 0 ? adminNotice : "",
-                                chatLines, chatCount, chatScroll, chatSelected, chatUnread,
-                                chatNoticeFrames > 0 ? chatNotice : "");
+                                gRequiredRulesVersion[0] ? gRequiredRulesVersion : gIdentity.rulesAcceptedVersion,
+                                gNeedsRules);
             topRenderFrame = 0;
         }
 
@@ -2825,18 +2498,6 @@ int main(int argc, char **argv)
         Renderer::presentTopFrame();
         fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
         memcpy(fb, buffer, bufferSize);
-        if (topMode == TOP_MODE_CHAT)
-        {
-            char targetLabel[32] = "";
-            ChatLine *target = currentChatTarget();
-            if (target)
-                snprintf(targetLabel, sizeof(targetLabel), "%s", target->displayName[0] ? target->displayName : target->username);
-            if (chatSelectedUser >= 0 && chatSelectedUser < connectedUserCount)
-                snprintf(targetLabel, sizeof(targetLabel), "%s",
-                         connectedUsers[chatSelectedUser].displayName[0] ? connectedUsers[chatSelectedUser].displayName : connectedUsers[chatSelectedUser].username);
-            drawChatBottomPanel(fb, fbWidth, fbHeight, connectedUsers, connectedUserCount, chatUserScroll,
-                                chatSelectedUser, isModOrAdmin(), targetLabel, identityInfo);
-        }
         if (UIState::isColorPickerActive())
         {
             if (!isModOrAdmin() && pickerTab == 1)
@@ -2845,7 +2506,7 @@ int main(int argc, char **argv)
                             adminNoticeFrames > 0 ? adminNotice : "");
         }
 
-        if (!UIState::isColorPickerActive() && topMode != TOP_MODE_CHAT)
+        if (!UIState::isColorPickerActive())
             UIInterface::drawCurrentSelection(fb, fbWidth, fbHeight, currentColor);
 
         gfxFlushBuffers();
@@ -2854,10 +2515,6 @@ int main(int argc, char **argv)
 
     if (sock >= 0)
         close(sock);
-    if (gSoundReady)
-        csndExit();
-    if (gBoopBuffer)
-        linearFree(gBoopBuffer);
     free(buffer);
     gfxExit();
     return 0;

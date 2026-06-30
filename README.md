@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.3.1`
+- Version: `1.3.3`
 
 ## Features
 
@@ -13,8 +13,8 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Zoom levels: `0.5x`, `1x`, `2x`, and `4x`.
 - Named channels: `main`, `sketch`, and `test`.
 - Channel switch UI on the 3DS.
-- Color picker, color sampling, brush size/shape controls, and hex color entry.
-- Color-square picker with hue strip and circle/box/dither brush modes.
+- Color picker, color sampling, brush size/shape controls, and quick eraser.
+- Color-square picker with hue strip and circle/box/dither/eraser brush modes.
 - Device identity, display name, backup-code recovery, and connected-user list.
 - Mod/admin canvas tools with snapshot, clear, and selection-style fill rectangle.
 - Compressed canvas snapshots using zlib.
@@ -33,7 +33,9 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 ## Controls
 
 - Touch bottom screen: Draw.
+- Circle Pad: Pan viewport.
 - Hold LEFT D-Pad or A + drag stylus: Pan viewport.
+- Hold L or R: Temporarily switch to eraser; release to return to the previous brush.
 - Hold RIGHT D-Pad: Show zoom buttons on the right side of the bottom screen.
 - Hold Y: Show zoom buttons on the left side of the bottom screen.
 - Hold RIGHT D-Pad or Y + tap `+`: Zoom in.
@@ -44,8 +46,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - B or D-Pad DOWN: Toggle color picker.
 - Color picker tabs: `COLOR` and `MOD`.
 - MOD tab: Snapshot, clear canvas, and fill rectangle. Fill rectangle arms a selection; release stylus to fill using the selected color.
-- Hold D-Pad UP + tap canvas: Sample color.
-- X: Enter hex color.
+- Hold D-Pad UP or X + tap canvas: Sample color.
 
 ## Server Links
 
@@ -78,7 +79,7 @@ make
 The Makefile exposes release/server variables:
 
 ```make
-APP_VERSION ?= 1.3.1
+APP_VERSION ?= 1.3.3
 CHAT_ENABLED ?= 0
 TEST_MODE ?= 0
 LOCAL_SERVER_HOST ?= 192.168.1.46
@@ -144,7 +145,7 @@ make TEST_MODE=1 DISABLE_UPDATER=0
 make cia TEST_MODE=1 DISABLE_UPDATER=0
 ```
 
-The selected TCP host is compiled into drawing/presence networking. The selected HTTP host is compiled into updater requests. Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds so Collab Doodle stays focused on shared drawing. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.3.1-test1` or `1.3.1-test2` on the top screen.
+The selected TCP host is compiled into drawing/presence networking. The selected HTTP host is compiled into updater requests. Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds so Collab Doodle stays focused on shared drawing. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.3.3-test1` or `1.3.3-test2` on the top screen.
 
 ## CIA Packaging
 

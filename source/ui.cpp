@@ -1,5 +1,6 @@
 // UI-related functionality
 #include "ui.h"
+#include <algorithm>
 
 const int UI_MARGIN_X = 20;
 const int UI_MARGIN_Y = 10;
@@ -80,6 +81,29 @@ void UIState::HSVtoRGB(float h, float s, float v, float& r, float& g, float& b) 
         case 4: r = t; g = p; b = v; break;
         case 5: r = v; g = p; b = q; break;
     }
+}
+
+void UIState::RGBtoHSV(float r, float g, float b, float& h, float& s, float& v) {
+    float maxValue = std::max(r, std::max(g, b));
+    float minValue = std::min(r, std::min(g, b));
+    float delta = maxValue - minValue;
+
+    v = maxValue;
+    s = maxValue <= 0.0f ? 0.0f : delta / maxValue;
+
+    if (delta <= 0.0f) {
+        h = 0.0f;
+        return;
+    }
+
+    if (maxValue == r)
+        h = (g - b) / delta + (g < b ? 6.0f : 0.0f);
+    else if (maxValue == g)
+        h = (b - r) / delta + 2.0f;
+    else
+        h = (r - g) / delta + 4.0f;
+
+    h /= 6.0f;
 }
 
 namespace UIInterface {
