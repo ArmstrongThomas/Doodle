@@ -49,9 +49,10 @@ foreach ($required in @($elf, $smdh, $rsf)) {
     }
 }
 
-$uniqueId = if ($TestMode -eq 1) { '0xCE476' } else { '0xCE475' }
-$productCode = if ($TestMode -eq 1) { 'CTR-P-CDT1' } else { 'CTR-P-CDDL' }
+$uniqueId = if ($TestMode -eq 1) { '0xCE476' } elseif ($TestMode -eq 2) { '0xCE477' } else { '0xCE475' }
+$productCode = if ($TestMode -eq 1) { 'CTR-P-CDT1' } elseif ($TestMode -eq 2) { 'CTR-P-CDT2' } else { 'CTR-P-CDDL' }
 $rsfText = [System.IO.File]::ReadAllText($rsf)
+$rsfText = $rsfText -replace 'Title\s+: "[^"]+"', "Title                   : `"$AppTitle`""
 $rsfText = $rsfText -replace 'ProductCode\s+: "CTR-P-[^"]+"', "ProductCode             : `"$productCode`""
 $rsfText = $rsfText -replace 'UniqueId\s+: 0x[0-9A-Fa-f]+', "UniqueId                : $uniqueId"
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $tempRsf)) | Out-Null
@@ -66,14 +67,16 @@ $fontTitle = New-Object System.Drawing.Font 'Arial', 24, ([System.Drawing.FontSt
 $fontSub = New-Object System.Drawing.Font 'Arial', 12, ([System.Drawing.FontStyle]::Regular)
 $brushWhite = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(245, 248, 250))
 $brushAccent = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(94, 234, 212))
-$graphics.DrawString('Collab Doodle', $fontTitle, $brushWhite, 18, 28)
-$graphics.DrawString("v$AppVersion", $fontSub, $brushAccent, 20, 68)
-$graphics.DrawString('Shared canvas for 3DS', $fontSub, $brushWhite, 20, 88)
+$bannerTitle = if ($TestMode -eq 0) { 'Collab Doodle' } else { "Collab Doodle T$TestMode" }
+$bannerSubtitle = if ($TestMode -eq 0) { 'doodle.7db.pw' } elseif ($TestMode -eq 1) { 'Local test build' } else { 'server2 test build' }
+$graphics.DrawString($bannerTitle, $fontTitle, $brushWhite, 18, 26)
+$graphics.DrawString("v$AppVersion", $fontSub, $brushAccent, 20, 66)
+$graphics.DrawString($bannerSubtitle, $fontSub, $brushWhite, 20, 88)
 $graphics.Dispose()
 $bitmap.Save($bannerPng, [System.Drawing.Imaging.ImageFormat]::Png)
 $bitmap.Dispose()
 
-$sampleRate = 8000
+$sampleRate = 22050
 $seconds = 1
 $samples = $sampleRate * $seconds
 $dataSize = $samples * 2
@@ -94,6 +97,10 @@ for ($i = 0; $i -lt $samples; $i++) {
     $writer.Write([int16]0)
 }
 $writer.Close()
+
+if (Test-Path -LiteralPath $bannerBin) {
+    Remove-Item -LiteralPath $bannerBin -Force
+}
 
 & $bannertool.Source makebanner -i $bannerPng -a $bannerWav -o $bannerBin
 if ($LASTEXITCODE -ne 0) {

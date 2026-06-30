@@ -13,24 +13,27 @@ static u8 topFrame[TOP_SCREEN_W * TOP_SCREEN_H * 3];
 static bool minimapCacheValid = false;
 static bool topFrameValid = false;
 static int minimapFrameCounter = 0;
+static const int BOTTOM_SCREEN_W = 320;
+static const int BOTTOM_SCREEN_H = 240;
 
 void Renderer::renderViewport(CanvasState &canvas, u8 *buffer, int fbWidth, int fbHeight, bool forceFull)
 {
     if (!canvas.pixels)
         return;
 
-    int startY = 0;
-    int endY = fbHeight - 1;
-    int startX = 0;
-    int endX = fbWidth - 1;
-
-    for (int y = startY; y <= endY; y++)
+    const bool rotatedFramebuffer = fbWidth < fbHeight;
+    for (int screenY = 0; screenY < BOTTOM_SCREEN_H; screenY++)
     {
-        for (int x = startX; x <= endX; x++)
+        for (int screenX = 0; screenX < BOTTOM_SCREEN_W; screenX++)
         {
-            int canvasX = canvas.screenToCanvasX(y);
-            int canvasY = canvas.screenToCanvasY(fbWidth - 1 - x);
-            int bufferIdx = 3 * (y * fbWidth + x);
+            int fbX = rotatedFramebuffer ? fbWidth - 1 - screenY : screenX;
+            int fbY = rotatedFramebuffer ? screenX : screenY;
+            if (fbX < 0 || fbX >= fbWidth || fbY < 0 || fbY >= fbHeight)
+                continue;
+
+            int canvasX = canvas.screenToCanvasX(screenX);
+            int canvasY = canvas.screenToCanvasY(screenY);
+            int bufferIdx = 3 * (fbY * fbWidth + fbX);
             if (canvasX >= 0 && canvasX < canvas.width && canvasY >= 0 && canvasY < canvas.height)
             {
                 int canvasIdx = 3 * (canvasY * canvas.width + canvasX);

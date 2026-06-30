@@ -207,7 +207,7 @@ void Protocol::buildHello(char *buffer, size_t size, const char *appId, const ch
                           const char *deviceId, const char *deviceSecret, const char *displayName, const char *packageType)
 {
     snprintf(buffer, size,
-             "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":3,\"updaterSupported\":%s,"
+             "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":4,\"updaterSupported\":%s,"
              "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"displayName\":\"%s\"}\n",
              appId, version, updaterSupported ? "true" : "false",
              packageType ? packageType : "3dsx",

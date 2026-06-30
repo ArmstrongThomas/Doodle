@@ -49,6 +49,20 @@ static bool gNeedsDisplayName = false;
 static bool gNeedsRules = false;
 static char gDisconnectReason[80] = "";
 
+struct ActiveDrawLabel {
+    bool active;
+    char name[25];
+    int canvasX;
+    int canvasY;
+    float displayX;
+    float displayY;
+    bool hasDisplay;
+    u64 updatedAt;
+};
+
+static const int MAX_ACTIVE_DRAW_LABELS = 8;
+static const u64 DRAW_LABEL_TTL_MS = 1400;
+
 static void seedRandom()
 {
     static bool seeded = false;
@@ -314,8 +328,9 @@ static void putPixel(u8 *fb, int width, int height, int x, int y, u8 r, u8 g, u8
 
 static void putScreenPixel(u8 *fb, int fbWidth, int fbHeight, int screenX, int screenY, u8 r, u8 g, u8 b)
 {
-    int fbX = fbWidth - 1 - screenY;
-    int fbY = screenX;
+    const bool rotatedFramebuffer = fbWidth < fbHeight;
+    int fbX = rotatedFramebuffer ? fbWidth - 1 - screenY : screenX;
+    int fbY = rotatedFramebuffer ? screenX : screenY;
     putPixel(fb, fbWidth, fbHeight, fbX, fbY, r, g, b);
 }
 
@@ -573,8 +588,9 @@ void writeColor(u8 *buffer, int idx, u8 r, u8 g, u8 b)
 
 static void putBufferScreenPixel(u8 *buffer, int fbWidth, int fbHeight, int screenX, int screenY, u8 r, u8 g, u8 b)
 {
-    int fbX = fbWidth - 1 - screenY;
-    int fbY = screenX;
+    const bool rotatedFramebuffer = fbWidth < fbHeight;
+    int fbX = rotatedFramebuffer ? fbWidth - 1 - screenY : screenX;
+    int fbY = rotatedFramebuffer ? screenX : screenY;
     if (!buffer || fbX < 0 || fbX >= fbWidth || fbY < 0 || fbY >= fbHeight)
         return;
 
@@ -843,6 +859,145 @@ static bool processRectPacket(const uint8_t *packet, size_t length, CanvasState 
     uint16_t h = *(uint16_t *)(packet + 10);
     applyCanvasRectLocal(canvas, x, y, w, h, color);
     return true;
+}
+
+static void upsertDrawLabel(ActiveDrawLabel *labels, const char *name, int canvasX, int canvasY)
+{
+    if (!labels || !name || !name[0])
+        return;
+
+    int slot = -1;
+    bool matchedExisting = false;
+    u64 oldest = UINT64_MAX;
+    u64 now = osGetTime();
+    for (int i = 0; i < MAX_ACTIVE_DRAW_LABELS; i++)
+    {
+        if (labels[i].active && strncmp(labels[i].name, name, sizeof(labels[i].name)) == 0)
+        {
+            slot = i;
+            matchedExisting = true;
+            break;
+        }
+        if (!labels[i].active && slot < 0)
+            slot = i;
+        if (labels[i].updatedAt < oldest)
+        {
+            oldest = labels[i].updatedAt;
+            if (slot < 0)
+                slot = i;
+        }
+    }
+
+    if (slot < 0)
+        slot = 0;
+    labels[slot].active = true;
+    snprintf(labels[slot].name, sizeof(labels[slot].name), "%s", name);
+    labels[slot].canvasX = canvasX;
+    labels[slot].canvasY = canvasY;
+    if (!matchedExisting || !labels[slot].hasDisplay)
+    {
+        labels[slot].displayX = (float)canvasX;
+        labels[slot].displayY = (float)canvasY;
+        labels[slot].hasDisplay = true;
+    }
+    labels[slot].updatedAt = now;
+}
+
+static bool processDrawAttributionPacket(const uint8_t *packet, size_t length, ActiveDrawLabel *labels)
+{
+    if (!packet || length < 6 || packet[0] != 3)
+        return false;
+    uint16_t x = *(uint16_t *)(packet + 1);
+    uint16_t y = *(uint16_t *)(packet + 3);
+    uint8_t nameLen = packet[5];
+    if (length < (size_t)(6 + nameLen))
+        return false;
+
+    char name[25];
+    size_t copyLen = std::min((size_t)nameLen, sizeof(name) - 1);
+    memcpy(name, packet + 6, copyLen);
+    name[copyLen] = '\0';
+    upsertDrawLabel(labels, name, x, y);
+    return true;
+}
+
+static bool processBinaryCanvasPackets(const uint8_t *packets, size_t length, CanvasState &canvas,
+                                       u8 *fullCanvas, int canvasWidth, int canvasHeight,
+                                       ActiveDrawLabel *labels)
+{
+    bool changed = false;
+    size_t offset = 0;
+    while (offset < length)
+    {
+        uint8_t type = packets[offset];
+        if (type == 1)
+        {
+            if (length - offset < 7)
+                break;
+            size_t packetLen = 7 + packets[offset + 6] * 4;
+            if (length - offset < packetLen)
+                break;
+            processDrawPacket(packets + offset, packetLen, NULL, 0, 0, fullCanvas, canvasWidth, canvasHeight);
+            changed = true;
+            offset += packetLen;
+        }
+        else if (type == 2)
+        {
+            if (length - offset < 12)
+                break;
+            if (processRectPacket(packets + offset, 12, canvas))
+                changed = true;
+            offset += 12;
+        }
+        else if (type == 3)
+        {
+            if (length - offset < 6)
+                break;
+            size_t packetLen = 6 + packets[offset + 5];
+            if (length - offset < packetLen)
+                break;
+            processDrawAttributionPacket(packets + offset, packetLen, labels);
+            offset += packetLen;
+        }
+        else
+        {
+            break;
+        }
+    }
+    return changed;
+}
+
+static void drawActiveDrawLabels(u8 *buffer, int fbWidth, int fbHeight, CanvasState &canvas, ActiveDrawLabel *labels)
+{
+    if (!labels)
+        return;
+    u64 now = osGetTime();
+    float zoom = canvas.zoomScale();
+    for (int i = 0; i < MAX_ACTIVE_DRAW_LABELS; i++)
+    {
+        if (!labels[i].active)
+            continue;
+        if (now - labels[i].updatedAt > DRAW_LABEL_TTL_MS)
+        {
+            labels[i].active = false;
+            continue;
+        }
+        if (!labels[i].hasDisplay)
+        {
+            labels[i].displayX = (float)labels[i].canvasX;
+            labels[i].displayY = (float)labels[i].canvasY;
+            labels[i].hasDisplay = true;
+        }
+        labels[i].displayX += ((float)labels[i].canvasX - labels[i].displayX) * 0.28f;
+        labels[i].displayY += ((float)labels[i].canvasY - labels[i].displayY) * 0.28f;
+
+        int screenX = (int)std::round((labels[i].displayX - canvas.offsetX) * zoom) + 7;
+        int screenY = (int)std::round((labels[i].displayY - canvas.offsetY) * zoom) - 8;
+        int textW = (int)strlen(labels[i].name) * 6;
+        screenX = std::max(2, std::min(318 - textW, screenX));
+        screenY = std::max(2, std::min(230, screenY));
+        drawMiniText(buffer, fbWidth, fbHeight, screenX, screenY, labels[i].name, 13, 122, 117);
+    }
 }
 
 void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
@@ -1263,6 +1418,8 @@ int main(int argc, char **argv)
     int adminRectStartY = 0;
     int adminRectEndX = 0;
     int adminRectEndY = 0;
+    ActiveDrawLabel activeDrawLabels[MAX_ACTIVE_DRAW_LABELS];
+    memset(activeDrawLabels, 0, sizeof(activeDrawLabels));
     bool exitRequested = false;
 
     auto isModOrAdmin = [&]() -> bool
@@ -2399,12 +2556,11 @@ int main(int argc, char **argv)
                 }
                 else
                 {
-                    if (!processRectPacket(packetBuffer, recvLen, canvas))
+                    if (processBinaryCanvasPackets(packetBuffer, recvLen, canvas, fullCanvas, canvasWidth, canvasHeight, activeDrawLabels))
                     {
-                        processDrawPacket(packetBuffer, recvLen, buffer, fbWidth, fbHeight, fullCanvas, canvasWidth, canvasHeight);
                         canvas.markFullDirty();
+                        Renderer::invalidateMinimap();
                     }
-                    Renderer::invalidateMinimap();
                 }
             }
             else if (recvLen == 0)
@@ -2451,6 +2607,7 @@ int main(int argc, char **argv)
                                     currentColor.r, currentColor.g, currentColor.b);
             }
         }
+        drawActiveDrawLabels(buffer, fbWidth, fbHeight, canvas, activeDrawLabels);
         if (gDisconnectReason[0])
         {
             fillRect(buffer, fbWidth, fbHeight, 28, 74, 264, 88, 248, 250, 251);
