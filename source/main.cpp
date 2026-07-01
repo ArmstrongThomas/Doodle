@@ -38,6 +38,7 @@ struct DeviceIdentity {
 };
 
 static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", "", ""};
+static char gHardwareId[32] = "";
 static char gIdentityStorageStatus[64] = "STORE UNKNOWN";
 static char gIdentityBootStatus[64] = "BOOT UNKNOWN";
 static const char *IDENTITY_PRIMARY_PATH = "sdmc:/3ds/CollabDoodle/identity.txt";
@@ -70,6 +71,25 @@ static void seedRandom()
     {
         srand((unsigned int)(osGetTime() ^ svcGetSystemTick()));
         seeded = true;
+    }
+}
+
+static void initHardwareId()
+{
+    u64 hash = 0;
+    Result rc = cfguInit();
+    if (R_SUCCEEDED(rc))
+    {
+        rc = CFGU_GenHashConsoleUnique(0xC011AB00, &hash);
+        cfguExit();
+    }
+    if (R_SUCCEEDED(rc) && hash != 0)
+    {
+        snprintf(gHardwareId, sizeof(gHardwareId), "3ds-hw-%016llX", (unsigned long long)hash);
+    }
+    else
+    {
+        snprintf(gHardwareId, sizeof(gHardwareId), "3ds-hw-unavailable");
     }
 }
 
@@ -310,9 +330,9 @@ static const char *updateTargetPathForPackage(const char *packageType, const cha
 
 static bool sendClientHello(int sock, const char *packageType)
 {
-    char hello[320];
+    char hello[384];
     Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true,
-                         gIdentity.deviceId, gIdentity.deviceSecret, gIdentity.displayName, packageType);
+                         gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId, gIdentity.displayName, packageType);
     return sock >= 0 && send(sock, hello, strlen(hello), 0) > 0;
 }
 
@@ -1275,9 +1295,9 @@ static bool recoverIdentity(int sock)
     if (!readKeyboardText("Backup code", backupCode, sizeof(backupCode), ""))
         return false;
 
-    char command[220];
+    char command[280];
     Protocol::buildRecoverIdentity(command, sizeof(command), username, backupCode,
-                                   gIdentity.deviceId, gIdentity.deviceSecret);
+                                   gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId);
     return send(sock, command, strlen(command), 0) > 0;
 }
 
@@ -1324,8 +1344,10 @@ int main(int argc, char **argv)
 
     printf("3DS Collab Doodle\n");
     printf("Package: %s\n", packageType);
+    initHardwareId();
     loadDeviceIdentity();
     printf("Identity: %s\n", gIdentity.deviceId);
+    printf("Hardware: %s\n", gHardwareId);
     printf("Identity boot: %s\n", gIdentityBootStatus);
 
     if (!NetworkManager::initialize())

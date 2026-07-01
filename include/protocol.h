@@ -56,12 +56,13 @@ public:
     static bool parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
                                     char *reason, size_t reasonSize);
     static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
-                           const char *deviceId, const char *deviceSecret, const char *displayName, const char *packageType);
+                           const char *deviceId, const char *deviceSecret, const char *hardwareId,
+                           const char *displayName, const char *packageType);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
     static void buildSetDisplayName(char *buffer, size_t size, const char *displayName);
     static void buildRulesAccepted(char *buffer, size_t size, const char *version);
     static void buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,
-                                     const char *deviceId, const char *deviceSecret);
+                                     const char *deviceId, const char *deviceSecret, const char *hardwareId);
     static void buildRotateBackupCode(char *buffer, size_t size);
     static void buildModerationCommand(char *buffer, size_t size, const char *action, const char *identityId,
                                        int messageId, const char *reason);

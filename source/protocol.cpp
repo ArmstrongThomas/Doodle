@@ -204,14 +204,16 @@ bool Protocol::parseDisconnected(const char *line, char *reason, size_t reasonSi
 }
 
 void Protocol::buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
-                          const char *deviceId, const char *deviceSecret, const char *displayName, const char *packageType)
+                          const char *deviceId, const char *deviceSecret, const char *hardwareId,
+                          const char *displayName, const char *packageType)
 {
     snprintf(buffer, size,
              "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":4,\"updaterSupported\":%s,"
-             "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"displayName\":\"%s\"}\n",
+             "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\",\"displayName\":\"%s\"}\n",
              appId, version, updaterSupported ? "true" : "false",
              packageType ? packageType : "3dsx",
-             deviceId ? deviceId : "", deviceSecret ? deviceSecret : "", displayName ? displayName : "3DS User");
+             deviceId ? deviceId : "", deviceSecret ? deviceSecret : "", hardwareId ? hardwareId : "",
+             displayName ? displayName : "3DS User");
 }
 
 void Protocol::buildSwitchChannel(char *buffer, size_t size, const char *channel)
@@ -234,20 +236,22 @@ void Protocol::buildRulesAccepted(char *buffer, size_t size, const char *version
 }
 
 void Protocol::buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,
-                                    const char *deviceId, const char *deviceSecret)
+                                    const char *deviceId, const char *deviceSecret, const char *hardwareId)
 {
     char safeUsername[25];
     char safeBackup[32];
     char safeDeviceId[48];
     char safeSecret[64];
+    char safeHardware[64];
     jsonSafeString(username, safeUsername, sizeof(safeUsername));
     jsonSafeString(backupCode, safeBackup, sizeof(safeBackup));
     jsonSafeString(deviceId, safeDeviceId, sizeof(safeDeviceId));
     jsonSafeString(deviceSecret, safeSecret, sizeof(safeSecret));
+    jsonSafeString(hardwareId, safeHardware, sizeof(safeHardware));
     snprintf(buffer, size,
              "{\"type\":\"recoverIdentity\",\"username\":\"%s\",\"backupCode\":\"%s\","
-             "\"deviceId\":\"%s\",\"deviceSecret\":\"%s\"}\n",
-             safeUsername, safeBackup, safeDeviceId, safeSecret);
+             "\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\"}\n",
+             safeUsername, safeBackup, safeDeviceId, safeSecret, safeHardware);
 }
 
 void Protocol::buildRotateBackupCode(char *buffer, size_t size)
