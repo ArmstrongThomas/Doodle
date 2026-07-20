@@ -16,7 +16,7 @@ enum TopScreenMode {
     TOP_MODE_STATUS = 6,
     TOP_MODE_IDENTITY = 7,
     TOP_MODE_RULES = 8,
-    TOP_MODE_CHAT = 9
+    TOP_MODE_TICKETS = 9
 };
 
 class Renderer {
@@ -32,9 +32,16 @@ public:
                           const char *identityStorage = "", int selectedAdminItem = 0,
                           const char *adminNotice = "",
                           const char *rulesVersion = "", bool needsRulesAgreement = false,
-                          ChatLine *chatLines = NULL,
-                          int chatCount = 0, int chatScroll = 0, int chatSelected = 0, int chatUnread = 0,
-                          const char *chatNotice = "");
+                          SupportTicketSummary *tickets = NULL, int ticketCount = 0, int ticketSelected = 0,
+                          int ticketView = 0, bool ticketStaffScope = false,
+                          SupportTicketSummary *activeTicket = NULL,
+                          SupportTicketMessage *ticketMessages = NULL, int ticketMessageCount = 0,
+                          StaffChatMessage *staffChatMessages = NULL, int staffChatMessageCount = 0,
+                          int ticketHomeSelected = 0, int ticketActionSelected = 0,
+                          bool supportOnly = false, const char *supportReason = "",
+                          const char *ticketNotice = "", int ticketNeedsReplyCount = 0,
+                          int staffChatUnreadCount = 0, int restrictionSecondsRemaining = 0,
+                          bool restrictionHasDuration = false, const char *restrictionReason = "");
     static void presentTopFrame();
     static void invalidateMinimap();
 };

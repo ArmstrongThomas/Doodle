@@ -27,6 +27,9 @@ static const int BRUSH_CIRCLE = 0;
 static const int BRUSH_SQUARE = 1;
 static const int BRUSH_DITHER = 2;
 static const int BRUSH_ERASER = 3;
+static bool gRainbowEnabled = false;
+static bool gRainbowStrokeColorValid = false;
+static Color gRainbowStrokeColor = {255, 0, 0};
 
 struct DeviceIdentity {
     char deviceId[48];
@@ -702,7 +705,38 @@ static Color effectiveDrawColor()
         Color white = {255, 255, 255};
         return white;
     }
+    if (gRainbowEnabled && gRainbowStrokeColorValid)
+        return gRainbowStrokeColor;
     return currentColor;
+}
+
+static Color rainbowColorForPoint(int x, int y, u64 nowMs)
+{
+    int hueDegrees = (int)((((nowMs / 110ULL) * 28ULL) + (u64)std::max(0, x) / 18ULL + (u64)std::max(0, y) / 24ULL) % 360ULL);
+    float h = (float)hueDegrees / 60.0f;
+    const float s = 0.92f;
+    const float l = 0.52f;
+    float c = (1.0f - fabsf(2.0f * l - 1.0f)) * s;
+    float xx = c * (1.0f - fabsf(fmodf(h, 2.0f) - 1.0f));
+    float r1 = 0.0f, g1 = 0.0f, b1 = 0.0f;
+    if (h < 1.0f) { r1 = c; g1 = xx; }
+    else if (h < 2.0f) { r1 = xx; g1 = c; }
+    else if (h < 3.0f) { g1 = c; b1 = xx; }
+    else if (h < 4.0f) { g1 = xx; b1 = c; }
+    else if (h < 5.0f) { r1 = xx; b1 = c; }
+    else { r1 = c; b1 = xx; }
+    float m = l - c * 0.5f;
+    Color color = {
+        (u8)std::max(0, std::min(255, (int)std::round((r1 + m) * 255.0f))),
+        (u8)std::max(0, std::min(255, (int)std::round((g1 + m) * 255.0f))),
+        (u8)std::max(0, std::min(255, (int)std::round((b1 + m) * 255.0f))),
+    };
+    return color;
+}
+
+static bool sameColor(const Color &a, const Color &b)
+{
+    return a.r == b.r && a.g == b.g && a.b == b.b;
 }
 
 static int effectiveBrushShape()
@@ -1212,10 +1246,12 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     {
         if (!modAllowed)
             return;
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 58, 132, 44, "SNAPSHOT", true, false);
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 166, 58, 132, 44, "CLEAR", false, true);
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 118, 276, 48, "FILL RECT", true, false);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 24, 190, notice && notice[0] ? notice : "DRAG SELECTION TO FILL", 32, 36, 42);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 54, 132, 36, "SNAPSHOT", true, false);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 166, 54, 132, 36, "CLEAR", false, true);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 102, 276, 36, "FILL RECT", true, false);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 150, 276, 34,
+                          gRainbowEnabled ? "RAINBOW ON" : "RAINBOW OFF", gRainbowEnabled, false);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 24, 204, notice && notice[0] ? notice : "STAFF DRAWING TOOLS", 32, 36, 42);
     }
 }
 
@@ -1332,6 +1368,10 @@ static void applyBackupCode(const IdentityInfo &identityInfo)
 int main(int argc, char **argv)
 {
     gfxInitDefault();
+    if (R_SUCCEEDED(ptmuInit()))
+        atexit(ptmuExit);
+    if (R_SUCCEEDED(mcuHwcInit()))
+        atexit(mcuHwcExit);
     gfxSetDoubleBuffering(GFX_TOP, false);
     UIState::init();
     chooseRandomDrawingColor();
@@ -1430,6 +1470,39 @@ int main(int argc, char **argv)
     int identityNoticeFrames = 0;
     char adminNotice[40] = "";
     int adminNoticeFrames = 0;
+    bool supportOnlyMode = false;
+    char supportOnlyReasonText[81] = "";
+    char supportOnlyBlockTypes[24] = "";
+    SupportTicketSummary ticketList[6];
+    memset(ticketList, 0, sizeof(ticketList));
+    int ticketListCount = 0;
+    int ticketSelected = 0;
+    int ticketNextBeforeId = 0;
+    bool ticketStaffScope = false;
+    SupportTicketSummary activeTicket;
+    memset(&activeTicket, 0, sizeof(activeTicket));
+    SupportTicketMessage ticketMessages[6];
+    memset(ticketMessages, 0, sizeof(ticketMessages));
+    int ticketMessageCount = 0;
+    int ticketNextBeforeMessageId = 0;
+    StaffChatMessage staffChatMessages[8];
+    memset(staffChatMessages, 0, sizeof(staffChatMessages));
+    int staffChatMessageCount = 0;
+    int staffChatNextBeforeId = 0;
+    int ticketView = 0;
+    int ticketHomeSelected = 0;
+    int ticketActionSelected = 0;
+    int ticketMineOpen = 0;
+    int ticketStaffNeedsReply = 0;
+    int staffChatUnread = 0;
+    bool restrictionActive = false;
+    bool restrictionHasDuration = false;
+    int restrictionInitialSeconds = 0;
+    int restrictionSecondsRemaining = 0;
+    u64 restrictionStartedAt = 0;
+    char restrictionReason[81] = "";
+    char ticketNotice[64] = "";
+    int ticketNoticeFrames = 0;
     enum AdminRectTool {
         ADMIN_RECT_NONE = 0,
         ADMIN_RECT_FILL = 1,
@@ -1461,6 +1534,28 @@ int main(int argc, char **argv)
         snprintf(adminNotice, sizeof(adminNotice), "%.39s", notice ? notice : "");
         adminNoticeFrames = adminNotice[0] ? 180 : 0;
         topRenderFrame = 10;
+    };
+
+    auto setTicketNotice = [&](const char *notice)
+    {
+        snprintf(ticketNotice, sizeof(ticketNotice), "%.63s", notice ? notice : "");
+        ticketNoticeFrames = ticketNotice[0] ? 240 : 0;
+        topRenderFrame = 10;
+    };
+
+    auto sendTicketCommand = [&](const char *command) -> bool
+    {
+        if (!command || !command[0] || !NetworkManager::checkConnection())
+        {
+            setTicketNotice("TICKET CONNECTION FAILED");
+            return false;
+        }
+        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        {
+            setTicketNotice("TICKET SEND FAILED");
+            return false;
+        }
+        return true;
     };
 
     auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
@@ -1515,6 +1610,180 @@ int main(int argc, char **argv)
         char gateVersion[32] = "";
         char rejectionReason[48] = "";
         char disconnectReason[80] = "";
+        char parsedSupportReason[81] = "";
+        char parsedBlockTypes[24] = "";
+        int parsedRestrictionSeconds = 0;
+        if (Protocol::parseSupportOnly(jsonLine, parsedSupportReason, sizeof(parsedSupportReason), parsedBlockTypes, sizeof(parsedBlockTypes), parsedRestrictionSeconds))
+        {
+            supportOnlyMode = true;
+            snprintf(supportOnlyReasonText, sizeof(supportOnlyReasonText), "%s", parsedSupportReason[0] ? parsedSupportReason : "Access restricted");
+            snprintf(supportOnlyBlockTypes, sizeof(supportOnlyBlockTypes), "%s", parsedBlockTypes);
+            restrictionActive = true;
+            restrictionHasDuration = parsedRestrictionSeconds > 0;
+            restrictionInitialSeconds = parsedRestrictionSeconds;
+            restrictionStartedAt = osGetTime();
+            snprintf(restrictionReason, sizeof(restrictionReason), "%s", supportOnlyReasonText);
+            topMode = TOP_MODE_TICKETS;
+            ticketView = 0;
+            ticketHomeSelected = 0;
+            topRenderFrame = 10;
+            return true;
+        }
+        int parsedMineOpen = 0;
+        int parsedStaffNeedsReply = 0;
+        int parsedStaffChatUnread = 0;
+        if (Protocol::parseTicketCounts(jsonLine, parsedMineOpen, parsedStaffNeedsReply, parsedStaffChatUnread))
+        {
+            ticketMineOpen = parsedMineOpen;
+            ticketStaffNeedsReply = parsedStaffNeedsReply;
+            staffChatUnread = parsedStaffChatUnread;
+            topRenderFrame = 10;
+            return true;
+        }
+        int expectedStaffMessages = 0;
+        if (Protocol::parseStaffChatStart(jsonLine, expectedStaffMessages))
+        {
+            (void)expectedStaffMessages;
+            staffChatMessageCount = 0;
+            return true;
+        }
+        StaffChatMessage parsedStaffMessage;
+        if (Protocol::parseStaffChatMessage(jsonLine, parsedStaffMessage))
+        {
+            bool duplicate = false;
+            for (int i = 0; i < staffChatMessageCount; i++) duplicate = duplicate || staffChatMessages[i].id == parsedStaffMessage.id;
+            if (!duplicate)
+            {
+                if (staffChatMessageCount >= 8)
+                {
+                    memmove(&staffChatMessages[0], &staffChatMessages[1], sizeof(StaffChatMessage) * 7);
+                    staffChatMessageCount = 7;
+                }
+                staffChatMessages[staffChatMessageCount++] = parsedStaffMessage;
+            }
+            if (ticketView == 4 && strstr(jsonLine, "\"live\":true"))
+            {
+                char readCommand[64];
+                Protocol::buildStaffChatRead(readCommand, sizeof(readCommand), parsedStaffMessage.id);
+                sendTicketCommand(readCommand);
+            }
+            topRenderFrame = 10;
+            return true;
+        }
+        int parsedStaffNextBeforeId = 0;
+        if (Protocol::parseStaffChatEnd(jsonLine, parsedStaffNextBeforeId))
+        {
+            staffChatNextBeforeId = parsedStaffNextBeforeId;
+            ticketView = 4;
+            topRenderFrame = 10;
+            return true;
+        }
+        bool staffChatOk = false;
+        char staffChatError[48] = "";
+        if (Protocol::parseStaffChatResult(jsonLine, staffChatOk, staffChatError, sizeof(staffChatError)))
+        {
+            setTicketNotice(staffChatOk ? "STAFF MESSAGE SENT" : (staffChatError[0] ? staffChatError : "STAFF CHAT FAILED"));
+            return true;
+        }
+        char listScope[12] = "";
+        int expectedTicketCount = 0;
+        if (Protocol::parseTicketListStart(jsonLine, listScope, sizeof(listScope), expectedTicketCount))
+        {
+            (void)expectedTicketCount;
+            ticketListCount = 0;
+            ticketSelected = 0;
+            ticketStaffScope = strcmp(listScope, "staff") == 0;
+            return true;
+        }
+        SupportTicketSummary parsedTicket;
+        if (Protocol::parseTicketSummary(jsonLine, parsedTicket))
+        {
+            if (strstr(jsonLine, "\"type\":\"ticketThreadStart\""))
+            {
+                activeTicket = parsedTicket;
+                ticketMessageCount = 0;
+                ticketView = 2;
+            }
+            else if (strstr(jsonLine, "\"type\":\"ticketSummary\""))
+            {
+                if (ticketListCount < 6)
+                    ticketList[ticketListCount++] = parsedTicket;
+            }
+            else
+            {
+                if (activeTicket.id == parsedTicket.id)
+                    activeTicket = parsedTicket;
+                for (int i = 0; i < ticketListCount; i++)
+                    if (ticketList[i].id == parsedTicket.id)
+                        ticketList[i] = parsedTicket;
+            }
+            topRenderFrame = 10;
+            return true;
+        }
+        SupportTicketMessage parsedMessage;
+        if (Protocol::parseTicketMessage(jsonLine, parsedMessage))
+        {
+            if (ticketMessageCount < 6)
+                ticketMessages[ticketMessageCount++] = parsedMessage;
+            topRenderFrame = 10;
+            return true;
+        }
+        int parsedNextBeforeId = 0;
+        if (Protocol::parseTicketListEnd(jsonLine, parsedNextBeforeId))
+        {
+            ticketNextBeforeId = parsedNextBeforeId;
+            ticketSelected = std::max(0, std::min(ticketSelected, std::max(0, ticketListCount - 1)));
+            ticketView = 1;
+            topRenderFrame = 10;
+            return true;
+        }
+        int parsedThreadId = 0;
+        int parsedNextMessage = 0;
+        if (Protocol::parseTicketThreadEnd(jsonLine, parsedThreadId, parsedNextMessage))
+        {
+            (void)parsedThreadId;
+            ticketNextBeforeMessageId = parsedNextMessage;
+            ticketView = 2;
+            topRenderFrame = 10;
+            return true;
+        }
+        bool ticketOk = false;
+        char ticketAction[24] = "";
+        char ticketError[48] = "";
+        int resultTicketId = 0;
+        if (Protocol::parseTicketResult(jsonLine, ticketOk, ticketAction, sizeof(ticketAction), ticketError, sizeof(ticketError), resultTicketId))
+        {
+            if (ticketOk)
+            {
+                setTicketNotice("TICKET ACTION OK");
+                char command[128];
+                if ((strcmp(ticketAction, "reply") == 0 || strcmp(ticketAction, "status") == 0 || strcmp(ticketAction, "approveUnban") == 0) && resultTicketId > 0)
+                {
+                    Protocol::buildTicketGet(command, sizeof(command), resultTicketId);
+                    sendTicketCommand(command);
+                }
+                else if (strcmp(ticketAction, "create") == 0)
+                {
+                    Protocol::buildTicketList(command, sizeof(command), false, "", supportOnlyMode ? "unban" : "", 0);
+                    sendTicketCommand(command);
+                }
+            }
+            else
+            {
+                char notice[64];
+                snprintf(notice, sizeof(notice), "FAILED: %.48s", ticketError[0] ? ticketError : "ticket-error");
+                setTicketNotice(notice);
+            }
+            return true;
+        }
+        if (strstr(jsonLine, "\"type\":\"accessRestored\""))
+        {
+            supportOnlyMode = false;
+            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "ACCESS RESTORED - PRESS A");
+            topMode = TOP_MODE_STATUS;
+            setTicketNotice("ACCESS RESTORED");
+            return true;
+        }
         if (Protocol::parseChannels(jsonLine, availableChannels, 8, availableChannelCount, currentChannel))
         {
             if (currentChannel[0])
@@ -1531,6 +1800,30 @@ int main(int argc, char **argv)
         if (Protocol::parseIdentityAccepted(jsonLine, identityInfo))
         {
             applyIdentityAccepted(identityInfo);
+            if (strcmp(identityInfo.status, "muted") == 0 || strcmp(identityInfo.status, "banned") == 0)
+            {
+                restrictionActive = true;
+                restrictionInitialSeconds = strcmp(identityInfo.status, "muted") == 0 ? identityInfo.muteSecondsRemaining : identityInfo.banSecondsRemaining;
+                restrictionHasDuration = restrictionInitialSeconds > 0;
+                restrictionStartedAt = osGetTime();
+                snprintf(restrictionReason, sizeof(restrictionReason), "%s", identityInfo.restrictionReason[0] ? identityInfo.restrictionReason : identityInfo.status);
+            }
+            else if (!supportOnlyMode)
+            {
+                restrictionActive = false;
+                restrictionReason[0] = '\0';
+            }
+            if (strcmp(identityInfo.role, "mod") != 0 && strcmp(identityInfo.role, "admin") != 0)
+            {
+                gRainbowEnabled = false;
+                gRainbowStrokeColorValid = false;
+                if (ticketStaffScope)
+                {
+                    ticketStaffScope = false;
+                    ticketView = 0;
+                    ticketHomeSelected = 0;
+                }
+            }
             gNeedsDisplayName = false;
             setIdentityNotice("ACCOUNT OK");
             return true;
@@ -1578,6 +1871,19 @@ int main(int argc, char **argv)
             saveDeviceIdentity();
             setIdentityNotice("RULES OK");
             topMode = TOP_MODE_CANVAS;
+            return true;
+        }
+        char mutedReason[81] = "";
+        int mutedSeconds = 0;
+        if (Protocol::parseMuted(jsonLine, mutedReason, sizeof(mutedReason), mutedSeconds))
+        {
+            restrictionActive = true;
+            restrictionHasDuration = mutedSeconds > 0;
+            restrictionInitialSeconds = mutedSeconds;
+            restrictionStartedAt = osGetTime();
+            snprintf(restrictionReason, sizeof(restrictionReason), "%s", mutedReason[0] ? mutedReason : "Drawing is disabled");
+            setIdentityNotice("MUTED - DRAWING DISABLED");
+            topRenderFrame = 10;
             return true;
         }
         if (Protocol::parseDisconnected(jsonLine, disconnectReason, sizeof(disconnectReason)))
@@ -1656,7 +1962,11 @@ int main(int argc, char **argv)
             }
 
             if (handleJsonControl(line))
+            {
+                if (supportOnlyMode)
+                    break;
                 continue;
+            }
 
             if (Protocol::parseCanvasMeta(line, meta))
             {
@@ -1665,7 +1975,16 @@ int main(int argc, char **argv)
             }
         }
 
-        if (!receivedMeta)
+        if (!receivedMeta && supportOnlyMode)
+        {
+            canvasWidth = 320;
+            canvasHeight = 240;
+            canvas.allocate(canvasWidth, canvasHeight);
+            canvas.setChannel("support");
+            fullCanvas = canvas.pixels;
+            Renderer::invalidateMinimap();
+        }
+        else if (!receivedMeta)
         {
             printf("Failed to read init canvas metadata.\n");
         }
@@ -1710,6 +2029,7 @@ int main(int argc, char **argv)
     float lastStrokeX = 0.0f;
     float lastStrokeY = 0.0f;
     bool hasLastStrokePoint = false;
+    std::string controlReceiveBuffer;
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
@@ -1727,8 +2047,19 @@ int main(int argc, char **argv)
         bool gotMeta = false;
         while (NetworkManager::readLine(activeSock, response, sizeof(response)))
         {
-            if (handleJsonControl(response))
+            char latestVersion[32] = "";
+            char updateReason[48] = "";
+            if (Protocol::parseUpdateRequired(response, latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
+            {
+                updateAvailable = true;
+                setAdminNotice("UPDATE AVAILABLE");
                 continue;
+            }
+            if (handleJsonControl(response))
+            {
+                if (supportOnlyMode) return true;
+                continue;
+            }
             if (Protocol::parseCanvasMeta(response, snapshotMeta))
             {
                 gotMeta = true;
@@ -1771,6 +2102,35 @@ int main(int argc, char **argv)
         free(compressedCanvas);
         printf("%s: canvas snapshot %s.\n", context ? context : "canvas", ok ? "loaded" : "failed");
         return ok;
+    };
+
+    auto reconnectSession = [&](const char *context) -> bool
+    {
+        bool wasSupportOnly = supportOnlyMode;
+        supportOnlyMode = false;
+        controlReceiveBuffer.clear();
+        UIState::clearPoints();
+        if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))
+        {
+            supportOnlyMode = wasSupportOnly;
+            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "RECONNECT FAILED - PRESS A");
+            topMode = TOP_MODE_STATUS;
+            return false;
+        }
+        sock = NetworkManager::getSocket();
+        if (!receiveCanvasSnapshot(sock, context))
+        {
+            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "REFRESH FAILED - PRESS A");
+            topMode = TOP_MODE_STATUS;
+            return false;
+        }
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        gDisconnectReason[0] = '\0';
+        setAdminNotice(updateAvailable ? "RECONNECTED - UPDATE AVAILABLE" : "RECONNECTED");
+        topMode = supportOnlyMode ? TOP_MODE_TICKETS : TOP_MODE_CANVAS;
+        topRenderFrame = 10;
+        return true;
     };
 
     auto switchToSelectedChannel = [&]() -> bool
@@ -1838,8 +2198,35 @@ int main(int argc, char **argv)
 
     syncSelectedChannel();
 
+    u64 lastLoopAt = osGetTime();
     while (aptMainLoop() && !exitRequested)
     {
+        u64 loopNow = osGetTime();
+        bool resumedFromSleep = loopNow > lastLoopAt && loopNow - lastLoopAt > 3000;
+        lastLoopAt = loopNow;
+        if (resumedFromSleep)
+        {
+            setAdminNotice("WAKING - CHECKING VERSION");
+            reconnectSession("wake");
+            lastLoopAt = osGetTime();
+        }
+        if (restrictionActive && restrictionHasDuration)
+        {
+            int elapsed = (int)((osGetTime() - restrictionStartedAt) / 1000ULL);
+            restrictionSecondsRemaining = std::max(0, restrictionInitialSeconds - elapsed);
+            if (restrictionSecondsRemaining == 0)
+            {
+                restrictionActive = false;
+                restrictionReason[0] = '\0';
+                snprintf(identityInfo.status, sizeof(identityInfo.status), "active");
+                reconnectSession("restriction-expired");
+                lastLoopAt = osGetTime();
+            }
+        }
+        else
+        {
+            restrictionSecondsRemaining = restrictionInitialSeconds;
+        }
         hidScanInput();
         u32 kDown = hidKeysDown();
         u32 kHeld = hidKeysHeld();
@@ -1851,13 +2238,19 @@ int main(int argc, char **argv)
 
         if (kDown & KEY_SELECT)
         {
-            topMode = TOP_MODE_MENU;
-            selectedMenuItem = 0;
+            topMode = supportOnlyMode ? TOP_MODE_TICKETS : TOP_MODE_MENU;
+            if (supportOnlyMode)
+            {
+                ticketView = 0;
+                ticketHomeSelected = 0;
+            }
+            else
+                selectedMenuItem = 0;
             topRenderFrame = 10;
             continue;
         }
 
-        if (kDown & KEY_START)
+        if (!supportOnlyMode && (kDown & KEY_START))
         {
             printf("Refreshing canvas from server...\n");
             if (!NetworkManager::checkConnection() &&
@@ -1930,27 +2323,7 @@ int main(int argc, char **argv)
             if (kDown & KEY_A)
             {
                 setAdminNotice("RECONNECTING");
-                if (NetworkManager::reconnect() && sendClientHello(NetworkManager::getSocket(), packageType))
-                {
-                    sock = NetworkManager::getSocket();
-                    if (receiveCanvasSnapshot(sock, "reconnect"))
-                    {
-                        int flags = fcntl(sock, F_GETFL, 0);
-                        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-                        gDisconnectReason[0] = '\0';
-                        setAdminNotice("RECONNECTED");
-                        topMode = TOP_MODE_CANVAS;
-                    }
-                    else
-                    {
-                        snprintf(gDisconnectReason, sizeof(gDisconnectReason), "REFRESH FAILED");
-                    }
-                }
-                else
-                {
-                    sock = -1;
-                    snprintf(gDisconnectReason, sizeof(gDisconnectReason), "RECONNECT FAILED");
-                }
+                reconnectSession("reconnect");
                 topRenderFrame = 10;
             }
             else if (kDown & KEY_B)
@@ -1974,8 +2347,7 @@ int main(int argc, char **argv)
 
         if (topMode == TOP_MODE_MENU)
         {
-            const bool staffMenu = isModOrAdmin();
-            const int menuCount = staffMenu ? 8 : 7;
+            const int menuCount = 8;
             selectedMenuItem = std::max(0, std::min(selectedMenuItem, menuCount - 1));
             if (kDown & KEY_DUP)
             {
@@ -2005,25 +2377,29 @@ int main(int argc, char **argv)
                     topMode = TOP_MODE_USERS;
                 }
                 else if (selectedMenuItem == 2)
-                    topMode = TOP_MODE_CONTROLS;
+                {
+                    topMode = TOP_MODE_TICKETS;
+                    ticketView = 0;
+                    ticketHomeSelected = 0;
+                    char command[48];
+                    Protocol::buildTicketCounts(command, sizeof(command));
+                    sendTicketCommand(command);
+                }
                 else if (selectedMenuItem == 3)
+                    topMode = TOP_MODE_CONTROLS;
+                else if (selectedMenuItem == 4)
                 {
                     topMode = TOP_MODE_RULES;
                 }
-                else if (selectedMenuItem == 4)
+                else if (selectedMenuItem == 5)
                 {
                     topMode = TOP_MODE_STATUS;
                 }
-                else if (selectedMenuItem == 5)
+                else if (selectedMenuItem == 6)
                 {
                     topMode = TOP_MODE_IDENTITY;
                 }
-                else if (staffMenu && selectedMenuItem == 6)
-                {
-                    topMode = TOP_MODE_ADMIN;
-                    selectedAdminItem = 0;
-                }
-                else if (selectedMenuItem == (staffMenu ? 7 : 6))
+                else if (selectedMenuItem == 7)
                 {
                     UIState::clearPoints();
                     NetworkManager::disconnect();
@@ -2076,6 +2452,237 @@ int main(int argc, char **argv)
                 }
                 topRenderFrame = 10;
                 continue;
+            }
+        }
+        else if (topMode == TOP_MODE_TICKETS)
+        {
+            const bool staffAllowed = isModOrAdmin() && !supportOnlyMode;
+            if (ticketView == 0)
+            {
+                int homeCount = supportOnlyMode ? 2 : (staffAllowed ? 6 : 4);
+                ticketHomeSelected = std::max(0, std::min(ticketHomeSelected, homeCount - 1));
+                if (kDown & KEY_DUP)
+                {
+                    ticketHomeSelected = (ticketHomeSelected + homeCount - 1) % homeCount;
+                    topRenderFrame = 10;
+                }
+                if (kDown & KEY_DDOWN)
+                {
+                    ticketHomeSelected = (ticketHomeSelected + 1) % homeCount;
+                    topRenderFrame = 10;
+                }
+                if ((kDown & KEY_B) && !supportOnlyMode)
+                {
+                    topMode = TOP_MODE_MENU;
+                    topRenderFrame = 10;
+                    continue;
+                }
+                if (kDown & KEY_A)
+                {
+                    bool listMine = (supportOnlyMode && ticketHomeSelected == 1) || (!supportOnlyMode && ticketHomeSelected == 3);
+                    bool listStaff = !supportOnlyMode && staffAllowed && ticketHomeSelected == 4;
+                    bool openStaffChat = !supportOnlyMode && staffAllowed && ticketHomeSelected == 5;
+                    if (openStaffChat)
+                    {
+                        char command[96];
+                        Protocol::buildStaffChatList(command, sizeof(command));
+                        if (sendTicketCommand(command)) setTicketNotice("LOADING STAFF CHAT");
+                        continue;
+                    }
+                    if (listMine || listStaff)
+                    {
+                        char command[192];
+                        ticketStaffScope = listStaff;
+                        Protocol::buildTicketList(command, sizeof(command), listStaff, listStaff ? "unresolved" : "",
+                                                  supportOnlyMode ? "unban" : "", 0);
+                        if (sendTicketCommand(command))
+                            setTicketNotice("LOADING TICKETS");
+                    }
+                    else
+                    {
+                        const char *category = supportOnlyMode || ticketHomeSelected == 0 ? "unban" :
+                                               ticketHomeSelected == 1 ? "bug" : "feature";
+                        char subject[65];
+                        char details[241];
+                        if (!readKeyboardText("Ticket subject", subject, sizeof(subject), ""))
+                            continue;
+                        if (!readKeyboardText("Ticket details", details, sizeof(details), ""))
+                            continue;
+                        char command[512];
+                        Protocol::buildTicketCreate(command, sizeof(command), category, subject, details);
+                        if (sendTicketCommand(command))
+                            setTicketNotice("TICKET SENT");
+                    }
+                    topRenderFrame = 10;
+                    continue;
+                }
+            }
+            else if (ticketView == 1)
+            {
+                if (ticketListCount > 0 && (kDown & KEY_DUP))
+                {
+                    ticketSelected = (ticketSelected + ticketListCount - 1) % ticketListCount;
+                    topRenderFrame = 10;
+                }
+                if (ticketListCount > 0 && (kDown & KEY_DDOWN))
+                {
+                    ticketSelected = (ticketSelected + 1) % ticketListCount;
+                    topRenderFrame = 10;
+                }
+                if (kDown & KEY_B)
+                {
+                    ticketView = 0;
+                    ticketHomeSelected = supportOnlyMode ? 1 : (ticketStaffScope ? 4 : 3);
+                    topRenderFrame = 10;
+                    continue;
+                }
+                if ((kDown & KEY_A) && ticketListCount > 0)
+                {
+                    char command[128];
+                    Protocol::buildTicketGet(command, sizeof(command), ticketList[ticketSelected].id);
+                    if (sendTicketCommand(command))
+                        setTicketNotice("LOADING THREAD");
+                    continue;
+                }
+                if ((kDown & KEY_X) || ((kDown & KEY_Y) && ticketNextBeforeId > 0))
+                {
+                    char command[192];
+                    int beforeId = (kDown & KEY_Y) ? ticketNextBeforeId : 0;
+                    Protocol::buildTicketList(command, sizeof(command), ticketStaffScope,
+                                              ticketStaffScope ? "unresolved" : "", supportOnlyMode ? "unban" : "", beforeId);
+                    if (sendTicketCommand(command))
+                        setTicketNotice(beforeId ? "LOADING NEXT PAGE" : "REFRESHING");
+                    continue;
+                }
+            }
+            else if (ticketView == 2)
+            {
+                bool closed = strcmp(activeTicket.status, "resolved") == 0 || strcmp(activeTicket.status, "rejected") == 0;
+                if (kDown & KEY_B)
+                {
+                    ticketView = 1;
+                    topRenderFrame = 10;
+                    continue;
+                }
+                if ((kDown & KEY_Y) && ticketNextBeforeMessageId > 0)
+                {
+                    char command[128];
+                    Protocol::buildTicketGet(command, sizeof(command), activeTicket.id, ticketNextBeforeMessageId);
+                    sendTicketCommand(command);
+                    continue;
+                }
+                if ((kDown & KEY_A) && (!closed || ticketStaffScope))
+                {
+                    char reply[241];
+                    if (readKeyboardText("Ticket reply", reply, sizeof(reply), ""))
+                    {
+                        char command[384];
+                        Protocol::buildTicketReply(command, sizeof(command), activeTicket.id, reply, ticketStaffScope);
+                        if (sendTicketCommand(command))
+                            setTicketNotice("REPLY SENT");
+                    }
+                    continue;
+                }
+                if ((kDown & KEY_X) && ticketStaffScope && staffAllowed)
+                {
+                    ticketView = 3;
+                    ticketActionSelected = 0;
+                    topRenderFrame = 10;
+                    continue;
+                }
+            }
+            else if (ticketView == 3)
+            {
+                if (kDown & KEY_DUP)
+                {
+                    ticketActionSelected = (ticketActionSelected + 5) % 6;
+                    topRenderFrame = 10;
+                }
+                if (kDown & KEY_DDOWN)
+                {
+                    ticketActionSelected = (ticketActionSelected + 1) % 6;
+                    topRenderFrame = 10;
+                }
+                if (kDown & KEY_B)
+                {
+                    ticketView = 2;
+                    topRenderFrame = 10;
+                    continue;
+                }
+                if ((kDown & KEY_A) && staffAllowed)
+                {
+                    char command[512];
+                    command[0] = '\0';
+                    if (ticketActionSelected == 0)
+                        Protocol::buildTicketStatus(command, sizeof(command), activeTicket.id, "in_progress");
+                    else if (ticketActionSelected == 1)
+                    {
+                        char reply[241];
+                        if (readKeyboardText("Reply to requester", reply, sizeof(reply), ""))
+                            Protocol::buildTicketReply(command, sizeof(command), activeTicket.id, reply, true);
+                    }
+                    else if (ticketActionSelected == 2 || ticketActionSelected == 3)
+                    {
+                        char response[241];
+                        if (readKeyboardText(ticketActionSelected == 2 ? "Resolution message" : "Rejection reason", response, sizeof(response), ""))
+                            Protocol::buildTicketStatus(command, sizeof(command), activeTicket.id,
+                                                        ticketActionSelected == 2 ? "resolved" : "rejected", response);
+                    }
+                    else if (ticketActionSelected == 4)
+                    {
+                        if (strcmp(activeTicket.category, "unban") != 0)
+                        {
+                            setTicketNotice("UNBAN TICKETS ONLY");
+                            continue;
+                        }
+                        char confirm[12];
+                        if (readKeyboardText("Type APPROVE", confirm, sizeof(confirm), "") && strcasecmp(confirm, "APPROVE") == 0)
+                            Protocol::buildTicketApproveUnban(command, sizeof(command), activeTicket.id);
+                        else
+                        {
+                            setTicketNotice("APPROVAL CANCELLED");
+                            continue;
+                        }
+                    }
+                    else if (ticketActionSelected == 5)
+                        Protocol::buildTicketStatus(command, sizeof(command), activeTicket.id, "open");
+
+                    if (command[0] && sendTicketCommand(command))
+                    {
+                        setTicketNotice("STAFF ACTION SENT");
+                        ticketView = 2;
+                    }
+                    continue;
+                }
+            }
+            else if (ticketView == 4)
+            {
+                if (kDown & KEY_B)
+                {
+                    ticketView = 0;
+                    ticketHomeSelected = 5;
+                    char counts[48];
+                    Protocol::buildTicketCounts(counts, sizeof(counts));
+                    sendTicketCommand(counts);
+                    topRenderFrame = 10;
+                    continue;
+                }
+                if (kDown & KEY_A)
+                {
+                    char message[241];
+                    if (!readKeyboardText("Staff message", message, sizeof(message), "")) continue;
+                    char command[360];
+                    Protocol::buildStaffChatSend(command, sizeof(command), message);
+                    if (sendTicketCommand(command)) setTicketNotice("STAFF MESSAGE SENT");
+                    continue;
+                }
+                if ((kDown & KEY_X) || ((kDown & KEY_Y) && staffChatNextBeforeId > 0))
+                {
+                    char command[96];
+                    Protocol::buildStaffChatList(command, sizeof(command), (kDown & KEY_Y) ? staffChatNextBeforeId : 0);
+                    if (sendTicketCommand(command)) setTicketNotice((kDown & KEY_Y) ? "LOADING OLDER CHAT" : "REFRESHING STAFF CHAT");
+                    continue;
+                }
             }
         }
         else if (topMode == TOP_MODE_RULES && (kDown & KEY_B) && gNeedsRules)
@@ -2153,7 +2760,7 @@ int main(int argc, char **argv)
 
         bool zoomOverlayLeft = (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT);
         bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DRIGHT | KEY_Y));
-        bool blockNormalCanvasInput = gDisconnectReason[0] || gNeedsDisplayName || gNeedsRules;
+        bool blockNormalCanvasInput = gDisconnectReason[0] || gNeedsDisplayName || gNeedsRules || restrictionActive;
         if (!shoulderEraserActive && !blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && (kDown & (KEY_L | KEY_R)))
         {
             shoulderSavedBrushShape = currentBrushShape;
@@ -2329,12 +2936,12 @@ int main(int argc, char **argv)
                     setAdminNotice("MOD OR ADMIN REQUIRED");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 22, 58, 132, 44))
+                if (pointInRect(touch.px, touch.py, 22, 54, 132, 36))
                 {
                     sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 166, 58, 132, 44))
+                if (pointInRect(touch.px, touch.py, 166, 54, 132, 36))
                 {
                     Color white = {255, 255, 255};
                     if (sendAdminCanvasCommand("clear", 0, 0, canvasWidth, canvasHeight, white))
@@ -2344,12 +2951,20 @@ int main(int argc, char **argv)
                     }
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 22, 118, 276, 48))
+                if (pointInRect(touch.px, touch.py, 22, 102, 276, 36))
                 {
                     pendingAdminRectTool = ADMIN_RECT_FILL;
                     adminRectDragging = false;
                     UIState::setColorPickerActive(false);
                     setAdminNotice("DRAG SELECTION");
+                    continue;
+                }
+                if (pointInRect(touch.px, touch.py, 22, 150, 276, 34))
+                {
+                    gRainbowEnabled = !gRainbowEnabled;
+                    gRainbowStrokeColorValid = false;
+                    setAdminNotice(gRainbowEnabled ? "RAINBOW ENABLED" : "RAINBOW DISABLED");
+                    topRenderFrame = 10;
                     continue;
                 }
                 continue;
@@ -2446,6 +3061,34 @@ int main(int argc, char **argv)
             // Normal drawing mode
             if (kHeld & KEY_TOUCH)
             {
+                if (gRainbowEnabled && currentBrushShape != BRUSH_ERASER)
+                {
+                    int rainbowX = canvas.screenToCanvasX(touch.px);
+                    int rainbowY = canvas.screenToCanvasY(touch.py);
+                    Color nextRainbowColor = rainbowColorForPoint(rainbowX, rainbowY, osGetTime());
+                    if (gRainbowStrokeColorValid && !sameColor(gRainbowStrokeColor, nextRainbowColor) && !UIState::getPoints().empty())
+                    {
+                        if (!NetworkManager::checkConnection())
+                        {
+                            if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))
+                            {
+                                UIState::clearPoints();
+                                gRainbowStrokeColorValid = false;
+                                continue;
+                            }
+                            sock = NetworkManager::getSocket();
+                        }
+                        sendDrawBatchCommand(sock, UIState::getPoints(), gRainbowStrokeColor,
+                                             currentBrushSize, effectiveBrushShape());
+                        UIState::clearPoints();
+                    }
+                    gRainbowStrokeColor = nextRainbowColor;
+                    gRainbowStrokeColorValid = true;
+                }
+                else
+                {
+                    gRainbowStrokeColorValid = false;
+                }
                 if (prevTouchX == -1 && prevTouchY == -1)
                 {
                     prevTouchX = touch.px;
@@ -2490,6 +3133,7 @@ int main(int argc, char **argv)
                                 UIState::clearPoints(); // Clear points if reconnect failed
                                 continue;
                             }
+                            sock = NetworkManager::getSocket();
                         }
                         Color drawColor = effectiveDrawColor();
                         sendDrawBatchCommand(sock, UIState::getPoints(), drawColor,
@@ -2522,12 +3166,14 @@ int main(int argc, char **argv)
                             UIState::clearPoints(); // Clear points if reconnect failed
                             continue;
                         }
+                        sock = NetworkManager::getSocket();
                     }
                     Color drawColor = effectiveDrawColor();
                     sendDrawBatchCommand(sock, UIState::getPoints(), drawColor,
                                          currentBrushSize, effectiveBrushShape());
                     UIState::clearPoints();
                 }
+                gRainbowStrokeColorValid = false;
                 prevTouchX = prevTouchY = -1;
                 prevPrevTouchX = prevPrevTouchY = -1;
                 hasLastStrokePoint = false;
@@ -2541,7 +3187,7 @@ int main(int argc, char **argv)
             int recvLen = recv(sock, packetBuffer, sizeof(packetBuffer), 0);
             if (recvLen > 0)
             {
-                if (packetBuffer[0] == '{')
+                if (packetBuffer[0] == '{' || !controlReceiveBuffer.empty())
                 {
                     packetBuffer[std::min(recvLen, (int)sizeof(packetBuffer) - 1)] = '\0';
                     CanvasMeta meta;
@@ -2567,13 +3213,17 @@ int main(int argc, char **argv)
                     }
                     else
                     {
-                        char *savePtr = NULL;
-                        char *line = strtok_r((char *)packetBuffer, "\n", &savePtr);
-                        while (line)
+                        controlReceiveBuffer.append((char *)packetBuffer, (size_t)recvLen);
+                        size_t newline = std::string::npos;
+                        while ((newline = controlReceiveBuffer.find('\n')) != std::string::npos)
                         {
-                            handleJsonControl(line);
-                            line = strtok_r(NULL, "\n", &savePtr);
+                            std::string line = controlReceiveBuffer.substr(0, newline);
+                            controlReceiveBuffer.erase(0, newline + 1);
+                            if (!line.empty())
+                                handleJsonControl(line.c_str());
                         }
+                        if (controlReceiveBuffer.size() > 900)
+                            controlReceiveBuffer.clear();
                     }
                 }
                 else
@@ -2630,6 +3280,20 @@ int main(int argc, char **argv)
             }
         }
         drawActiveDrawLabels(buffer, fbWidth, fbHeight, canvas, activeDrawLabels);
+        if (restrictionActive && !supportOnlyMode && topMode == TOP_MODE_CANVAS)
+        {
+            char remaining[48];
+            if (restrictionHasDuration)
+                snprintf(remaining, sizeof(remaining), "MUTED - %02d:%02d:%02d LEFT", restrictionSecondsRemaining / 3600, (restrictionSecondsRemaining / 60) % 60, restrictionSecondsRemaining % 60);
+            else
+                snprintf(remaining, sizeof(remaining), "MUTED - NO AUTOMATIC EXPIRATION");
+            fillRect(buffer, fbWidth, fbHeight, 18, 16, 284, 54, 248, 250, 251);
+            drawRectOutline(buffer, fbWidth, fbHeight, 18, 16, 284, 54, 196, 92, 40);
+            drawMiniText(buffer, fbWidth, fbHeight, 28, 28, remaining, 196, 61, 61);
+            char compactReason[43];
+            snprintf(compactReason, sizeof(compactReason), "%.42s", restrictionReason);
+            drawMiniText(buffer, fbWidth, fbHeight, 28, 48, compactReason, 32, 36, 42);
+        }
         if (gDisconnectReason[0])
         {
             fillRect(buffer, fbWidth, fbHeight, 28, 74, 264, 88, 248, 250, 251);
@@ -2657,19 +3321,39 @@ int main(int argc, char **argv)
             if (adminNoticeFrames == 0)
                 topRenderFrame = 10;
         }
+        if (ticketNoticeFrames > 0)
+        {
+            ticketNoticeFrames--;
+            if (ticketNoticeFrames == 0)
+                topRenderFrame = 10;
+        }
         if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
+            bool renderStaffScope = ticketView == 0 ? isModOrAdmin() : ticketStaffScope;
+            int renderedOpenCount = isModOrAdmin() ? ticketStaffNeedsReply : 0;
+            const char *renderedIdentityStatus = restrictionActive ? (supportOnlyMode ? "banned" : "muted") : identityInfo.status;
             Renderer::renderTop(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor,
                                 currentBrushSize, currentBrushShape, topMode,
                                 availableChannels, availableChannelCount, selectedChannel,
                                 selectedMenuItem, connectedUsers, connectedUserCount,
                                 identityInfo.displayName, identityInfo.username,
-                                identityInfo.role, identityInfo.status,
+                                identityInfo.role, renderedIdentityStatus,
                                 identityInfo.backupCode, identityNoticeFrames > 0 ? identityNotice : "",
                                 gIdentityBootStatus, selectedAdminItem,
                                 adminNoticeFrames > 0 ? adminNotice : "",
                                 gRequiredRulesVersion[0] ? gRequiredRulesVersion : gIdentity.rulesAcceptedVersion,
-                                gNeedsRules);
+                                gNeedsRules,
+                                ticketList, ticketListCount, ticketSelected,
+                                ticketView, renderStaffScope,
+                                activeTicket.id > 0 ? &activeTicket : NULL,
+                                ticketMessages, ticketMessageCount,
+                                staffChatMessages, staffChatMessageCount,
+                                ticketHomeSelected, ticketActionSelected,
+                                supportOnlyMode, supportOnlyReasonText,
+                                ticketNoticeFrames > 0 ? ticketNotice : "", renderedOpenCount,
+                                isModOrAdmin() ? staffChatUnread : 0,
+                                restrictionSecondsRemaining, restrictionHasDuration,
+                                restrictionReason);
             topRenderFrame = 0;
         }
 

@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static const int MINIMAP_W = 256;
 static const int MINIMAP_H = 144;
@@ -15,6 +16,9 @@ static bool topFrameValid = false;
 static int minimapFrameCounter = 0;
 static const int BOTTOM_SCREEN_W = 320;
 static const int BOTTOM_SCREEN_H = 240;
+static int topBatteryPercent = -1;
+static bool topBatteryCharging = false;
+static u64 topBatteryReadAt = 0;
 
 void Renderer::renderViewport(CanvasState &canvas, u8 *buffer, int fbWidth, int fbHeight, bool forceFull)
 {
@@ -269,14 +273,72 @@ static void drawMenuRow(int y, const char *label, bool selected, bool current = 
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 48, y, label, selected ? 245 : 32, selected ? 248 : 36, selected ? 250 : 42);
 }
 
+static void drawTopSystemStatus()
+{
+    time_t now = time(NULL);
+    struct tm *local = localtime(&now);
+    char clockText[6] = "--:--";
+    if (local)
+        snprintf(clockText, sizeof(clockText), "%02d:%02d", local->tm_hour, local->tm_min);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 180, 10, clockText, 218, 226, 232);
+
+    u8 wifi = osGetWifiStrength();
+    if (wifi > 3) wifi = 3;
+    for (int bar = 0; bar < 3; bar++)
+    {
+        int barHeight = 3 + bar * 3;
+        bool active = wifi > bar;
+        fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 220 + bar * 5, 20 - barHeight,
+                    3, barHeight, active ? 94 : 73, active ? 234 : 82, active ? 212 : 92);
+    }
+
+    u64 readNow = osGetTime();
+    if (topBatteryPercent < 0 || readNow - topBatteryReadAt >= 15000ULL)
+    {
+        u8 level = 0;
+        if (R_SUCCEEDED(MCUHWC_GetBatteryLevel(&level)) && level <= 100)
+            topBatteryPercent = level;
+        else if (R_SUCCEEDED(PTMU_GetBatteryLevel(&level)))
+        {
+            static const int estimatedPercent[] = { 5, 20, 40, 60, 80, 100 };
+            topBatteryPercent = estimatedPercent[std::min((int)level, 5)];
+        }
+        u8 charging = 0;
+        bool adapterConnected = false;
+        bool hasChargeState = R_SUCCEEDED(PTMU_GetBatteryChargeState(&charging));
+        bool hasAdapterState = R_SUCCEEDED(PTMU_GetAdapterState(&adapterConnected));
+        if (hasChargeState || hasAdapterState)
+            topBatteryCharging = charging != 0 || adapterConnected;
+        topBatteryReadAt = readNow;
+    }
+
+    u8 batteryR = topBatteryPercent >= 0 && topBatteryPercent <= 20 ? 255 : (topBatteryPercent <= 40 ? 255 : 94);
+    u8 batteryG = topBatteryPercent >= 0 && topBatteryPercent <= 20 ? 115 : (topBatteryPercent <= 40 ? 214 : 234);
+    u8 batteryB = topBatteryPercent >= 0 && topBatteryPercent <= 20 ? 115 : (topBatteryPercent <= 40 ? 102 : 212);
+    strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 242, 8, 17, 12, 218, 226, 232);
+    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 259, 11, 2, 6, 218, 226, 232);
+    if (topBatteryPercent >= 0)
+    {
+        int fillWidth = std::max(1, std::min(13, topBatteryPercent * 13 / 100));
+        fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 244, 10, fillWidth, 8, batteryR, batteryG, batteryB);
+    }
+    char batteryText[16];
+    if (topBatteryPercent >= 0)
+        snprintf(batteryText, sizeof(batteryText), "%d%%%s", topBatteryPercent, topBatteryCharging ? "+" : "");
+    else
+        snprintf(batteryText, sizeof(batteryText), "--%%");
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 266, 10, batteryText, batteryR, batteryG, batteryB);
+}
+
 static void drawTopChrome(bool connected, bool updateAvailable)
 {
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, TOP_SCREEN_H, 232, 236, 239);
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, 30, 24, 33, 38);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 10, "COLLAB DOODLE", 245, 248, 250);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 300, 10, connected ? "CONN" : "OFF", connected ? 94 : 255, connected ? 234 : 115, connected ? 212 : 115);
+    drawTopSystemStatus();
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 320, 10, connected ? "CONN" : "OFF", connected ? 94 : 255, connected ? 234 : 115, connected ? 212 : 115);
     if (updateAvailable)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 348, 10, "UP", 255, 214, 102);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 370, 10, "UP", 255, 214, 102);
 
     char version[40];
     snprintf(version, sizeof(version), "V %s", APP_BUILD_LABEL);
@@ -312,7 +374,7 @@ static void updateMinimapCache(CanvasState &canvas)
 }
 
 static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
-                                  int brushSize, int brushShape, int chatUnread)
+                                  int brushSize, int brushShape, int ticketNeedsReply, int staffChatUnread)
 {
     drawTopChrome(connected, updateAvailable);
 
@@ -343,11 +405,17 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 152, 42, 42, 32, 36, 42);
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 288, 206, "SELECT MENU", 73, 82, 92);
-    if (chatUnread > 0)
+    if (ticketNeedsReply > 0)
     {
-        fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 354, 38, 34, 20, 255, 255, 255);
-        strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 354, 38, 34, 20, 196, 92, 40);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 360, 45, "MSG", 196, 92, 40);
+        char text[16];
+        snprintf(text, sizeof(text), "TKT %d", std::min(ticketNeedsReply, 99));
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 324, 45, text, 196, 92, 40);
+    }
+    if (staffChatUnread > 0)
+    {
+        char text[16];
+        snprintf(text, sizeof(text), "CHAT %d", std::min(staffChatUnread, 99));
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 318, 63, text, 13, 122, 117);
     }
 
     if (!canvas.pixels || canvas.width <= 0 || canvas.height <= 0)
@@ -428,38 +496,41 @@ static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool up
 }
 
 static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, int selectedMenuItem,
-                                int chatUnread, bool showAdminTools)
+                                int ticketNeedsReplyCount, int staffChatUnreadCount, bool showAdminTools)
 {
-    (void)chatUnread;
+    (void)showAdminTools;
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "MAIN MENU", 32, 36, 42);
 
     const char *regularItems[] = {
         "CHANNELS",
         "CONNECTED USERS",
+        "TICKETS",
         "CONTROLS",
         "RULES / HELP",
         "STATUS",
         "IDENTITY",
         "EXIT APP",
     };
-    const char *staffItems[] = {
-        "CHANNELS",
-        "CONNECTED USERS",
-        "CONTROLS",
-        "RULES / HELP",
-        "STATUS",
-        "IDENTITY",
-        "ADMIN TOOLS",
-        "EXIT APP",
-    };
-    const char **items = showAdminTools ? staffItems : regularItems;
-    const int itemCount = showAdminTools ? (int)(sizeof(staffItems) / sizeof(staffItems[0]))
-                                         : (int)(sizeof(regularItems) / sizeof(regularItems[0]));
+    const char **items = regularItems;
+    const int itemCount = (int)(sizeof(regularItems) / sizeof(regularItems[0]));
     for (int i = 0; i < itemCount; i++)
     {
-        int y = 78 + i * 20;
+        int y = 70 + i * 18;
         drawMenuRow(y, items[i], i == selectedMenuItem);
+    }
+
+    if (ticketNeedsReplyCount > 0)
+    {
+        char ticketText[24];
+        snprintf(ticketText, sizeof(ticketText), "TKT %d NEW", std::min(ticketNeedsReplyCount, 99));
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 82, ticketText, 196, 92, 40);
+    }
+    if (staffChatUnreadCount > 0)
+    {
+        char chatText[24];
+        snprintf(chatText, sizeof(chatText), "CHAT %d NEW", std::min(staffChatUnreadCount, 99));
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 96, chatText, 13, 122, 117);
     }
 
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "CHANNEL", 73, 82, 92);
@@ -600,6 +671,182 @@ static void composeChatTopFrame(CanvasState &canvas, bool connected, bool update
     topFrameValid = true;
 }
 
+static void composeTicketsTopFrame(bool connected, bool updateAvailable,
+                                   SupportTicketSummary *tickets, int ticketCount, int ticketSelected,
+                                   int ticketView, bool staffScope, SupportTicketSummary *activeTicket,
+                                   SupportTicketMessage *messages, int messageCount,
+                                   int homeSelected, int actionSelected, bool supportOnly,
+                                   const char *supportReason, const char *notice, int needsReplyCount,
+                                   StaffChatMessage *staffMessages, int staffMessageCount, int staffChatUnread,
+                                   int restrictionSecondsRemaining, bool restrictionHasDuration)
+{
+    drawTopChrome(connected, updateAvailable);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 36, supportOnly ? "SUPPORT ACCESS" : "TICKETS", 32, 36, 42);
+    if (needsReplyCount > 0)
+    {
+        char countText[24];
+        snprintf(countText, sizeof(countText), "%d NEED REPLY", std::min(needsReplyCount, 99));
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 320, 36, countText, 196, 92, 40);
+    }
+
+    if (ticketView == 0)
+    {
+        const char *regularItems[] = { "NEW UNBAN REQUEST", "REPORT A BUG", "REQUEST A FEATURE", "MY TICKETS" };
+        const char *staffItems[] = { "NEW UNBAN REQUEST", "REPORT A BUG", "REQUEST A FEATURE", "MY TICKETS", "STAFF QUEUE", "STAFF CHAT" };
+        const char *supportItems[] = { "NEW UNBAN REQUEST", "MY UNBAN TICKETS" };
+        const char **items = supportOnly ? supportItems : (staffScope ? staffItems : regularItems);
+        int count = supportOnly ? 2 : (staffScope ? 6 : 4);
+        for (int i = 0; i < count; i++)
+            drawMenuRow(70 + i * 24, items[i], i == homeSelected);
+        if (supportOnly)
+        {
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 150, "CANVAS ACCESS IS DISABLED.", 196, 92, 40);
+            drawWrappedText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, 54, 2,
+                            supportReason && supportReason[0] ? supportReason : "Use an unban ticket to contact staff.",
+                            73, 82, 92);
+            char remaining[40];
+            if (restrictionHasDuration)
+                snprintf(remaining, sizeof(remaining), "ACCESS RETURNS IN %02dH %02dM", restrictionSecondsRemaining / 3600, (restrictionSecondsRemaining / 60) % 60);
+            else
+                snprintf(remaining, sizeof(remaining), "NO AUTOMATIC EXPIRATION");
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, remaining, 196, 92, 40);
+        }
+        drawFooterHint("A OPEN", supportOnly ? "" : "B MENU");
+    }
+    else if (ticketView == 1)
+    {
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 54, staffScope ? "STAFF QUEUE" : "MY TICKETS", 13, 122, 117);
+        for (int i = 0; tickets && i < ticketCount && i < 6; i++)
+        {
+            int y = 70 + i * 21;
+            if (i == ticketSelected)
+            {
+                fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 14, y - 3, 372, 19, 224, 242, 238);
+                strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 14, y - 3, 372, 19, 13, 122, 117);
+            }
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "#%d %s %s", tickets[i].id, tickets[i].category, tickets[i].status);
+            drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, y, prefix, 13, 122, 117);
+            char subject[25];
+            snprintf(subject, sizeof(subject), "%.24s", tickets[i].subject);
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 154, y, subject, 32, 36, 42);
+            if (staffScope)
+            {
+                char requester[13];
+                snprintf(requester, sizeof(requester), "%.12s",
+                         tickets[i].displayName[0] ? tickets[i].displayName : tickets[i].username);
+                drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 310, y, requester, 104, 114, 124);
+            }
+        }
+        if (ticketCount == 0)
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 40, 100, "NO TICKETS FOUND", 104, 114, 124);
+        drawFooterHint("A OPEN  X REFRESH  Y NEXT", "B BACK");
+    }
+    else if (ticketView == 2 && activeTicket)
+    {
+        char heading[96];
+        snprintf(heading, sizeof(heading), "#%d %s / %s", activeTicket->id, activeTicket->category, activeTicket->status);
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 54, heading, 13, 122, 117);
+        char ticketSubject[61];
+        snprintf(ticketSubject, sizeof(ticketSubject), "%.60s", activeTicket->subject);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 68, ticketSubject, 32, 36, 42);
+        if (staffScope)
+        {
+            char context[128];
+            snprintf(context, sizeof(context), "%.42s  BLOCKS: %.12s",
+                     activeTicket->banReason[0] ? activeTicket->banReason : "NO BAN REASON",
+                     activeTicket->blockTypes[0] ? activeTicket->blockTypes : "NONE");
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 82, context, 196, 92, 40);
+        }
+        const int firstY = staffScope ? 98 : 82;
+        int start = messageCount;
+        int usedHeight = 0;
+        for (int i = messageCount - 1; messages && i >= 0; i--)
+        {
+            int lines = wrappedLineCount(58, 3, messages[i].message);
+            int rowHeight = 13 + lines * 10;
+            if (usedHeight + rowHeight > 200 - firstY) break;
+            usedHeight += rowHeight;
+            start = i;
+        }
+        int y = firstY;
+        for (int i = start; messages && i < messageCount && y < 200; i++)
+        {
+            char timeText[6] = "--:--";
+            if (messages[i].createdAt[11] && messages[i].createdAt[12] && messages[i].createdAt[14] && messages[i].createdAt[15])
+                snprintf(timeText, sizeof(timeText), "%.2s:%.2s", messages[i].createdAt + 11, messages[i].createdAt + 14);
+            char author[72];
+            snprintf(author, sizeof(author), "[%s] %s  %s", messages[i].authorKind,
+                     messages[i].displayName[0] ? messages[i].displayName : "STAFF", timeText);
+            drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, y, author, 13, 122, 117);
+            int lines = wrappedLineCount(58, 3, messages[i].message);
+            drawWrappedText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 32, y + 11, 58, 3, messages[i].message, 32, 36, 42);
+            y += 13 + lines * 10;
+        }
+        bool closed = strcmp(activeTicket->status, "resolved") == 0 || strcmp(activeTicket->status, "rejected") == 0;
+        if (staffScope)
+            drawFooterHint("A REPLY  X ACTIONS", "B LIST");
+        else
+            drawFooterHint(closed ? "CLOSED" : "A REPLY", "B LIST");
+    }
+    else if (ticketView == 3 && activeTicket)
+    {
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 56, "STAFF ACTION", 13, 122, 117);
+        const char *actions[] = { "MARK IN PROGRESS", "REPLY TO USER", "RESOLVE", "REJECT", "APPROVE UNBAN", "REOPEN" };
+        for (int i = 0; i < 6; i++)
+        {
+            bool unavailable = (i == 4 && strcmp(activeTicket->category, "unban") != 0);
+            if (unavailable)
+                drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 36, 80 + i * 22, "APPROVE UNBAN (N/A)", 160, 166, 172);
+            else
+                drawMenuRow(80 + i * 22, actions[i], i == actionSelected);
+        }
+        drawFooterHint("A CONFIRM", "B THREAD");
+    }
+    else if (ticketView == 4)
+    {
+        char heading[40];
+        snprintf(heading, sizeof(heading), "STAFF CHAT%s", staffChatUnread > 0 ? " - NEW" : "");
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 54, heading, 13, 122, 117);
+        const int firstY = 70;
+        int start = staffMessageCount;
+        int usedHeight = 0;
+        for (int i = staffMessageCount - 1; staffMessages && i >= 0; i--)
+        {
+            int lines = wrappedLineCount(58, 3, staffMessages[i].message);
+            int rowHeight = 13 + lines * 10;
+            if (usedHeight + rowHeight > 200 - firstY) break;
+            usedHeight += rowHeight;
+            start = i;
+        }
+        int y = firstY;
+        for (int i = start; staffMessages && i < staffMessageCount && y < 200; i++)
+        {
+            char timeText[6] = "--:--";
+            if (staffMessages[i].createdAt[11] && staffMessages[i].createdAt[12] && staffMessages[i].createdAt[14] && staffMessages[i].createdAt[15])
+                snprintf(timeText, sizeof(timeText), "%.2s:%.2s", staffMessages[i].createdAt + 11, staffMessages[i].createdAt + 14);
+            char prefix[72];
+            const char *name = staffMessages[i].displayName[0] ? staffMessages[i].displayName : staffMessages[i].username;
+            snprintf(prefix, sizeof(prefix), "[%s] %s  %s", staffMessages[i].role, name, timeText);
+            drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, y, prefix, 13, 122, 117);
+            int lines = wrappedLineCount(58, 3, staffMessages[i].message);
+            drawWrappedText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 32, y + 11, 58, 3, staffMessages[i].message, 32, 36, 42);
+            y += 13 + lines * 10;
+        }
+        if (staffMessageCount == 0)
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 40, 100, "NO STAFF MESSAGES YET", 104, 114, 124);
+        drawFooterHint("A SEND  X REFRESH  Y OLDER", "B BACK");
+    }
+
+    if (notice && notice[0])
+    {
+        char compactNotice[61];
+        snprintf(compactNotice, sizeof(compactNotice), "%.60s", notice);
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 205, compactNotice, 196, 92, 40);
+    }
+    topFrameValid = true;
+}
+
 static void composeAdminTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
                                  const char *role, int selectedAdminItem, const char *adminNotice)
 {
@@ -659,7 +906,8 @@ static void composeIdentityTopFrame(bool connected, bool updateAvailable,
                                     const char *role, const char *status,
                                     const char *backupCode,
                                     const char *identityNotice,
-                                    const char *identityStorage)
+                                    const char *identityStorage, int restrictionSecondsRemaining,
+                                    bool restrictionHasDuration, const char *restrictionReason)
 {
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "IDENTITY", 32, 36, 42);
@@ -671,6 +919,22 @@ static void composeIdentityTopFrame(bool connected, bool updateAvailable,
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 122, role, 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 144, "STATE", 73, 82, 92);
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 144, status, 32, 36, 42);
+    bool restricted = strcmp(status, "muted") == 0 || strcmp(status, "banned") == 0;
+    if (restricted)
+    {
+        char remaining[40];
+        if (restrictionHasDuration)
+            snprintf(remaining, sizeof(remaining), "%02dH %02dM %02dS LEFT", restrictionSecondsRemaining / 3600, (restrictionSecondsRemaining / 60) % 60, restrictionSecondsRemaining % 60);
+        else
+            snprintf(remaining, sizeof(remaining), "NO AUTOMATIC EXPIRATION");
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 214, 144, remaining, 196, 92, 40);
+        if (restrictionReason && restrictionReason[0])
+        {
+            char compactReason[61];
+            snprintf(compactReason, sizeof(compactReason), "%.60s", restrictionReason);
+            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, compactReason, 196, 92, 40);
+        }
+    }
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "BACKUP", 73, 82, 92);
     if (backupCode && backupCode[0])
         drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, backupCode, 32, 36, 42);
@@ -679,8 +943,12 @@ static void composeIdentityTopFrame(bool connected, bool updateAvailable,
     if (identityStorage && identityStorage[0])
         drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 256, 166, identityStorage, 104, 114, 124);
     if (identityNotice && identityNotice[0])
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, identityNotice, 196, 92, 40);
-    else
+    {
+        char compactNotice[61];
+        snprintf(compactNotice, sizeof(compactNotice), "%.60s", identityNotice);
+        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, restricted ? 202 : 190, compactNotice, 196, 92, 40);
+    }
+    else if (!restricted)
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, "X RECOVER  Y GET CODE", 104, 114, 124);
     drawFooterHint("A EDIT NAME", "B BACK");
     topFrameValid = true;
@@ -721,8 +989,15 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
                          const char *identityStorage, int selectedAdminItem,
                          const char *adminNotice,
                          const char *rulesVersion, bool needsRulesAgreement,
-                         ChatLine *chatLines, int chatCount, int chatScroll, int chatSelected, int chatUnread,
-                         const char *chatNotice)
+                         SupportTicketSummary *tickets, int ticketCount, int ticketSelected,
+                         int ticketView, bool ticketStaffScope, SupportTicketSummary *activeTicket,
+                         SupportTicketMessage *ticketMessages, int ticketMessageCount,
+                         StaffChatMessage *staffChatMessages, int staffChatMessageCount,
+                         int ticketHomeSelected, int ticketActionSelected,
+                         bool supportOnly, const char *supportReason,
+                         const char *ticketNotice, int ticketNeedsReplyCount,
+                         int staffChatUnreadCount, int restrictionSecondsRemaining,
+                         bool restrictionHasDuration, const char *restrictionReason)
 {
     minimapFrameCounter++;
     if (mode == TOP_MODE_CANVAS && (!minimapCacheValid || minimapFrameCounter >= 15))
@@ -736,23 +1011,27 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
     else if (mode == TOP_MODE_CONTROLS)
         composeControlsTopFrame(canvas, connected, updateAvailable);
     else if (mode == TOP_MODE_MENU)
-        composeMenuTopFrame(canvas, connected, updateAvailable, selectedMenuItem, chatUnread,
+        composeMenuTopFrame(canvas, connected, updateAvailable, selectedMenuItem, ticketNeedsReplyCount, staffChatUnreadCount,
                             role && (strcmp(role, "mod") == 0 || strcmp(role, "admin") == 0));
     else if (mode == TOP_MODE_USERS)
         composeUsersTopFrame(canvas, connected, updateAvailable, users, userCount);
     else if (mode == TOP_MODE_RULES)
         composeRulesTopFrame(connected, updateAvailable, rulesVersion, needsRulesAgreement);
-    else if (mode == TOP_MODE_CHAT)
-        composeChatTopFrame(canvas, connected, updateAvailable, chatLines, chatCount, chatScroll, chatSelected, chatUnread, chatNotice);
+    else if (mode == TOP_MODE_TICKETS)
+        composeTicketsTopFrame(connected, updateAvailable, tickets, ticketCount, ticketSelected,
+                               ticketView, ticketStaffScope, activeTicket, ticketMessages, ticketMessageCount,
+                               ticketHomeSelected, ticketActionSelected, supportOnly, supportReason,
+                               ticketNotice, ticketNeedsReplyCount, staffChatMessages, staffChatMessageCount,
+                               staffChatUnreadCount, restrictionSecondsRemaining, restrictionHasDuration);
     else if (mode == TOP_MODE_ADMIN)
         composeAdminTopFrame(canvas, connected, updateAvailable, role, selectedAdminItem, adminNotice);
     else if (mode == TOP_MODE_STATUS)
         composeStatusTopFrame(canvas, connected, updateAvailable);
     else if (mode == TOP_MODE_IDENTITY)
         composeIdentityTopFrame(connected, updateAvailable, displayName, username, role, status, backupCode,
-                                identityNotice, identityStorage);
+                                identityNotice, identityStorage, restrictionSecondsRemaining, restrictionHasDuration, restrictionReason);
     else
-        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape, chatUnread);
+        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape, ticketNeedsReplyCount, staffChatUnreadCount);
 }
 
 void Renderer::presentTopFrame()

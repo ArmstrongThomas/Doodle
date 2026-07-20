@@ -211,9 +211,24 @@ bool NetworkManager::readLine(int s, char* buffer, size_t maxlen) {
         buffer[pos++] = c;
     }
 
+    // Drain an oversized line so the following read starts on a JSON boundary.
+    while (c != '\n') {
+        if (!waitForSocket(s, false, IO_TIMEOUT_MS)) {
+            fcntl(s, F_SETFL, flags);
+            buffer[0] = '\0';
+            return false;
+        }
+        int ret = recv(s, &c, 1, 0);
+        if (ret <= 0) {
+            fcntl(s, F_SETFL, flags);
+            buffer[0] = '\0';
+            return false;
+        }
+    }
     fcntl(s, F_SETFL, flags);
-    buffer[pos] = '\0';
-    return true;
+    buffer[0] = '\0';
+    errno = EMSGSIZE;
+    return false;
 }
 
 bool NetworkManager::readExact(int s, void* buf, size_t length) {
