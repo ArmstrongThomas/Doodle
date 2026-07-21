@@ -288,7 +288,11 @@ bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, cons
     char request[224];
     snprintf(request, sizeof(request), "GET /api/updates/latest?package=%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
              cleanPackage, serverDomain);
-    send(sock, request, strlen(request), 0);
+    if (!NetworkManager::sendAll(sock, request, strlen(request)))
+    {
+        close(sock);
+        return false;
+    }
 
     char response[8192];
     int responseLen = 0;
@@ -542,7 +546,11 @@ UpdateDownloadResult Updater::downloadUpdate(const char *serverDomain, const cha
 
     char request[320];
     snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, serverDomain);
-    send(sock, request, strlen(request), 0);
+    if (!NetworkManager::sendAll(sock, request, strlen(request)))
+    {
+        close(sock);
+        return UPDATE_DOWNLOAD_FAILED;
+    }
 
     FILE *file = fopen(partPath, "wb");
     if (!file)

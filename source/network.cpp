@@ -185,6 +185,41 @@ bool NetworkManager::ensureConnected() {
     return true;
 }
 
+bool NetworkManager::sendAll(int s, const void* buffer, size_t length) {
+    if (s < 0 || (!buffer && length > 0)) return false;
+
+    const char* bytes = static_cast<const char*>(buffer);
+    size_t sent = 0;
+    const u64 deadline = osGetTime() + IO_TIMEOUT_MS;
+    while (sent < length) {
+        int result = send(s, bytes + sent, length - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (result > 0) {
+            sent += (size_t)result;
+            continue;
+        }
+        if (result == 0) return false;
+
+        int sendError = errno;
+        if (sendError == EINTR) continue;
+        if (result != SOC_IN_PROGRESS && sendError != EAGAIN && sendError != EWOULDBLOCK &&
+            sendError != EINPROGRESS) {
+            return false;
+        }
+
+        u64 now = osGetTime();
+        if (now >= deadline) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+        int remainingMs = (int)(deadline - now);
+        if (!waitForSocket(s, true, remainingMs)) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool NetworkManager::readLine(int s, char* buffer, size_t maxlen) {
     if (!checkConnection()) return false;
 

@@ -130,6 +130,8 @@ bool Protocol::parsePresence(const char *line, PresenceUser *users, int maxUsers
         jsonString(ptr, "\"displayName\":\"", users[count].displayName, sizeof(users[count].displayName));
         jsonString(ptr, "\"role\":\"", users[count].role, sizeof(users[count].role));
         jsonString(ptr, "\"status\":\"", users[count].status, sizeof(users[count].status));
+        jsonString(ptr, "\"deviceModel\":\"", users[count].deviceModel, sizeof(users[count].deviceModel));
+        jsonString(ptr, "\"deviceModelLabel\":\"", users[count].deviceModelLabel, sizeof(users[count].deviceModelLabel));
         users[count].muteSecondsRemaining = jsonInt(ptr, "\"muteSecondsRemaining\":");
         users[count].banSecondsRemaining = jsonInt(ptr, "\"banSecondsRemaining\":");
         if (!users[count].displayName[0])
@@ -138,6 +140,9 @@ bool Protocol::parsePresence(const char *line, PresenceUser *users, int maxUsers
             snprintf(users[count].role, sizeof(users[count].role), "user");
         if (!users[count].status[0])
             snprintf(users[count].status, sizeof(users[count].status), "active");
+        if (!users[count].deviceModelLabel[0])
+            snprintf(users[count].deviceModelLabel, sizeof(users[count].deviceModelLabel),
+                     "%s", users[count].deviceModel[0] ? users[count].deviceModel : "Unknown");
         count++;
         ptr += strlen("\"id\":\"");
     }
@@ -192,6 +197,31 @@ bool Protocol::parseRulesRequired(const char *line, char *version, size_t versio
     jsonString(line, "\"version\":\"", version, versionSize);
     if (version && versionSize > 0 && !version[0])
         snprintf(version, versionSize, "1");
+    return true;
+}
+
+bool Protocol::parseRulesRejected(const char *line, char *reason, size_t reasonSize,
+                                  char *version, size_t versionSize)
+{
+    if (!line || !strstr(line, "\"type\":\"rulesRejected\""))
+        return false;
+    jsonString(line, "\"reason\":\"", reason, reasonSize);
+    jsonString(line, "\"version\":\"", version, versionSize);
+    if (reason && reasonSize > 0 && !reason[0])
+        snprintf(reason, reasonSize, "rules-rejected");
+    return true;
+}
+
+bool Protocol::parseOnboardingState(const char *line, bool &needsDisplayName, bool &needsRules,
+                                    char *rulesVersion, size_t rulesVersionSize)
+{
+    if (!line || !strstr(line, "\"type\":\"onboardingState\""))
+        return false;
+    needsDisplayName = strstr(line, "\"needsDisplayName\":true") != NULL;
+    needsRules = strstr(line, "\"needsRules\":true") != NULL;
+    jsonString(line, "\"rulesVersion\":\"", rulesVersion, rulesVersionSize);
+    if (rulesVersion && rulesVersionSize > 0 && !rulesVersion[0])
+        snprintf(rulesVersion, rulesVersionSize, "1");
     return true;
 }
 
@@ -383,15 +413,17 @@ bool Protocol::parseStaffChatResult(const char *line, bool &ok, char *error, siz
 }
 
 void Protocol::buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
-                          const char *deviceId, const char *deviceSecret, const char *hardwareId,
+                          const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
                           const char *displayName, const char *packageType)
 {
     snprintf(buffer, size,
              "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":5,\"updaterSupported\":%s,"
-             "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\",\"displayName\":\"%s\"}\n",
+             "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\","
+             "\"deviceModel\":\"%s\",\"displayName\":\"%s\"}\n",
              appId, version, updaterSupported ? "true" : "false",
              packageType ? packageType : "3dsx",
              deviceId ? deviceId : "", deviceSecret ? deviceSecret : "", hardwareId ? hardwareId : "",
+             deviceModel ? deviceModel : "3ds-family",
              displayName ? displayName : "3DS User");
 }
 
@@ -412,6 +444,11 @@ void Protocol::buildRulesAccepted(char *buffer, size_t size, const char *version
     char safeVersion[32];
     jsonSafeString(version, safeVersion, sizeof(safeVersion));
     snprintf(buffer, size, "{\"type\":\"rulesAccepted\",\"version\":\"%s\"}\n", safeVersion[0] ? safeVersion : "1");
+}
+
+void Protocol::buildGetOnboardingState(char *buffer, size_t size)
+{
+    snprintf(buffer, size, "{\"type\":\"getOnboardingState\"}\n");
 }
 
 void Protocol::buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,

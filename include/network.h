@@ -26,6 +26,7 @@ private:
 public:
     static bool initialize();
     static void shutdown();
+    static bool sendAll(int s, const void *buffer, size_t length);
     static bool readLine(int s, char *buffer, size_t maxlen);
     static bool readExact(int s, void *buf, size_t length);
     static int getSocket() { return sock; }

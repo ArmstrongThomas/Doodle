@@ -42,6 +42,7 @@ struct DeviceIdentity {
 
 static DeviceIdentity gIdentity = {{0}, {0}, "3DS User", "pending", "", ""};
 static char gHardwareId[32] = "";
+static char gDeviceModel[24] = "3ds-family";
 static char gIdentityStorageStatus[64] = "STORE UNKNOWN";
 static char gIdentityBootStatus[64] = "BOOT UNKNOWN";
 static const char *IDENTITY_PRIMARY_PATH = "sdmc:/3ds/CollabDoodle/identity.txt";
@@ -51,14 +52,30 @@ static int gLastFallbackReadErr = 0;
 static char gRequiredRulesVersion[32] = "";
 static bool gNeedsDisplayName = false;
 static bool gNeedsRules = false;
+
+enum OnboardingStage
+{
+    ONBOARDING_READY = 0,
+    ONBOARDING_WAITING_DISPLAY_NAME,
+    ONBOARDING_SUBMITTING_DISPLAY_NAME,
+    ONBOARDING_WAITING_RULES,
+    ONBOARDING_SUBMITTING_RULES
+};
+
 static char gDisconnectReason[80] = "";
 static volatile bool gAptResumeRequested = false;
+static volatile bool gAptWentToSleep = false;
 static const size_t CONTROL_LINE_CAPACITY = 2048;
 
 static void handleAptEvent(APT_HookType hook, void *)
 {
-    if (hook == APTHOOK_ONRESTORE || hook == APTHOOK_ONWAKEUP)
+    if (hook == APTHOOK_ONSLEEP)
+        gAptWentToSleep = true;
+    else if (hook == APTHOOK_ONWAKEUP && gAptWentToSleep)
+    {
+        gAptWentToSleep = false;
         gAptResumeRequested = true;
+    }
 }
 
 struct ActiveDrawLabel {
@@ -88,13 +105,30 @@ static void seedRandom()
 static void initHardwareId()
 {
     u64 hash = 0;
-    Result rc = cfguInit();
-    if (R_SUCCEEDED(rc))
+    Result cfgResult = cfguInit();
+    Result hashResult = cfgResult;
+    if (R_SUCCEEDED(cfgResult))
     {
-        rc = CFGU_GenHashConsoleUnique(0xC011AB00, &hash);
+        hashResult = CFGU_GenHashConsoleUnique(0xC011AB00, &hash);
+        u8 model = 0xFF;
+        if (R_SUCCEEDED(CFGU_GetSystemModel(&model)))
+        {
+            const char *modelName = "3ds-family";
+            switch (model)
+            {
+                case CFG_MODEL_3DS: modelName = "3ds"; break;
+                case CFG_MODEL_3DSXL: modelName = "3ds-xl"; break;
+                case CFG_MODEL_N3DS: modelName = "new-3ds"; break;
+                case CFG_MODEL_2DS: modelName = "2ds"; break;
+                case CFG_MODEL_N3DSXL: modelName = "new-3ds-xl"; break;
+                case CFG_MODEL_N2DSXL: modelName = "new-2ds-xl"; break;
+                default: break;
+            }
+            snprintf(gDeviceModel, sizeof(gDeviceModel), "%s", modelName);
+        }
         cfguExit();
     }
-    if (R_SUCCEEDED(rc) && hash != 0)
+    if (R_SUCCEEDED(hashResult) && hash != 0)
     {
         snprintf(gHardwareId, sizeof(gHardwareId), "3ds-hw-%016llX", (unsigned long long)hash);
     }
@@ -341,10 +375,11 @@ static const char *updateTargetPathForPackage(const char *packageType, const cha
 
 static bool sendClientHello(int sock, const char *packageType)
 {
-    char hello[384];
+    char hello[512];
     Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true,
-                         gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId, gIdentity.displayName, packageType);
-    return sock >= 0 && send(sock, hello, strlen(hello), 0) > 0;
+                         gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId, gDeviceModel,
+                         gIdentity.displayName, packageType);
+    return sock >= 0 && NetworkManager::sendAll(sock, hello, strlen(hello));
 }
 
 static void putPixel(u8 *fb, int width, int height, int x, int y, u8 r, u8 g, u8 b)
@@ -1167,7 +1202,11 @@ static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint> &points,
             *(uint16_t *)(packet + 9 + i * 4) = points[start + i].y;
         }
 
-        send(sock, packet, 7 + count * 4, 0);
+        if (!NetworkManager::sendAll(sock, packet, 7 + count * 4))
+        {
+            printf("Failed to send draw batch.\n");
+            return;
+        }
 
         if (start + count >= points.size())
             break;
@@ -1316,7 +1355,7 @@ void handleHexColorInput()
     }
 }
 
-static bool editDisplayName(int sock, IdentityInfo &identityInfo)
+static bool promptDisplayName(IdentityInfo &identityInfo, char *displayName, size_t displayNameSize)
 {
     SwkbdState swkbd;
     char inputText[25];
@@ -1333,9 +1372,10 @@ static bool editDisplayName(int sock, IdentityInfo &identityInfo)
     if (!inputText[0])
         return false;
 
-    char command[96];
-    Protocol::buildSetDisplayName(command, sizeof(command), inputText);
-    return sock >= 0 && send(sock, command, strlen(command), 0) > 0;
+    if (!displayName || displayNameSize == 0)
+        return false;
+    snprintf(displayName, displayNameSize, "%s", inputText);
+    return true;
 }
 
 static bool readKeyboardText(const char *hint, char *out, size_t outSize, const char *initial = "")
@@ -1359,7 +1399,7 @@ static bool requestBackupCode(int sock)
         return false;
     char command[48];
     Protocol::buildRotateBackupCode(command, sizeof(command));
-    return send(sock, command, strlen(command), 0) > 0;
+    return NetworkManager::sendAll(sock, command, strlen(command));
 }
 
 static bool recoverIdentity(int sock)
@@ -1377,16 +1417,7 @@ static bool recoverIdentity(int sock)
     char command[280];
     Protocol::buildRecoverIdentity(command, sizeof(command), username, backupCode,
                                    gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId);
-    return send(sock, command, strlen(command), 0) > 0;
-}
-
-static bool acceptRules(int sock, const char *version)
-{
-    if (sock < 0)
-        return false;
-    char command[96];
-    Protocol::buildRulesAccepted(command, sizeof(command), version && version[0] ? version : "1");
-    return send(sock, command, strlen(command), 0) > 0;
+    return NetworkManager::sendAll(sock, command, strlen(command));
 }
 
 static void applyIdentityAccepted(const IdentityInfo &identityInfo)
@@ -1430,6 +1461,7 @@ int main(int argc, char **argv)
     printf("3DS Collab Doodle\n");
     printf("Package: %s\n", packageType);
     initHardwareId();
+    printf("Device model: %s\n", gDeviceModel);
     loadDeviceIdentity();
     printf("Identity: %s\n", gIdentity.deviceId);
     printf("Hardware: %s\n", gHardwareId);
@@ -1561,6 +1593,14 @@ int main(int argc, char **argv)
     ActiveDrawLabel activeDrawLabels[MAX_ACTIVE_DRAW_LABELS];
     memset(activeDrawLabels, 0, sizeof(activeDrawLabels));
     bool exitRequested = false;
+    OnboardingStage onboardingStage = ONBOARDING_READY;
+    u64 onboardingSubmissionStartedAt = 0;
+    bool onboardingStateQuerySent = false;
+    int onboardingRetryCount = 0;
+    char pendingDisplayName[25] = "";
+    char pendingRulesVersion[32] = "";
+    bool rulesRequireFreshAPress = false;
+    bool rulesRenderedSinceKeyboard = false;
 
     auto isModOrAdmin = [&]() -> bool
     {
@@ -1588,6 +1628,66 @@ int main(int argc, char **argv)
         topRenderFrame = 10;
     };
 
+    auto clearOnboardingSubmission = [&]()
+    {
+        onboardingSubmissionStartedAt = 0;
+        onboardingStateQuerySent = false;
+        onboardingRetryCount = 0;
+    };
+
+    auto beginOnboardingSubmission = [&](OnboardingStage stage)
+    {
+        onboardingStage = stage;
+        onboardingSubmissionStartedAt = osGetTime();
+        onboardingStateQuerySent = false;
+        onboardingRetryCount = 0;
+    };
+
+    auto sendDisplayNameValue = [&](const char *displayName) -> bool
+    {
+        if (!displayName || !displayName[0] || NetworkManager::getSocket() < 0)
+            return false;
+        char command[96];
+        Protocol::buildSetDisplayName(command, sizeof(command), displayName);
+        return NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command));
+    };
+
+    auto sendRulesValue = [&](const char *version) -> bool
+    {
+        if (!version || !version[0] || NetworkManager::getSocket() < 0)
+            return false;
+        char command[96];
+        Protocol::buildRulesAccepted(command, sizeof(command), version);
+        return NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command));
+    };
+
+    auto requestOnboardingState = [&]() -> bool
+    {
+        if (NetworkManager::getSocket() < 0)
+            return false;
+        char command[64];
+        Protocol::buildGetOnboardingState(command, sizeof(command));
+        return NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command));
+    };
+
+    auto retryPendingOnboardingSubmission = [&]() -> bool
+    {
+        if (onboardingRetryCount >= 1)
+            return false;
+
+        bool sent = false;
+        if (onboardingStage == ONBOARDING_SUBMITTING_DISPLAY_NAME)
+            sent = sendDisplayNameValue(pendingDisplayName);
+        else if (onboardingStage == ONBOARDING_SUBMITTING_RULES)
+            sent = sendRulesValue(pendingRulesVersion);
+        if (!sent)
+            return false;
+
+        onboardingRetryCount++;
+        setIdentityNotice(onboardingStage == ONBOARDING_SUBMITTING_DISPLAY_NAME ? "RETRYING NAME" : "RETRYING RULES");
+        return true;
+    };
+
     auto sendTicketCommand = [&](const char *command) -> bool
     {
         if (!command || !command[0] || !NetworkManager::checkConnection())
@@ -1595,37 +1695,11 @@ int main(int argc, char **argv)
             setTicketNotice("TICKET CONNECTION FAILED");
             return false;
         }
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        if (!NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command)))
         {
             setTicketNotice("TICKET SEND FAILED");
             return false;
         }
-        return true;
-    };
-
-    auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
-    {
-        if (!isModOrAdmin())
-        {
-            setAdminNotice("MOD OR ADMIN REQUIRED");
-            return false;
-        }
-        if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
-        {
-            setAdminNotice("CONNECTION FAILED");
-            return false;
-        }
-
-        char command[256];
-        Protocol::buildAdminCanvasCommand(command, sizeof(command), action, canvas.channel[0] ? canvas.channel : "main",
-                                          x, y, w, h, color.r, color.g, color.b);
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
-        {
-            setAdminNotice("SEND FAILED");
-            return false;
-        }
-        setAdminNotice("COMMAND SENT");
         return true;
     };
 
@@ -1842,6 +1916,90 @@ int main(int argc, char **argv)
             topRenderFrame = 10;
             return true;
         }
+        bool authoritativeNeedsDisplayName = false;
+        bool authoritativeNeedsRules = false;
+        char authoritativeRulesVersion[32] = "";
+        if (Protocol::parseOnboardingState(jsonLine, authoritativeNeedsDisplayName, authoritativeNeedsRules,
+                                           authoritativeRulesVersion, sizeof(authoritativeRulesVersion)))
+        {
+            OnboardingStage previousStage = onboardingStage;
+            gNeedsDisplayName = authoritativeNeedsDisplayName;
+            gNeedsRules = authoritativeNeedsRules;
+            if (authoritativeRulesVersion[0])
+                snprintf(gRequiredRulesVersion, sizeof(gRequiredRulesVersion), "%s", authoritativeRulesVersion);
+
+            u64 submissionElapsed = onboardingSubmissionStartedAt > 0
+                                        ? osGetTime() - onboardingSubmissionStartedAt
+                                        : 0;
+            if (gNeedsDisplayName)
+            {
+                topMode = TOP_MODE_IDENTITY;
+                if (previousStage == ONBOARDING_SUBMITTING_DISPLAY_NAME)
+                {
+                    onboardingStage = ONBOARDING_SUBMITTING_DISPLAY_NAME;
+                    if (onboardingStateQuerySent && submissionElapsed >= 5000 && onboardingRetryCount == 0 &&
+                        !retryPendingOnboardingSubmission())
+                    {
+                        onboardingStage = ONBOARDING_WAITING_DISPLAY_NAME;
+                        clearOnboardingSubmission();
+                        setIdentityNotice("SEND FAILED - PRESS A TO RETRY");
+                    }
+                }
+                else
+                {
+                    onboardingStage = ONBOARDING_WAITING_DISPLAY_NAME;
+                    clearOnboardingSubmission();
+                }
+            }
+            else if (gNeedsRules)
+            {
+                if (previousStage == ONBOARDING_SUBMITTING_DISPLAY_NAME && pendingDisplayName[0])
+                {
+                    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", pendingDisplayName);
+                    snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", pendingDisplayName);
+                    saveDeviceIdentity();
+                    setIdentityNotice("NAME SAVED");
+                }
+                topMode = TOP_MODE_RULES;
+                if (previousStage == ONBOARDING_SUBMITTING_RULES)
+                {
+                    onboardingStage = ONBOARDING_SUBMITTING_RULES;
+                    if (onboardingStateQuerySent && submissionElapsed >= 5000 && onboardingRetryCount == 0 &&
+                        !retryPendingOnboardingSubmission())
+                    {
+                        onboardingStage = ONBOARDING_WAITING_RULES;
+                        clearOnboardingSubmission();
+                        setIdentityNotice("SEND FAILED - PRESS A TO RETRY");
+                    }
+                }
+                else
+                {
+                    onboardingStage = ONBOARDING_WAITING_RULES;
+                    clearOnboardingSubmission();
+                }
+            }
+            else
+            {
+                if (previousStage == ONBOARDING_SUBMITTING_DISPLAY_NAME && pendingDisplayName[0])
+                {
+                    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", pendingDisplayName);
+                    snprintf(gIdentity.displayName, sizeof(gIdentity.displayName), "%s", pendingDisplayName);
+                    setIdentityNotice("NAME SAVED");
+                }
+                else if (previousStage == ONBOARDING_SUBMITTING_RULES)
+                    setIdentityNotice("RULES ACCEPTED");
+                if (authoritativeRulesVersion[0])
+                    snprintf(gIdentity.rulesAcceptedVersion, sizeof(gIdentity.rulesAcceptedVersion), "%s", authoritativeRulesVersion);
+                saveDeviceIdentity();
+                onboardingStage = ONBOARDING_READY;
+                clearOnboardingSubmission();
+                rulesRequireFreshAPress = false;
+                if (topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_RULES)
+                    topMode = TOP_MODE_CANVAS;
+            }
+            topRenderFrame = 10;
+            return true;
+        }
         if (Protocol::parseIdentityAccepted(jsonLine, identityInfo))
         {
             applyIdentityAccepted(identityInfo);
@@ -1869,13 +2027,14 @@ int main(int argc, char **argv)
                     ticketHomeSelected = 0;
                 }
             }
-            gNeedsDisplayName = false;
             setIdentityNotice("ACCOUNT OK");
             return true;
         }
         if (strstr(jsonLine, "\"type\":\"identityNeedsDisplayName\""))
         {
             gNeedsDisplayName = true;
+            if (onboardingStage != ONBOARDING_SUBMITTING_DISPLAY_NAME)
+                onboardingStage = ONBOARDING_WAITING_DISPLAY_NAME;
             topMode = TOP_MODE_IDENTITY;
             setIdentityNotice("CHOOSE A NAME");
             return true;
@@ -1883,6 +2042,8 @@ int main(int argc, char **argv)
         if (Protocol::parseDisplayNameRejected(jsonLine, rejectionReason, sizeof(rejectionReason)))
         {
             gNeedsDisplayName = true;
+            onboardingStage = ONBOARDING_WAITING_DISPLAY_NAME;
+            clearOnboardingSubmission();
             topMode = TOP_MODE_IDENTITY;
             if (strcmp(rejectionReason, "display-name-taken") == 0)
                 setIdentityNotice("NAME TAKEN");
@@ -1895,13 +2056,39 @@ int main(int argc, char **argv)
         if (strstr(jsonLine, "\"type\":\"displayNameChanged\""))
         {
             gNeedsDisplayName = false;
+            onboardingStage = gNeedsRules ? ONBOARDING_WAITING_RULES : ONBOARDING_READY;
+            clearOnboardingSubmission();
             setIdentityNotice("NAME SAVED");
+            return true;
+        }
+        char rulesRejectedReason[48] = "";
+        char rejectedRulesVersion[32] = "";
+        if (Protocol::parseRulesRejected(jsonLine, rulesRejectedReason, sizeof(rulesRejectedReason),
+                                         rejectedRulesVersion, sizeof(rejectedRulesVersion)))
+        {
+            if (rejectedRulesVersion[0])
+                snprintf(gRequiredRulesVersion, sizeof(gRequiredRulesVersion), "%s", rejectedRulesVersion);
+            gNeedsRules = true;
+            onboardingStage = ONBOARDING_WAITING_RULES;
+            clearOnboardingSubmission();
+            topMode = TOP_MODE_RULES;
+            if (strcmp(rulesRejectedReason, "display-name-required") == 0 ||
+                strcmp(rulesRejectedReason, "name-required") == 0)
+                setIdentityNotice("CHOOSE A NAME FIRST");
+            else if (strcmp(rulesRejectedReason, "wrong-version") == 0 ||
+                     strcmp(rulesRejectedReason, "invalid-version") == 0 ||
+                     strcmp(rulesRejectedReason, "rules-version-mismatch") == 0)
+                setIdentityNotice("RULES CHANGED - REVIEW AGAIN");
+            else
+                setIdentityNotice("RULES NOT ACCEPTED - PRESS A TO RETRY");
             return true;
         }
         if (Protocol::parseRulesRequired(jsonLine, gateVersion, sizeof(gateVersion)))
         {
             snprintf(gRequiredRulesVersion, sizeof(gRequiredRulesVersion), "%s", gateVersion[0] ? gateVersion : "1");
             gNeedsRules = true;
+            if (onboardingStage != ONBOARDING_SUBMITTING_RULES)
+                onboardingStage = ONBOARDING_WAITING_RULES;
             topMode = TOP_MODE_RULES;
             topRenderFrame = 10;
             return true;
@@ -1913,6 +2100,9 @@ int main(int argc, char **argv)
             if (gRequiredRulesVersion[0])
                 snprintf(gIdentity.rulesAcceptedVersion, sizeof(gIdentity.rulesAcceptedVersion), "%s", gRequiredRulesVersion);
             gNeedsRules = false;
+            onboardingStage = gNeedsDisplayName ? ONBOARDING_WAITING_DISPLAY_NAME : ONBOARDING_READY;
+            clearOnboardingSubmission();
+            rulesRequireFreshAPress = false;
             saveDeviceIdentity();
             setIdentityNotice("RULES OK");
             topMode = TOP_MODE_CANVAS;
@@ -2074,7 +2264,10 @@ int main(int argc, char **argv)
     float lastStrokeX = 0.0f;
     float lastStrokeY = 0.0f;
     bool hasLastStrokePoint = false;
-    std::string controlReceiveBuffer;
+    std::vector<uint8_t> realtimeReceiveBuffer;
+    CanvasMeta realtimeCanvasMeta;
+    memset(&realtimeCanvasMeta, 0, sizeof(realtimeCanvasMeta));
+    bool realtimeCanvasPending = false;
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
@@ -2153,7 +2346,8 @@ int main(int argc, char **argv)
     {
         bool wasSupportOnly = supportOnlyMode;
         supportOnlyMode = false;
-        controlReceiveBuffer.clear();
+        realtimeReceiveBuffer.clear();
+        realtimeCanvasPending = false;
         UIState::clearPoints();
         if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))
         {
@@ -2178,6 +2372,31 @@ int main(int argc, char **argv)
         return true;
     };
 
+    auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
+    {
+        if (!isModOrAdmin())
+        {
+            setAdminNotice("MOD OR ADMIN REQUIRED");
+            return false;
+        }
+        if (!NetworkManager::checkConnection() && !reconnectSession("admin-reconnect"))
+        {
+            setAdminNotice("CONNECTION FAILED");
+            return false;
+        }
+
+        char command[256];
+        Protocol::buildAdminCanvasCommand(command, sizeof(command), action, canvas.channel[0] ? canvas.channel : "main",
+                                          x, y, w, h, color.r, color.g, color.b);
+        if (!NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command)))
+        {
+            setAdminNotice("SEND FAILED");
+            return false;
+        }
+        setAdminNotice("COMMAND SENT");
+        return true;
+    };
+
     auto switchToSelectedChannel = [&]() -> bool
     {
         if (availableChannelCount <= 0)
@@ -2187,8 +2406,7 @@ int main(int argc, char **argv)
         if (strcmp(canvas.channel, availableChannels[selectedChannel]) == 0)
             return true;
 
-        if (!NetworkManager::checkConnection() &&
-            (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)))
+        if (!NetworkManager::checkConnection() && !reconnectSession("channel-reconnect"))
         {
             printf("Cannot switch channel - connection failed.\n");
             return false;
@@ -2196,49 +2414,17 @@ int main(int argc, char **argv)
 
         char command[96];
         Protocol::buildSwitchChannel(command, sizeof(command), availableChannels[selectedChannel]);
-        if (send(NetworkManager::getSocket(), command, strlen(command), 0) <= 0)
+        if (!NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command)))
         {
             printf("Failed to request channel switch.\n");
             return false;
         }
 
         printf("Switching to channel %s...\n", availableChannels[selectedChannel]);
-        char response[CONTROL_LINE_CAPACITY];
-        CanvasMeta meta;
-        if (!NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response)) ||
-            !Protocol::parseCanvasMeta(response, meta))
-        {
-            printf("Channel switch response was invalid.\n");
-            return false;
-        }
-
-        u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
-        if (!compressedCanvas)
-        {
-            printf("Failed to allocate channel canvas.\n");
-            return false;
-        }
-
-        bool switched = false;
-        if (NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, meta.compressedSize))
-        {
-            canvasWidth = meta.width;
-            canvasHeight = meta.height;
-            canvas.setChannel(meta.channel);
-            if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
-            {
-                fullCanvas = canvas.pixels;
-                offsetX = offsetY = 0;
-                clampOffsets(offsetX, offsetY);
-                Renderer::invalidateMinimap();
-                printf("Switched to %s.\n", canvas.channel);
-                switched = true;
-            }
-        }
-
-        free(compressedCanvas);
-        syncSelectedChannel();
-        return switched;
+        // The response is consumed by the buffered realtime stream parser. TCP
+        // may combine gate JSON, drawing packets, and canvas metadata in one
+        // recv(), so reading a single line synchronously here is not safe.
+        return true;
     };
 
     syncSelectedChannel();
@@ -2251,6 +2437,28 @@ int main(int argc, char **argv)
         {
             setAdminNotice("WAKING - CHECKING VERSION");
             reconnectSession("wake");
+        }
+        if ((onboardingStage == ONBOARDING_SUBMITTING_DISPLAY_NAME ||
+             onboardingStage == ONBOARDING_SUBMITTING_RULES) &&
+            onboardingSubmissionStartedAt > 0)
+        {
+            u64 elapsed = osGetTime() - onboardingSubmissionStartedAt;
+            if (elapsed >= 10000)
+            {
+                bool nameSubmission = onboardingStage == ONBOARDING_SUBMITTING_DISPLAY_NAME;
+                onboardingStage = nameSubmission ? ONBOARDING_WAITING_DISPLAY_NAME : ONBOARDING_WAITING_RULES;
+                clearOnboardingSubmission();
+                setIdentityNotice("NO RESPONSE - PRESS A TO RETRY");
+                topMode = nameSubmission ? TOP_MODE_IDENTITY : TOP_MODE_RULES;
+            }
+            else if (elapsed >= 5000 && !onboardingStateQuerySent)
+            {
+                onboardingStateQuerySent = true;
+                if (requestOnboardingState())
+                    setIdentityNotice("CHECKING ACCOUNT STATE");
+                else
+                    setIdentityNotice("CHECK FAILED - PRESS A TO RETRY");
+            }
         }
         if (restrictionActive && restrictionHasDuration)
         {
@@ -2277,16 +2485,32 @@ int main(int argc, char **argv)
         hidTouchRead(&touch);
         hidCircleRead(&circle);
 
+        if (rulesRequireFreshAPress && topMode == TOP_MODE_RULES &&
+            rulesRenderedSinceKeyboard && !(kHeld & KEY_A))
+        {
+            rulesRequireFreshAPress = false;
+        }
+
         if (kDown & KEY_SELECT)
         {
-            topMode = supportOnlyMode ? TOP_MODE_TICKETS : TOP_MODE_MENU;
-            if (supportOnlyMode)
+            if (gNeedsDisplayName)
             {
+                topMode = TOP_MODE_IDENTITY;
+                setIdentityNotice("CHOOSE A NAME");
+            }
+            else if (gNeedsRules)
+                topMode = TOP_MODE_RULES;
+            else if (supportOnlyMode)
+            {
+                topMode = TOP_MODE_TICKETS;
                 ticketView = 0;
                 ticketHomeSelected = 0;
             }
             else
+            {
+                topMode = TOP_MODE_MENU;
                 selectedMenuItem = 0;
+            }
             topRenderFrame = 10;
             continue;
         }
@@ -2294,69 +2518,17 @@ int main(int argc, char **argv)
         if (!supportOnlyMode && (kDown & KEY_START))
         {
             printf("Refreshing canvas from server...\n");
-            if (!NetworkManager::checkConnection() &&
-                (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))) {
+            if (!NetworkManager::checkConnection() && !reconnectSession("refresh-reconnect")) {
                 printf("Cannot refresh canvas - connection failed!\n");
                 continue;
             }
 
             char request[] = "getCanvas\n";
-            if (send(NetworkManager::getSocket(), request, strlen(request), 0) <= 0) {
-                printf("Failed to send refresh request. Attempting to reconnect...\n");
-                if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)) {
-                    printf("Reconnection failed. Please try again later.\n");
-                    continue;
-                }
-                // Retry sending after reconnection
-                if (send(NetworkManager::getSocket(), request, strlen(request), 0) <= 0) {
-                    printf("Failed to send refresh request even after reconnection.\n");
-                    continue;
-                }
-            }
-
-            char response[CONTROL_LINE_CAPACITY];
-            if (!NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response))) {
-                printf("Failed to read server response.\n");
+            if (!NetworkManager::sendAll(NetworkManager::getSocket(), request, strlen(request))) {
+                printf("Failed to send refresh request.\n");
                 continue;
             }
-
-            CanvasMeta refreshMeta;
-            if (!Protocol::parseCanvasMeta(response, refreshMeta)) {
-                printf("Invalid response format from server: %s\n", response);
-                continue;
-            }
-
-            int compressedSize = refreshMeta.compressedSize;
-            if (compressedSize <= 0 || compressedSize > 10000000) { // Sanity check for size
-                printf("Invalid compressed size: %d\n", compressedSize);
-                continue;
-            }
-
-            u8 *compressedCanvas = (u8 *)malloc(compressedSize);
-            if (!compressedCanvas) {
-                printf("Failed to allocate memory for compressed canvas.\n");
-                continue;
-            }
-
-            bool success = false;
-            if (NetworkManager::readExact(NetworkManager::getSocket(), compressedCanvas, compressedSize)) {
-                if (canvas.loadFromCompressed(compressedCanvas, compressedSize)) {
-                    fullCanvas = canvas.pixels;
-                    Renderer::invalidateMinimap();
-                    printf("Canvas refreshed successfully!\n");
-                    success = true;
-                } else {
-                    printf("Failed to decompress canvas data.\n");
-                }
-            } else {
-                printf("Failed to read compressed canvas data.\n");
-            }
-
-            free(compressedCanvas);
-
-            if (!success) {
-                printf("Canvas refresh failed. Try again?\n");
-            }
+            setAdminNotice("REFRESH REQUESTED");
         }
 
         if (gDisconnectReason[0])
@@ -2741,9 +2913,29 @@ int main(int argc, char **argv)
         }
         else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_A))
         {
-            if (editDisplayName(NetworkManager::getSocket(), identityInfo))
+            if (onboardingStage == ONBOARDING_SUBMITTING_DISPLAY_NAME)
             {
-                setIdentityNotice("NAME SENT");
+                setIdentityNotice("WAITING FOR SERVER");
+                continue;
+            }
+
+            rulesRequireFreshAPress = true;
+            rulesRenderedSinceKeyboard = false;
+            char chosenDisplayName[25] = "";
+            if (promptDisplayName(identityInfo, chosenDisplayName, sizeof(chosenDisplayName)))
+            {
+                snprintf(pendingDisplayName, sizeof(pendingDisplayName), "%s", chosenDisplayName);
+                if (sendDisplayNameValue(pendingDisplayName))
+                {
+                    gNeedsDisplayName = true;
+                    beginOnboardingSubmission(ONBOARDING_SUBMITTING_DISPLAY_NAME);
+                    setIdentityNotice("NAME SENT");
+                }
+                else
+                {
+                    onboardingStage = ONBOARDING_WAITING_DISPLAY_NAME;
+                    setIdentityNotice("SEND FAILED - PRESS A TO RETRY");
+                }
             }
             continue;
         }
@@ -2763,10 +2955,27 @@ int main(int argc, char **argv)
             }
             continue;
         }
-        else if (topMode == TOP_MODE_RULES && (kDown & KEY_A))
+        else if (topMode == TOP_MODE_RULES && (kDown & KEY_A) && !rulesRequireFreshAPress)
         {
-            if (gRequiredRulesVersion[0] && acceptRules(NetworkManager::getSocket(), gRequiredRulesVersion))
-                setIdentityNotice("RULES SENT");
+            if (onboardingStage == ONBOARDING_SUBMITTING_RULES)
+            {
+                setIdentityNotice("WAITING FOR SERVER");
+            }
+            else if (gRequiredRulesVersion[0])
+            {
+                snprintf(pendingRulesVersion, sizeof(pendingRulesVersion), "%s", gRequiredRulesVersion);
+                if (sendRulesValue(pendingRulesVersion))
+                {
+                    gNeedsRules = true;
+                    beginOnboardingSubmission(ONBOARDING_SUBMITTING_RULES);
+                    setIdentityNotice("RULES SENT");
+                }
+                else
+                {
+                    onboardingStage = ONBOARDING_WAITING_RULES;
+                    setIdentityNotice("SEND FAILED - PRESS A TO RETRY");
+                }
+            }
             else if (!gRequiredRulesVersion[0])
                 topMode = TOP_MODE_MENU;
             topRenderFrame = 10;
@@ -3111,7 +3320,7 @@ int main(int argc, char **argv)
                     {
                         if (!NetworkManager::checkConnection())
                         {
-                            if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))
+                            if (!reconnectSession("draw-reconnect"))
                             {
                                 UIState::clearPoints();
                                 gRainbowStrokeColorValid = false;
@@ -3170,7 +3379,7 @@ int main(int argc, char **argv)
                     {
                         if (!NetworkManager::checkConnection()) {
                             printf("Connection lost while drawing! Attempting to reconnect...\n");
-                            if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)) {
+                            if (!reconnectSession("draw-reconnect")) {
                                 UIState::clearPoints(); // Clear points if reconnect failed
                                 continue;
                             }
@@ -3203,7 +3412,7 @@ int main(int argc, char **argv)
                 {
                     if (!NetworkManager::checkConnection()) {
                         printf("Connection lost while drawing! Attempting to reconnect...\n");
-                        if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType)) {
+                        if (!reconnectSession("draw-reconnect")) {
                             UIState::clearPoints(); // Clear points if reconnect failed
                             continue;
                         }
@@ -3225,59 +3434,154 @@ int main(int argc, char **argv)
         if (sock >= 0)
         {
             uint8_t packetBuffer[4096];
-            int recvLen = recv(sock, packetBuffer, sizeof(packetBuffer), 0);
-            if (recvLen > 0)
+            const size_t receiveBudget = 16 * 1024;
+            size_t receivedThisFrame = 0;
+            bool peerClosed = false;
+            bool receiveFailed = false;
+            while (receivedThisFrame < receiveBudget)
             {
-                if (packetBuffer[0] == '{' || !controlReceiveBuffer.empty())
+                size_t requestSize = std::min(sizeof(packetBuffer), receiveBudget - receivedThisFrame);
+                int recvLen = recv(sock, packetBuffer, requestSize, 0);
+                if (recvLen > 0)
                 {
-                    packetBuffer[std::min(recvLen, (int)sizeof(packetBuffer) - 1)] = '\0';
-                    CanvasMeta meta;
-                    if (Protocol::parseCanvasMeta((char *)packetBuffer, meta))
+                    realtimeReceiveBuffer.insert(realtimeReceiveBuffer.end(), packetBuffer, packetBuffer + recvLen);
+                    receivedThisFrame += (size_t)recvLen;
+                    continue;
+                }
+                if (recvLen == 0)
+                {
+                    peerClosed = true;
+                    break;
+                }
+                if (errno == EINTR)
+                    continue;
+                if (errno != EWOULDBLOCK && errno != EAGAIN)
+                    receiveFailed = true;
+                break;
+            }
+
+            if (!realtimeReceiveBuffer.empty())
+            {
+                while (!realtimeReceiveBuffer.empty())
+                {
+                    if (realtimeCanvasPending)
                     {
-                        canvasWidth = meta.width;
-                        canvasHeight = meta.height;
-                        canvas.setChannel(meta.channel);
-                        if (canvas.allocate(canvasWidth, canvasHeight))
+                        size_t compressedSize = (size_t)realtimeCanvasMeta.compressedSize;
+                        if (realtimeReceiveBuffer.size() < compressedSize)
+                            break;
+
+                        canvasWidth = realtimeCanvasMeta.width;
+                        canvasHeight = realtimeCanvasMeta.height;
+                        canvas.setChannel(realtimeCanvasMeta.channel);
+                        bool loaded = canvas.allocate(canvasWidth, canvasHeight) &&
+                                      canvas.loadFromCompressed(realtimeReceiveBuffer.data(), compressedSize);
+                        realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin(), realtimeReceiveBuffer.begin() + compressedSize);
+                        realtimeCanvasPending = false;
+                        if (loaded)
                         {
-                            u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
-                            if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, meta.compressedSize))
-                            {
-                                if (canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
-                                {
-                                    fullCanvas = canvas.pixels;
-                                    Renderer::invalidateMinimap();
-                                }
-                            }
-                            if (compressedCanvas)
-                                free(compressedCanvas);
+                            fullCanvas = canvas.pixels;
+                            offsetX = offsetY = 0;
+                            clampOffsets(offsetX, offsetY);
+                            canvas.markFullDirty();
+                            Renderer::invalidateMinimap();
+                            syncSelectedChannel();
+                            printf("Loaded realtime canvas %s.\n", canvas.channel);
                         }
+                        else
+                            setAdminNotice("CANVAS LOAD FAILED");
+                        continue;
+                    }
+
+                    uint8_t frameType = realtimeReceiveBuffer[0];
+                    if (frameType == '{')
+                    {
+                        std::vector<uint8_t>::iterator newline = std::find(realtimeReceiveBuffer.begin(), realtimeReceiveBuffer.end(), (uint8_t)'\n');
+                        if (newline == realtimeReceiveBuffer.end())
+                        {
+                            if (realtimeReceiveBuffer.size() > 32768)
+                            {
+                                realtimeReceiveBuffer.clear();
+                                realtimeCanvasPending = false;
+                                NetworkManager::disconnect();
+                                sock = -1;
+                                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SERVER MESSAGE TOO LARGE");
+                                topMode = TOP_MODE_STATUS;
+                                topRenderFrame = 10;
+                            }
+                            break;
+                        }
+
+                        if ((size_t)std::distance(realtimeReceiveBuffer.begin(), newline) > 32768)
+                        {
+                            realtimeReceiveBuffer.clear();
+                            realtimeCanvasPending = false;
+                            NetworkManager::disconnect();
+                            sock = -1;
+                            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SERVER MESSAGE TOO LARGE");
+                            topMode = TOP_MODE_STATUS;
+                            topRenderFrame = 10;
+                            break;
+                        }
+
+                        std::string line(realtimeReceiveBuffer.begin(), newline);
+                        realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin(), newline + 1);
+                        if (line.empty())
+                            continue;
+
+                        CanvasMeta meta;
+                        if (Protocol::parseCanvasMeta(line.c_str(), meta))
+                        {
+                            if (meta.compressedSize <= 0 || meta.compressedSize > 10000000)
+                            {
+                                setAdminNotice("INVALID CANVAS SIZE");
+                                continue;
+                            }
+                            realtimeCanvasMeta = meta;
+                            realtimeCanvasPending = true;
+                        }
+                        else
+                            handleJsonControl(line.c_str());
+                        continue;
+                    }
+
+                    size_t binarySize = 0;
+                    if (frameType == 1)
+                    {
+                        if (realtimeReceiveBuffer.size() < 7)
+                            break;
+                        binarySize = 7 + (size_t)realtimeReceiveBuffer[6] * 4;
+                    }
+                    else if (frameType == 2)
+                        binarySize = 12;
+                    else if (frameType == 3)
+                    {
+                        if (realtimeReceiveBuffer.size() < 6)
+                            break;
+                        binarySize = 6 + (size_t)realtimeReceiveBuffer[5];
                     }
                     else
                     {
-                        controlReceiveBuffer.append((char *)packetBuffer, (size_t)recvLen);
-                        size_t newline = std::string::npos;
-                        while ((newline = controlReceiveBuffer.find('\n')) != std::string::npos)
-                        {
-                            std::string line = controlReceiveBuffer.substr(0, newline);
-                            controlReceiveBuffer.erase(0, newline + 1);
-                            if (!line.empty())
-                                handleJsonControl(line.c_str());
-                        }
-                        if (controlReceiveBuffer.size() > 900)
-                            controlReceiveBuffer.clear();
+                        // Drop only the unrecognized byte so a following JSON or
+                        // binary frame in the same TCP read can still be parsed.
+                        realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin());
+                        continue;
                     }
-                }
-                else
-                {
-                    if (processBinaryCanvasPackets(packetBuffer, recvLen, canvas, fullCanvas, canvasWidth, canvasHeight, activeDrawLabels))
+
+                    if (realtimeReceiveBuffer.size() < binarySize)
+                        break;
+                    if (processBinaryCanvasPackets(realtimeReceiveBuffer.data(), binarySize, canvas,
+                                                   fullCanvas, canvasWidth, canvasHeight, activeDrawLabels))
                     {
                         canvas.markFullDirty();
                         Renderer::invalidateMinimap();
                     }
+                    realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin(), realtimeReceiveBuffer.begin() + binarySize);
                 }
             }
-            else if (recvLen == 0)
+            if (peerClosed && sock >= 0)
             {
+                realtimeReceiveBuffer.clear();
+                realtimeCanvasPending = false;
                 NetworkManager::disconnect();
                 sock = -1;
                 snprintf(gDisconnectReason, sizeof(gDisconnectReason), "CONNECTION LOST");
@@ -3285,8 +3589,10 @@ int main(int argc, char **argv)
                 topRenderFrame = 10;
                 printf("Server disconnected.\n");
             }
-            else if (errno != EWOULDBLOCK && errno != EAGAIN)
+            else if (receiveFailed && sock >= 0)
             {
+                realtimeReceiveBuffer.clear();
+                realtimeCanvasPending = false;
                 NetworkManager::disconnect();
                 sock = -1;
                 snprintf(gDisconnectReason, sizeof(gDisconnectReason), "NETWORK ERROR");
@@ -3395,6 +3701,8 @@ int main(int argc, char **argv)
                                 isModOrAdmin() ? staffChatUnread : 0,
                                 restrictionSecondsRemaining, restrictionHasDuration,
                                 restrictionReason);
+            if (topMode == TOP_MODE_RULES)
+                rulesRenderedSinceKeyboard = true;
             topRenderFrame = 0;
         }
 

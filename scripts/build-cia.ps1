@@ -9,6 +9,43 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if ($TestMode -notin @(0, 1, 2)) {
+    throw "TestMode must be 0 (production), 1 (local test), or 2 (remote test)."
+}
+
+if ($TestMode -eq 0) {
+    $expectedProductionTitle = "Collab Doodle v$AppVersion"
+    $expectedProductionDescription = "Shared canvas drawing for Nintendo 3DS - v$AppVersion"
+    if ($AppTitle -ne $expectedProductionTitle -or $AppDescription -ne $expectedProductionDescription) {
+        throw "Production CIA metadata must be '$expectedProductionTitle' / '$expectedProductionDescription'."
+    }
+}
+
+function Assert-SmdhMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedText,
+        [string[]]$ForbiddenText = @()
+    )
+
+    $decoded = [System.Text.Encoding]::Unicode.GetString(
+        [System.IO.File]::ReadAllBytes($Path)
+    )
+
+    foreach ($expected in $ExpectedText) {
+        if (-not $decoded.Contains($expected)) {
+            throw "$Label does not contain expected metadata '$expected': $Path"
+        }
+    }
+
+    foreach ($forbidden in $ForbiddenText) {
+        if ($decoded.Contains($forbidden)) {
+            throw "$Label contains stale test metadata '$forbidden': $Path"
+        }
+    }
+}
+
 $makerom = Get-Command makerom.exe -ErrorAction SilentlyContinue
 if (-not $makerom) {
     $candidate = 'C:\devkitPro\tools\bin\makerom.exe'
@@ -48,6 +85,20 @@ foreach ($required in @($elf, $smdh, $rsf)) {
         throw "Required CIA input is missing: $required"
     }
 }
+
+$forbiddenProductionMetadata = @(
+    'Collab Doodle TEST',
+    'Test 1 build',
+    'Test 2 build',
+    'Local test build',
+    'server2.rpgwo.org'
+)
+
+Assert-SmdhMetadata `
+    -Path $smdh `
+    -Label '3DSX SMDH' `
+    -ExpectedText @($AppTitle, $AppDescription) `
+    -ForbiddenText $(if ($TestMode -eq 0) { $forbiddenProductionMetadata } else { @() })
 
 $uniqueId = if ($TestMode -eq 1) { '0xCE476' } elseif ($TestMode -eq 2) { '0xCE477' } else { '0xCE475' }
 $productCode = if ($TestMode -eq 1) { 'CTR-P-CDT1' } elseif ($TestMode -eq 2) { 'CTR-P-CDT2' } else { 'CTR-P-CDDL' }
@@ -98,8 +149,10 @@ for ($i = 0; $i -lt $samples; $i++) {
 }
 $writer.Close()
 
-if (Test-Path -LiteralPath $bannerBin) {
-    Remove-Item -LiteralPath $bannerBin -Force
+foreach ($generatedFile in @($bannerBin, $iconBin, $cia)) {
+    if (Test-Path -LiteralPath $generatedFile) {
+        Remove-Item -LiteralPath $generatedFile -Force
+    }
 }
 
 & $bannertool.Source makebanner -i $bannerPng -a $bannerWav -o $bannerBin
@@ -111,6 +164,12 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "bannertool makesmdh failed with exit code $LASTEXITCODE"
 }
+
+Assert-SmdhMetadata `
+    -Path $iconBin `
+    -Label 'CIA icon SMDH' `
+    -ExpectedText @($AppTitle, $AppDescription) `
+    -ForbiddenText $(if ($TestMode -eq 0) { $forbiddenProductionMetadata } else { @() })
 
 & $makerom.Source `
     -f cia `
@@ -125,5 +184,11 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "makerom failed with exit code $LASTEXITCODE"
 }
+
+Assert-SmdhMetadata `
+    -Path $cia `
+    -Label 'CIA package' `
+    -ExpectedText @($AppTitle, $AppDescription) `
+    -ForbiddenText $(if ($TestMode -eq 0) { $forbiddenProductionMetadata } else { @() })
 
 Write-Host "Built CIA: $cia"

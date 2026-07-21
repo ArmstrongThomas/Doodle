@@ -582,7 +582,8 @@ static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool update
     topFrameValid = true;
 }
 
-static void composeRulesTopFrame(bool connected, bool updateAvailable, const char *requiredVersion, bool needsAgreement)
+static void composeRulesTopFrame(bool connected, bool updateAvailable, const char *requiredVersion,
+                                 bool needsAgreement, const char *notice)
 {
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 38, "Rules + quick start", 32, 36, 42);
@@ -611,38 +612,63 @@ static void composeRulesTopFrame(bool connected, bool updateAvailable, const cha
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "Draw on the bottom screen.", 73, 82, 92);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, "C-PAD or LEFT/A pans. RIGHT/Y shows zoom.", 73, 82, 92);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 202, "Hold L/R for eraser. UP/X samples color.", 73, 82, 92);
-    if (needsAgreement)
+    if (notice && notice[0])
+    {
+        char compactNotice[61];
+        snprintf(compactNotice, sizeof(compactNotice), "%.60s", notice);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 220, compactNotice, 196, 92, 40);
+    }
+    else if (needsAgreement)
         drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 220, "PRESS A TO AGREE AND CONTINUE", 196, 92, 40);
-    drawFooterHint("", needsAgreement ? "B EXIT" : "B BACK");
+    drawFooterHint(needsAgreement ? "A AGREE" : "", needsAgreement ? "B EXIT" : "B BACK");
     topFrameValid = true;
 }
 
 static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, PresenceUser *users, int userCount)
 {
+    (void)canvas;
     drawTopChrome(connected, updateAvailable);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Connected users", 32, 36, 42);
     char countText[20];
     snprintf(countText, sizeof(countText), "%d online", userCount);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 276, 46, countText, 73, 82, 92);
 
-    int rows = std::min(userCount, 8);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 64, "Name", 104, 114, 124);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 190, 64, "Role", 104, 114, 124);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 238, 64, "Device", 104, 114, 124);
+
+    int order[24];
+    int ordered = 0;
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (int i = 0; i < userCount && ordered < 24; i++)
+        {
+            bool staff = strcmp(users[i].role, "admin") == 0 || strcmp(users[i].role, "mod") == 0;
+            if ((pass == 0 && staff) || (pass == 1 && !staff))
+                order[ordered++] = i;
+        }
+    }
+
+    int rows = std::min(ordered, 8);
     for (int i = 0; i < rows; i++)
     {
-        int y = 78 + i * 18;
+        PresenceUser &user = users[order[i]];
+        int y = 80 + i * 17;
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 34, y, "-", 73, 82, 92);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, users[i].displayName, 32, 36, 42);
-        if (strcmp(users[i].role, "admin") == 0 || strcmp(users[i].role, "mod") == 0)
-        {
-            char roleLabel[12];
-            formatTitleLabel(users[i].role, roleLabel, sizeof(roleLabel));
-            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 206, y, roleLabel, 13, 122, 117);
-        }
+        char name[23];
+        snprintf(name, sizeof(name), "%.22s", user.displayName[0] ? user.displayName : user.username);
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, name, 32, 36, 42);
+        char roleLabel[12];
+        formatTitleLabel(user.role, roleLabel, sizeof(roleLabel));
+        bool staff = strcmp(user.role, "admin") == 0 || strcmp(user.role, "mod") == 0;
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 190, y, roleLabel,
+                 staff ? 13 : 73, staff ? 122 : 82, staff ? 117 : 92);
+        char device[26];
+        snprintf(device, sizeof(device), "%.25s", user.deviceModelLabel[0] ? user.deviceModelLabel : "Unknown");
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 238, y, device, 73, 82, 92);
     }
     if (rows == 0)
         drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "No users yet", 104, 114, 124);
-
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "Channel", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 118, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
     drawFooterHint("", "B BACK");
     topFrameValid = true;
 }
@@ -1077,7 +1103,7 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
     else if (mode == TOP_MODE_USERS)
         composeUsersTopFrame(canvas, connected, updateAvailable, users, userCount);
     else if (mode == TOP_MODE_RULES)
-        composeRulesTopFrame(connected, updateAvailable, rulesVersion, needsRulesAgreement);
+        composeRulesTopFrame(connected, updateAvailable, rulesVersion, needsRulesAgreement, identityNotice);
     else if (mode == TOP_MODE_TICKETS)
         composeTicketsTopFrame(connected, updateAvailable, tickets, ticketCount, ticketSelected,
                                ticketView, ticketStaffScope, activeTicket, ticketMessages, ticketMessageCount,

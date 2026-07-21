@@ -75,6 +75,8 @@ struct PresenceUser {
     char displayName[25];
     char role[12];
     char status[12];
+    char deviceModel[24];
+    char deviceModelLabel[32];
     int muteSecondsRemaining;
     int banSecondsRemaining;
 };
@@ -88,6 +90,10 @@ public:
     static bool parseIdentityBackupCode(const char *line, IdentityInfo &identity);
     static bool parseRecoveryFailed(const char *line, char *reason, size_t reasonSize);
     static bool parseRulesRequired(const char *line, char *version, size_t versionSize);
+    static bool parseRulesRejected(const char *line, char *reason, size_t reasonSize,
+                                   char *version, size_t versionSize);
+    static bool parseOnboardingState(const char *line, bool &needsDisplayName, bool &needsRules,
+                                     char *rulesVersion, size_t rulesVersionSize);
     static bool parseDisplayNameRejected(const char *line, char *reason, size_t reasonSize);
     static bool parseDisconnected(const char *line, char *reason, size_t reasonSize);
     static bool parseSupportOnly(const char *line, char *reason, size_t reasonSize, char *blockTypes, size_t blockTypesSize, int &secondsRemaining);
@@ -107,11 +113,12 @@ public:
     static bool parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
                                     char *reason, size_t reasonSize);
     static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
-                           const char *deviceId, const char *deviceSecret, const char *hardwareId,
+                           const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
                            const char *displayName, const char *packageType);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
     static void buildSetDisplayName(char *buffer, size_t size, const char *displayName);
     static void buildRulesAccepted(char *buffer, size_t size, const char *version);
+    static void buildGetOnboardingState(char *buffer, size_t size);
     static void buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,
                                      const char *deviceId, const char *deviceSecret, const char *hardwareId);
     static void buildRotateBackupCode(char *buffer, size_t size);

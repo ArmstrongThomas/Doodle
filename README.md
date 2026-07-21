@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.3.3`
+- Version: `1.4.4`
 
 ## Features
 
@@ -79,7 +79,7 @@ make
 The Makefile exposes release/server variables:
 
 ```make
-APP_VERSION ?= 1.3.3
+APP_VERSION ?= 1.4.4
 CHAT_ENABLED ?= 0
 TEST_MODE ?= 0
 LOCAL_SERVER_HOST ?= 192.168.1.46
@@ -145,7 +145,7 @@ make TEST_MODE=1 DISABLE_UPDATER=0
 make cia TEST_MODE=1 DISABLE_UPDATER=0
 ```
 
-The selected TCP host is compiled into drawing/presence networking. The selected HTTP host is compiled into updater requests. Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds so Collab Doodle stays focused on shared drawing. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.3.3-test1` or `1.3.3-test2` on the top screen.
+The selected TCP host is compiled into drawing/presence networking. The selected HTTP host is compiled into updater requests. Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds so Collab Doodle stays focused on shared drawing. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.4.4-test1` or `1.4.4-test2` on the top screen.
 
 ## CIA Packaging
 
