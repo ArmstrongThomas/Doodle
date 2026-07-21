@@ -52,6 +52,14 @@ static char gRequiredRulesVersion[32] = "";
 static bool gNeedsDisplayName = false;
 static bool gNeedsRules = false;
 static char gDisconnectReason[80] = "";
+static volatile bool gAptResumeRequested = false;
+static const size_t CONTROL_LINE_CAPACITY = 2048;
+
+static void handleAptEvent(APT_HookType hook, void *)
+{
+    if (hook == APTHOOK_ONRESTORE || hook == APTHOOK_ONWAKEUP)
+        gAptResumeRequested = true;
+}
 
 struct ActiveDrawLabel {
     bool active;
@@ -422,12 +430,14 @@ static void drawMiniGlyph(u8 *fb, int width, int height, int x, int y, char c, u
         case 'G': { u8 g[7] = {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}; memcpy(glyph,g,7); break; }
         case 'H': { u8 g[7] = {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
         case 'I': { u8 g[7] = {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case 'J': { u8 g[7] = {0x07,0x02,0x02,0x02,0x12,0x12,0x0C}; memcpy(glyph,g,7); break; }
         case 'K': { u8 g[7] = {0x11,0x12,0x14,0x18,0x14,0x12,0x11}; memcpy(glyph,g,7); break; }
         case 'L': { u8 g[7] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; memcpy(glyph,g,7); break; }
         case 'M': { u8 g[7] = {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
         case 'N': { u8 g[7] = {0x11,0x19,0x15,0x13,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
         case 'O': { u8 g[7] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
         case 'P': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 'Q': { u8 g[7] = {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}; memcpy(glyph,g,7); break; }
         case 'R': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; memcpy(glyph,g,7); break; }
         case 'S': { u8 g[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
         case 'T': { u8 g[7] = {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
@@ -436,6 +446,33 @@ static void drawMiniGlyph(u8 *fb, int width, int height, int x, int y, char c, u
         case 'W': { u8 g[7] = {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}; memcpy(glyph,g,7); break; }
         case 'X': { u8 g[7] = {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; memcpy(glyph,g,7); break; }
         case 'Y': { u8 g[7] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
+        case 'Z': { u8 g[7] = {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}; memcpy(glyph,g,7); break; }
+        case 'a': { u8 g[7] = {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F}; memcpy(glyph,g,7); break; }
+        case 'b': { u8 g[7] = {0x10,0x10,0x16,0x19,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
+        case 'c': { u8 g[7] = {0x00,0x00,0x0E,0x10,0x10,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'd': { u8 g[7] = {0x01,0x01,0x0D,0x13,0x11,0x11,0x0F}; memcpy(glyph,g,7); break; }
+        case 'e': { u8 g[7] = {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E}; memcpy(glyph,g,7); break; }
+        case 'f': { u8 g[7] = {0x06,0x08,0x08,0x1C,0x08,0x08,0x08}; memcpy(glyph,g,7); break; }
+        case 'g': { u8 g[7] = {0x00,0x00,0x0F,0x11,0x0F,0x01,0x0E}; memcpy(glyph,g,7); break; }
+        case 'h': { u8 g[7] = {0x10,0x10,0x16,0x19,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'i': { u8 g[7] = {0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case 'j': { u8 g[7] = {0x02,0x00,0x06,0x02,0x02,0x12,0x0C}; memcpy(glyph,g,7); break; }
+        case 'k': { u8 g[7] = {0x10,0x10,0x12,0x14,0x18,0x14,0x12}; memcpy(glyph,g,7); break; }
+        case 'l': { u8 g[7] = {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
+        case 'm': { u8 g[7] = {0x00,0x00,0x1A,0x15,0x15,0x15,0x15}; memcpy(glyph,g,7); break; }
+        case 'n': { u8 g[7] = {0x00,0x00,0x16,0x19,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
+        case 'o': { u8 g[7] = {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
+        case 'p': { u8 g[7] = {0x00,0x00,0x1E,0x11,0x1E,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 'q': { u8 g[7] = {0x00,0x00,0x0D,0x13,0x0F,0x01,0x01}; memcpy(glyph,g,7); break; }
+        case 'r': { u8 g[7] = {0x00,0x00,0x16,0x19,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case 's': { u8 g[7] = {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E}; memcpy(glyph,g,7); break; }
+        case 't': { u8 g[7] = {0x08,0x08,0x1C,0x08,0x08,0x09,0x06}; memcpy(glyph,g,7); break; }
+        case 'u': { u8 g[7] = {0x00,0x00,0x11,0x11,0x11,0x13,0x0D}; memcpy(glyph,g,7); break; }
+        case 'v': { u8 g[7] = {0x00,0x00,0x11,0x11,0x11,0x0A,0x04}; memcpy(glyph,g,7); break; }
+        case 'w': { u8 g[7] = {0x00,0x00,0x11,0x15,0x15,0x15,0x0A}; memcpy(glyph,g,7); break; }
+        case 'x': { u8 g[7] = {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11}; memcpy(glyph,g,7); break; }
+        case 'y': { u8 g[7] = {0x00,0x00,0x11,0x11,0x0F,0x01,0x0E}; memcpy(glyph,g,7); break; }
+        case 'z': { u8 g[7] = {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F}; memcpy(glyph,g,7); break; }
         case '0': { u8 g[7] = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}; memcpy(glyph,g,7); break; }
         case '1': { u8 g[7] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
         case '2': { u8 g[7] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}; memcpy(glyph,g,7); break; }
@@ -448,7 +485,14 @@ static void drawMiniGlyph(u8 *fb, int width, int height, int x, int y, char c, u
         case '9': { u8 g[7] = {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}; memcpy(glyph,g,7); break; }
         case '.': { u8 g[7] = {0,0,0,0,0,0x0C,0x0C}; memcpy(glyph,g,7); break; }
         case '-': { u8 g[7] = {0,0,0,0x1F,0,0,0}; memcpy(glyph,g,7); break; }
-        default: return;
+        case ':': { u8 g[7] = {0,0x04,0,0,0x04,0,0}; memcpy(glyph,g,7); break; }
+        case '(': { u8 g[7] = {0x02,0x04,0x08,0x08,0x08,0x04,0x02}; memcpy(glyph,g,7); break; }
+        case ')': { u8 g[7] = {0x08,0x04,0x02,0x02,0x02,0x04,0x08}; memcpy(glyph,g,7); break; }
+        case '/': { u8 g[7] = {0x01,0x01,0x02,0x04,0x08,0x10,0x10}; memcpy(glyph,g,7); break; }
+        case '+': { u8 g[7] = {0,0x04,0x04,0x1F,0x04,0x04,0}; memcpy(glyph,g,7); break; }
+        case '!': { u8 g[7] = {0x04,0x04,0x04,0x04,0x04,0,0x04}; memcpy(glyph,g,7); break; }
+        case '?': { u8 g[7] = {0x0E,0x11,0x01,0x02,0x04,0,0x04}; memcpy(glyph,g,7); break; }
+        default: { u8 g[7] = {0x1F,0x11,0x15,0x15,0x11,0x11,0x1F}; memcpy(glyph,g,7); break; }
     }
     for (int gy = 0; gy < 7; gy++)
         for (int gx = 0; gx < 5; gx++)
@@ -462,7 +506,6 @@ static void drawMiniText(u8 *fb, int width, int height, int x, int y, const char
     while (*text)
     {
         char c = *text;
-        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
         if (c != ' ') drawMiniGlyph(fb, width, height, cx, y, c, r, g, b);
         cx += 6;
         text++;
@@ -528,7 +571,7 @@ static bool waitForUpdateConfirm(const UpdateManifest &manifest)
 {
     while (aptMainLoop())
     {
-        drawPromptScreen("UPDATE AVAILABLE", manifest.latestVersion);
+        drawPromptScreen("Update available", manifest.latestVersion);
         hidScanInput();
         u32 down = hidKeysDown();
         if (down & KEY_A) return true;
@@ -540,23 +583,23 @@ static bool waitForUpdateConfirm(const UpdateManifest &manifest)
 static void updateProgress(int downloaded, int total, void *)
 {
     if (downloaded >= 1000000)
-        drawStatusScreen("INSTALLING UPDATE", "PLEASE WAIT", downloaded - 1000000, total);
+        drawStatusScreen("Installing update", "Please wait", downloaded - 1000000, total);
     else
-        drawStatusScreen("DOWNLOADING UPDATE", "PLEASE WAIT", downloaded, total);
+        drawStatusScreen("Downloading update", "Please wait", downloaded, total);
 }
 
 static void exitAfterUpdateInstalled(const char *packageType, u64 titleId)
 {
     if (packageType && strcmp(packageType, "cia") == 0 && titleId != 0)
     {
-        drawStatusScreen("UPDATE READY", "RELAUNCHING", 1, 1);
+        drawStatusScreen("Update ready", "Relaunching", 1, 1);
         if (Updater::relaunchInstalledTitle(titleId))
             return;
     }
 
     while (aptMainLoop())
     {
-        drawStatusScreen("UPDATE READY", "A CLOSE REOPEN APP", 1, 1);
+        drawStatusScreen("Update ready", "A: Close and reopen app", 1, 1);
         hidScanInput();
         u32 down = hidKeysDown();
         if ((down & KEY_A) || (down & KEY_B))
@@ -1218,19 +1261,19 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     fillBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 220, 226, 232);
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 104, 114, 124);
 
-    drawPaletteButton(framebuffer, fbWidth, fbHeight, 14, 14, 88, 28, "COLOR", activeTab == 0, false);
+    drawPaletteButton(framebuffer, fbWidth, fbHeight, 14, 14, 88, 28, "Color", activeTab == 0, false);
     if (modAllowed)
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 106, 14, 88, 28, "MOD", activeTab == 1, false);
+        drawPaletteButton(framebuffer, fbWidth, fbHeight, 106, 14, 88, 28, "Staff", activeTab == 1, false);
 
     if (activeTab == 0)
     {
-        drawMiniText(framebuffer, fbWidth, fbHeight, 26, 52, "BRUSH", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 26, 52, "Brush", 73, 82, 92);
         const int shapeXs[] = {30, 60, 90, 120};
         const int sizeYs[] = {70, 92, 114, 136, 158};
-        drawMiniText(framebuffer, fbWidth, fbHeight, 16, 184, "CIR", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 48, 184, "BOX", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 78, 184, "DIT", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 108, 184, "ERS", 196, 61, 61);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 16, 184, "Cir", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 48, 184, "Box", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 78, 184, "Dit", 73, 82, 92);
+        drawMiniText(framebuffer, fbWidth, fbHeight, 108, 184, "Erase", 196, 61, 61);
         for (int row = 0; row < 5; row++)
             for (int shape = 0; shape < 4; shape++)
                 drawPaletteBrushChoice(framebuffer, fbWidth, fbHeight, shapeXs[shape], sizeYs[row],
@@ -1368,6 +1411,8 @@ static void applyBackupCode(const IdentityInfo &identityInfo)
 int main(int argc, char **argv)
 {
     gfxInitDefault();
+    aptHookCookie aptCookie;
+    aptHook(&aptCookie, handleAptEvent, NULL);
     if (R_SUCCEEDED(ptmuInit()))
         atexit(ptmuExit);
     if (R_SUCCEEDED(mcuHwcInit()))
@@ -1380,7 +1425,7 @@ int main(int argc, char **argv)
     const char *packageType = (installedTitleId != 0 || isCiaLaunch(appPath)) ? "cia" : "3dsx";
     const char *updateTargetPath = updateTargetPathForPackage(packageType, appPath);
 
-    drawStatusScreen("PLEASE WAIT", "CONNECTING", 0, 0);
+    drawStatusScreen("Please wait", "Connecting", 0, 0);
 
     printf("3DS Collab Doodle\n");
     printf("Package: %s\n", packageType);
@@ -1928,7 +1973,7 @@ int main(int argc, char **argv)
 
     if (sock >= 0)
     {
-        char line[1024];
+        char line[CONTROL_LINE_CAPACITY];
         CanvasMeta meta;
         bool receivedMeta = false;
         while (NetworkManager::readLine(sock, line, sizeof(line)))
@@ -2042,7 +2087,7 @@ int main(int argc, char **argv)
 
     auto receiveCanvasSnapshot = [&](int activeSock, const char *context) -> bool
     {
-        char response[1024];
+        char response[CONTROL_LINE_CAPACITY];
         CanvasMeta snapshotMeta;
         bool gotMeta = false;
         while (NetworkManager::readLine(activeSock, response, sizeof(response)))
@@ -2158,7 +2203,7 @@ int main(int argc, char **argv)
         }
 
         printf("Switching to channel %s...\n", availableChannels[selectedChannel]);
-        char response[1024];
+        char response[CONTROL_LINE_CAPACITY];
         CanvasMeta meta;
         if (!NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response)) ||
             !Protocol::parseCanvasMeta(response, meta))
@@ -2198,17 +2243,14 @@ int main(int argc, char **argv)
 
     syncSelectedChannel();
 
-    u64 lastLoopAt = osGetTime();
     while (aptMainLoop() && !exitRequested)
     {
-        u64 loopNow = osGetTime();
-        bool resumedFromSleep = loopNow > lastLoopAt && loopNow - lastLoopAt > 3000;
-        lastLoopAt = loopNow;
+        bool resumedFromSleep = gAptResumeRequested;
+        gAptResumeRequested = false;
         if (resumedFromSleep)
         {
             setAdminNotice("WAKING - CHECKING VERSION");
             reconnectSession("wake");
-            lastLoopAt = osGetTime();
         }
         if (restrictionActive && restrictionHasDuration)
         {
@@ -2220,7 +2262,6 @@ int main(int argc, char **argv)
                 restrictionReason[0] = '\0';
                 snprintf(identityInfo.status, sizeof(identityInfo.status), "active");
                 reconnectSession("restriction-expired");
-                lastLoopAt = osGetTime();
             }
         }
         else
@@ -2273,7 +2314,7 @@ int main(int argc, char **argv)
                 }
             }
 
-            char response[1024];
+            char response[CONTROL_LINE_CAPACITY];
             if (!NetworkManager::readLine(NetworkManager::getSocket(), response, sizeof(response))) {
                 printf("Failed to read server response.\n");
                 continue;
@@ -3379,6 +3420,7 @@ int main(int argc, char **argv)
     if (sock >= 0)
         close(sock);
     free(buffer);
+    aptUnhook(&aptCookie);
     gfxExit();
     return 0;
 }
