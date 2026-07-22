@@ -20,6 +20,34 @@
 #include "protocol.h"
 #include "updater.h"
 
+// TLS certificate verification can exceed libctru's 32 KiB default main
+// thread stack. The updater deliberately runs HTTPS on the main thread so it
+// remains available when the realtime worker cannot connect.
+extern "C"
+{
+u32 __stacksize__ = 256 * 1024;
+}
+
+#ifndef TEST_MODE
+#error TEST_MODE must be provided by the build system
+#endif
+#ifndef UPDATER_ENABLED
+#error UPDATER_ENABLED must be provided by the build system
+#endif
+#if (UPDATER_ENABLED != 0) && (UPDATER_ENABLED != 1)
+#error UPDATER_ENABLED must be 0 or 1
+#endif
+
+#define DOODLE_STRINGIFY_INNER(value) #value
+#define DOODLE_STRINGIFY(value) DOODLE_STRINGIFY_INNER(value)
+
+static const char gBuildConfiguration[] =
+    "DoodleBuildConfig:test=" DOODLE_STRINGIFY(TEST_MODE)
+    ";updater=" DOODLE_STRINGIFY(UPDATER_ENABLED)
+    ";ws_secure=" DOODLE_STRINGIFY(SERVER_WS_SECURE)
+    ";ws=" SERVER_WS_HOST ":" SERVER_WS_PORT SERVER_WS_PATH
+    ";https=" SERVER_HTTPS_HOST ":" SERVER_HTTPS_PORT;
+
 Color currentColor = {255, 0, 0}; // Red by default
 int currentBrushSize = 1;
 int currentBrushShape = 0;
@@ -66,6 +94,15 @@ static char gDisconnectReason[80] = "";
 static volatile bool gAptResumeRequested = false;
 static volatile bool gAptWentToSleep = false;
 static const size_t CONTROL_LINE_CAPACITY = 2048;
+static const uint64_t MAX_CANVAS_BYTES = 12ULL * 1024ULL * 1024ULL;
+
+static bool isValidCanvasMeta(const CanvasMeta &meta)
+{
+    if (meta.width <= 0 || meta.height <= 0 || meta.compressedSize <= 0 || meta.compressedSize > 10000000)
+        return false;
+    uint64_t pixelBytes = (uint64_t)meta.width * (uint64_t)meta.height * 3ULL;
+    return pixelBytes > 0 && pixelBytes <= MAX_CANVAS_BYTES;
+}
 
 static void handleAptEvent(APT_HookType hook, void *)
 {
@@ -368,18 +405,20 @@ static u64 currentInstalledTitleId()
     return 0;
 }
 
+#if UPDATER_ENABLED
 static const char *updateTargetPathForPackage(const char *packageType, const char *appPath)
 {
     return (packageType && strcmp(packageType, "cia") == 0) ? "sdmc:/cias/CollabDoodle-update.cia" : appPath;
 }
+#endif
 
-static bool sendClientHello(int sock, const char *packageType)
+static bool sendClientHello(const char *packageType)
 {
     char hello[512];
-    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, TEST_MODE ? false : true,
+    Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, UPDATER_ENABLED != 0,
                          gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId, gDeviceModel,
                          gIdentity.displayName, packageType);
-    return sock >= 0 && NetworkManager::sendAll(sock, hello, strlen(hello));
+    return NetworkManager::sendSessionHello(hello, strlen(hello));
 }
 
 static void putPixel(u8 *fb, int width, int height, int x, int y, u8 r, u8 g, u8 b)
@@ -581,6 +620,7 @@ static void drawStatusScreen(const char *title, const char *line, int progress, 
     gspWaitForVBlank();
 }
 
+#if UPDATER_ENABLED
 static void drawPromptPanel(gfxScreen_t screen, const char *title, const char *line)
 {
     u16 w, h;
@@ -645,6 +685,54 @@ static void exitAfterUpdateInstalled(const char *packageType, u64 titleId)
     gfxExit();
     exit(0);
 }
+
+struct HttpsUpdateAttempt
+{
+    bool manifestFetched;
+    bool updateAvailable;
+    bool accepted;
+    UpdateDownloadResult result;
+};
+
+static HttpsUpdateAttempt offerHttpsUpdate(const char *packageType, const char *updateTargetPath,
+                                           u64 installedTitleId)
+{
+    HttpsUpdateAttempt attempt = {false, false, false, UPDATE_DOWNLOAD_MANIFEST_FAILED};
+    UpdateManifest manifest;
+    if (!Updater::fetchManifest(SERVER_HTTPS_HOST, SERVER_HTTPS_PORT, APP_VERSION,
+                                packageType, manifest))
+        return attempt;
+
+    attempt.manifestFetched = true;
+    attempt.updateAvailable = manifest.available;
+    if (!manifest.available)
+    {
+        attempt.result = UPDATE_DOWNLOAD_NO_UPDATE;
+        return attempt;
+    }
+
+    attempt.accepted = waitForUpdateConfirm(manifest);
+    if (!attempt.accepted)
+    {
+        attempt.result = UPDATE_DOWNLOAD_NO_UPDATE;
+        return attempt;
+    }
+
+    if (strcmp(packageType, "cia") == 0)
+    {
+        attempt.result = Updater::downloadAndInstallCia(
+            SERVER_HTTPS_HOST, SERVER_HTTPS_PORT, manifest, updateTargetPath,
+            installedTitleId, updateProgress, NULL);
+    }
+    else
+    {
+        attempt.result = Updater::downloadUpdate(
+            SERVER_HTTPS_HOST, SERVER_HTTPS_PORT, manifest, updateTargetPath,
+            updateProgress, NULL);
+    }
+    return attempt;
+}
+#endif
 
 std::unordered_map<int, std::vector<float>> gaussianFalloffTables;
 
@@ -1057,46 +1145,25 @@ static bool processBinaryCanvasPackets(const uint8_t *packets, size_t length, Ca
                                        u8 *fullCanvas, int canvasWidth, int canvasHeight,
                                        ActiveDrawLabel *labels)
 {
-    bool changed = false;
-    size_t offset = 0;
-    while (offset < length)
+    if (!packets || length == 0)
+        return false;
+    uint8_t type = packets[0];
+    if (type == 1)
     {
-        uint8_t type = packets[offset];
-        if (type == 1)
-        {
-            if (length - offset < 7)
-                break;
-            size_t packetLen = 7 + packets[offset + 6] * 4;
-            if (length - offset < packetLen)
-                break;
-            processDrawPacket(packets + offset, packetLen, NULL, 0, 0, fullCanvas, canvasWidth, canvasHeight);
-            changed = true;
-            offset += packetLen;
-        }
-        else if (type == 2)
-        {
-            if (length - offset < 12)
-                break;
-            if (processRectPacket(packets + offset, 12, canvas))
-                changed = true;
-            offset += 12;
-        }
-        else if (type == 3)
-        {
-            if (length - offset < 6)
-                break;
-            size_t packetLen = 6 + packets[offset + 5];
-            if (length - offset < packetLen)
-                break;
-            processDrawAttributionPacket(packets + offset, packetLen, labels);
-            offset += packetLen;
-        }
-        else
-        {
-            break;
-        }
+        if (length < 7 || length != 7 + (size_t)packets[6] * 4)
+            return false;
+        processDrawPacket(packets, length, NULL, 0, 0, fullCanvas, canvasWidth, canvasHeight);
+        return true;
     }
-    return changed;
+    if (type == 2)
+        return length == 12 && processRectPacket(packets, length, canvas);
+    if (type == 3)
+    {
+        if (length < 6 || length != 6 + (size_t)packets[5])
+            return false;
+        processDrawAttributionPacket(packets, length, labels);
+    }
+    return false;
 }
 
 static void drawActiveDrawLabels(u8 *buffer, int fbWidth, int fbHeight, CanvasState &canvas, ActiveDrawLabel *labels)
@@ -1177,9 +1244,9 @@ void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
     }
 }
 
-static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint> &points, const Color &color, int size, int shape)
+static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Color &color, int size, int shape)
 {
-    if (sock < 0 || points.empty())
+    if (!NetworkManager::checkConnection() || points.empty())
         return;
 
     const size_t maxPointsPerPacket = 64;
@@ -1202,7 +1269,7 @@ static void sendDrawBatchCommand(int sock, const std::vector<DrawPoint> &points,
             *(uint16_t *)(packet + 9 + i * 4) = points[start + i].y;
         }
 
-        if (!NetworkManager::sendAll(sock, packet, 7 + count * 4))
+        if (!NetworkManager::sendBinary(packet, 7 + count * 4))
         {
             printf("Failed to send draw batch.\n");
             return;
@@ -1359,7 +1426,7 @@ static bool promptDisplayName(IdentityInfo &identityInfo, char *displayName, siz
 {
     SwkbdState swkbd;
     char inputText[25];
-    snprintf(inputText, sizeof(inputText), "%s", identityInfo.displayName[0] ? identityInfo.displayName : gIdentity.displayName);
+    snprintf(inputText, sizeof(inputText), "%.24s", identityInfo.displayName[0] ? identityInfo.displayName : gIdentity.displayName);
 
     swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, 24);
     swkbdSetHintText(&swkbd, "Display name");
@@ -1393,18 +1460,18 @@ static bool readKeyboardText(const char *hint, char *out, size_t outSize, const 
     return out[0] != '\0';
 }
 
-static bool requestBackupCode(int sock)
+static bool requestBackupCode()
 {
-    if (sock < 0)
+    if (!NetworkManager::checkConnection())
         return false;
     char command[48];
     Protocol::buildRotateBackupCode(command, sizeof(command));
-    return NetworkManager::sendAll(sock, command, strlen(command));
+    return NetworkManager::sendText(command);
 }
 
-static bool recoverIdentity(int sock)
+static bool recoverIdentity()
 {
-    if (sock < 0)
+    if (!NetworkManager::checkConnection())
         return false;
     char username[25];
     char backupCode[32];
@@ -1417,7 +1484,7 @@ static bool recoverIdentity(int sock)
     char command[280];
     Protocol::buildRecoverIdentity(command, sizeof(command), username, backupCode,
                                    gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId);
-    return NetworkManager::sendAll(sock, command, strlen(command));
+    return NetworkManager::sendText(command);
 }
 
 static void applyIdentityAccepted(const IdentityInfo &identityInfo)
@@ -1454,11 +1521,14 @@ int main(int argc, char **argv)
     const char *appPath = (argc > 0 && argv && argv[0] && argv[0][0]) ? argv[0] : "sdmc:/3ds/CollabDoodle-current.3dsx";
     u64 installedTitleId = currentInstalledTitleId();
     const char *packageType = (installedTitleId != 0 || isCiaLaunch(appPath)) ? "cia" : "3dsx";
+#if UPDATER_ENABLED
     const char *updateTargetPath = updateTargetPathForPackage(packageType, appPath);
+#endif
 
-    drawStatusScreen("Please wait", "Connecting", 0, 0);
+    drawStatusScreen("Connecting securely", "This may take a few seconds", 0, 0);
 
     printf("3DS Collab Doodle\n");
+    printf("%s\n", gBuildConfiguration);
     printf("Package: %s\n", packageType);
     initHardwareId();
     printf("Device model: %s\n", gDeviceModel);
@@ -1469,18 +1539,37 @@ int main(int argc, char **argv)
 
     if (!NetworkManager::initialize())
     {
-        failExit("Network connection failed or timed out.");
+        failExit("Network services failed to initialize.");
     }
     atexit(NetworkManager::shutdown);
 
-    int sock = NetworkManager::getSocket();
-    if (sock < 0)
+    if (!NetworkManager::waitForConnected(35000))
     {
-        failExit("No valid socket connection\n");
+        char connectionError[160];
+        snprintf(connectionError, sizeof(connectionError), "%s", NetworkManager::lastError());
+        NetworkManager::disconnect();
+#if UPDATER_ENABLED
+        // A failed WSS attempt may still be inside its bounded TLS handshake.
+        // Let the worker close it before opening the updater's TLS connection,
+        // avoiding two heavyweight TLS sessions on memory-constrained systems.
+        if (!NetworkManager::waitForDisconnected(35000))
+            failExit("Secure connection worker did not stop.\nRestart Collab Doodle and try again.");
+        // The updater deliberately remains reachable even when the realtime
+        // endpoint or WebSocket protocol is broken. This prevents future
+        // transport migrations from stranding an installed client.
+        drawStatusScreen("Connection failed", "Checking for an update", 0, 0);
+        HttpsUpdateAttempt updateAttempt = offerHttpsUpdate(packageType, updateTargetPath, installedTitleId);
+        if (updateAttempt.result == UPDATE_DOWNLOAD_OK)
+            exitAfterUpdateInstalled(packageType, installedTitleId);
+        if (strcmp(packageType, "cia") == 0 && updateAttempt.result == UPDATE_DOWNLOAD_INSTALL_FAILED)
+            failExit("CIA install failed.\n%s", Updater::lastError());
+#endif
+        failExit("Secure connection failed.\n%s\nUpdate recovery: %s",
+                 connectionError, Updater::lastError());
         return 1;
     }
 
-    if (!sendClientHello(sock, packageType))
+    if (!sendClientHello(packageType))
     {
         failExit("Failed to send client hello.");
     }
@@ -1538,7 +1627,7 @@ int main(int argc, char **argv)
     int connectedUserCount = 0;
     IdentityInfo identityInfo;
     memset(&identityInfo, 0, sizeof(identityInfo));
-    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%s", gIdentity.displayName);
+    snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%.24s", gIdentity.displayName);
     snprintf(identityInfo.username, sizeof(identityInfo.username), "%s", gIdentity.username);
     snprintf(identityInfo.role, sizeof(identityInfo.role), "user");
     snprintf(identityInfo.status, sizeof(identityInfo.status), "active");
@@ -1645,29 +1734,29 @@ int main(int argc, char **argv)
 
     auto sendDisplayNameValue = [&](const char *displayName) -> bool
     {
-        if (!displayName || !displayName[0] || NetworkManager::getSocket() < 0)
+        if (!displayName || !displayName[0] || !NetworkManager::checkConnection())
             return false;
         char command[96];
         Protocol::buildSetDisplayName(command, sizeof(command), displayName);
-        return NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command));
+        return NetworkManager::sendText(command);
     };
 
     auto sendRulesValue = [&](const char *version) -> bool
     {
-        if (!version || !version[0] || NetworkManager::getSocket() < 0)
+        if (!version || !version[0] || !NetworkManager::checkConnection())
             return false;
         char command[96];
         Protocol::buildRulesAccepted(command, sizeof(command), version);
-        return NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command));
+        return NetworkManager::sendText(command);
     };
 
     auto requestOnboardingState = [&]() -> bool
     {
-        if (NetworkManager::getSocket() < 0)
+        if (!NetworkManager::checkConnection())
             return false;
         char command[64];
         Protocol::buildGetOnboardingState(command, sizeof(command));
-        return NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command));
+        return NetworkManager::sendText(command);
     };
 
     auto retryPendingOnboardingSubmission = [&]() -> bool
@@ -1695,7 +1784,7 @@ int main(int argc, char **argv)
             setTicketNotice("TICKET CONNECTION FAILED");
             return false;
         }
-        if (!NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command)))
+        if (!NetworkManager::sendText(command))
         {
             setTicketNotice("TICKET SEND FAILED");
             return false;
@@ -2161,52 +2250,83 @@ int main(int argc, char **argv)
         return false;
     };
 
-    if (sock >= 0)
     {
-        char line[CONTROL_LINE_CAPACITY];
         CanvasMeta meta;
         bool receivedMeta = false;
-        while (NetworkManager::readLine(sock, line, sizeof(line)))
+        bool initialHelloSent = true;
+        std::vector<uint8_t> initialCanvas;
+        u64 initialDeadline = osGetTime() + 15000;
+        NetworkEvent event;
+        while (osGetTime() < initialDeadline)
         {
+            if (!NetworkManager::waitEvent(event, 250))
+                continue;
+            if (event.type == NETWORK_EVENT_ERROR || event.type == NETWORK_EVENT_DISCONNECTED)
+            {
+                printf("Initial connection failed: %s\n", event.detail.c_str());
+                receivedMeta = false;
+                initialHelloSent = false;
+                initialCanvas.clear();
+                continue;
+            }
+            if (event.type == NETWORK_EVENT_CONNECTED)
+            {
+                if (!initialHelloSent)
+                {
+                    initialHelloSent = sendClientHello(packageType);
+                    if (!initialHelloSent)
+                        NetworkManager::reconnect();
+                }
+                continue;
+            }
+            if (event.type == NETWORK_EVENT_BINARY)
+            {
+                if (receivedMeta)
+                {
+                    initialCanvas = std::move(event.payload);
+                    break;
+                }
+                continue;
+            }
+            if (event.type != NETWORK_EVENT_TEXT || event.payload.size() >= CONTROL_LINE_CAPACITY)
+                continue;
+
+            std::string line(event.payload.begin(), event.payload.end());
             char latestVersion[32] = "";
             char updateReason[48] = "";
-            if (Protocol::parseUpdateRequired(line, latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
+            if (Protocol::parseUpdateRequired(line.c_str(), latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
             {
                 printf("Update required: %s Latest: %s\n", updateReason, latestVersion);
-#if TEST_MODE
-                failExit("Server requested update to %s.\nTEST_MODE disables updater.", latestVersion);
+#if !UPDATER_ENABLED
+                failExit("Server requested update to %s.\nThis build has the updater disabled.", latestVersion);
 #else
-                UpdateManifest manifest;
-                UpdateDownloadResult updateResult = UPDATE_DOWNLOAD_FAILED;
-                if (Updater::fetchManifest(SERVER_HTTP_HOST, SERVER_HTTP_PORT, APP_VERSION, packageType, manifest) && waitForUpdateConfirm(manifest))
-                {
-                    if (strcmp(packageType, "cia") == 0)
-                        updateResult = Updater::downloadAndInstallCia(SERVER_HTTP_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath,
-                                                                       installedTitleId, updateProgress, NULL);
-                    else
-                        updateResult = Updater::downloadUpdate(SERVER_HTTP_HOST, SERVER_HTTP_PORT, manifest, updateTargetPath, updateProgress, NULL);
-                }
-                if (updateResult == UPDATE_DOWNLOAD_OK)
-                {
+                NetworkManager::disconnect();
+                if (!NetworkManager::waitForDisconnected(35000))
+                    failExit("Secure connection worker did not stop.\nRestart Collab Doodle and try again.");
+                HttpsUpdateAttempt updateAttempt = offerHttpsUpdate(packageType, updateTargetPath, installedTitleId);
+                if (updateAttempt.result == UPDATE_DOWNLOAD_OK)
                     exitAfterUpdateInstalled(packageType, installedTitleId);
-                }
-                if (strcmp(packageType, "cia") == 0 && updateResult == UPDATE_DOWNLOAD_INSTALL_FAILED)
+                if (strcmp(packageType, "cia") == 0 && updateAttempt.result == UPDATE_DOWNLOAD_INSTALL_FAILED)
                     failExit("CIA install failed.\n%s", Updater::lastError());
                 failExit("Update required.\nDownload the latest Collab Doodle build to continue.");
 #endif
             }
 
-            if (handleJsonControl(line))
+            if (handleJsonControl(line.c_str()))
             {
                 if (supportOnlyMode)
                     break;
                 continue;
             }
 
-            if (Protocol::parseCanvasMeta(line, meta))
+            if (Protocol::parseCanvasMeta(line.c_str(), meta))
             {
+                if (!isValidCanvasMeta(meta))
+                {
+                    printf("Invalid initial canvas size: %d\n", meta.compressedSize);
+                    break;
+                }
                 receivedMeta = true;
-                break;
             }
         }
 
@@ -2230,10 +2350,9 @@ int main(int argc, char **argv)
             canvas.setChannel(meta.channel);
             printf("Received canvas dimensions: W=%d, H=%d, Compressed Size=%d\n", canvasWidth, canvasHeight, meta.compressedSize);
 
-            u8 *compressedCanvas = (u8 *)malloc(meta.compressedSize);
-            if (compressedCanvas && NetworkManager::readExact(sock, compressedCanvas, meta.compressedSize))
+            if (initialCanvas.size() == (size_t)meta.compressedSize)
             {
-                if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, meta.compressedSize))
+                if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(initialCanvas.data(), initialCanvas.size()))
                 {
                     fullCanvas = canvas.pixels;
                     Renderer::invalidateMinimap();
@@ -2243,7 +2362,6 @@ int main(int argc, char **argv)
                 {
                     printf("Failed to decompress canvas data.\n");
                 }
-                free(compressedCanvas);
             }
             else
             {
@@ -2251,8 +2369,19 @@ int main(int argc, char **argv)
             }
         }
 
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        if (!supportOnlyMode && !fullCanvas)
+        {
+            // Keep the UI valid while the worker retries. A subsequent
+            // protocol-6 canvas message atomically replaces this placeholder.
+            canvasWidth = 320;
+            canvasHeight = 240;
+            canvas.allocate(canvasWidth, canvasHeight);
+            canvas.setChannel("main");
+            fullCanvas = canvas.pixels;
+            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SYNC FAILED - RETRYING");
+            topMode = TOP_MODE_STATUS;
+            NetworkManager::reconnect();
+        }
     }
 
     int offsetX = 0;
@@ -2264,10 +2393,11 @@ int main(int argc, char **argv)
     float lastStrokeX = 0.0f;
     float lastStrokeY = 0.0f;
     bool hasLastStrokePoint = false;
-    std::vector<uint8_t> realtimeReceiveBuffer;
     CanvasMeta realtimeCanvasMeta;
     memset(&realtimeCanvasMeta, 0, sizeof(realtimeCanvasMeta));
     bool realtimeCanvasPending = false;
+    bool sessionAwaitingSnapshot = false;
+    u64 sessionSnapshotDeadline = 0;
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
@@ -2278,96 +2408,24 @@ int main(int argc, char **argv)
         oy = canvas.offsetY;
     };
 
-    auto receiveCanvasSnapshot = [&](int activeSock, const char *context) -> bool
-    {
-        char response[CONTROL_LINE_CAPACITY];
-        CanvasMeta snapshotMeta;
-        bool gotMeta = false;
-        while (NetworkManager::readLine(activeSock, response, sizeof(response)))
-        {
-            char latestVersion[32] = "";
-            char updateReason[48] = "";
-            if (Protocol::parseUpdateRequired(response, latestVersion, sizeof(latestVersion), updateReason, sizeof(updateReason)))
-            {
-                updateAvailable = true;
-                setAdminNotice("UPDATE AVAILABLE");
-                continue;
-            }
-            if (handleJsonControl(response))
-            {
-                if (supportOnlyMode) return true;
-                continue;
-            }
-            if (Protocol::parseCanvasMeta(response, snapshotMeta))
-            {
-                gotMeta = true;
-                break;
-            }
-        }
-        if (!gotMeta)
-        {
-            printf("%s: failed to read canvas metadata.\n", context ? context : "canvas");
-            return false;
-        }
-
-        if (snapshotMeta.compressedSize <= 0 || snapshotMeta.compressedSize > 10000000)
-        {
-            printf("%s: invalid compressed size %d.\n", context ? context : "canvas", snapshotMeta.compressedSize);
-            return false;
-        }
-
-        u8 *compressedCanvas = (u8 *)malloc(snapshotMeta.compressedSize);
-        if (!compressedCanvas)
-            return false;
-        bool ok = false;
-        if (NetworkManager::readExact(activeSock, compressedCanvas, snapshotMeta.compressedSize))
-        {
-            canvasWidth = snapshotMeta.width;
-            canvasHeight = snapshotMeta.height;
-            canvas.setChannel(snapshotMeta.channel);
-            if (canvas.allocate(canvasWidth, canvasHeight) && canvas.loadFromCompressed(compressedCanvas, snapshotMeta.compressedSize))
-            {
-                fullCanvas = canvas.pixels;
-                offsetX = 0;
-                offsetY = 0;
-                clampOffsets(offsetX, offsetY);
-                canvas.markFullDirty();
-                Renderer::invalidateMinimap();
-                syncSelectedChannel();
-                ok = true;
-            }
-        }
-        free(compressedCanvas);
-        printf("%s: canvas snapshot %s.\n", context ? context : "canvas", ok ? "loaded" : "failed");
-        return ok;
-    };
-
     auto reconnectSession = [&](const char *context) -> bool
     {
         bool wasSupportOnly = supportOnlyMode;
         supportOnlyMode = false;
-        realtimeReceiveBuffer.clear();
         realtimeCanvasPending = false;
+        sessionAwaitingSnapshot = false;
+        sessionSnapshotDeadline = 0;
         UIState::clearPoints();
-        if (!NetworkManager::reconnect() || !sendClientHello(NetworkManager::getSocket(), packageType))
+        if (!NetworkManager::reconnect())
         {
             supportOnlyMode = wasSupportOnly;
             snprintf(gDisconnectReason, sizeof(gDisconnectReason), "RECONNECT FAILED - PRESS A");
             topMode = TOP_MODE_STATUS;
             return false;
         }
-        sock = NetworkManager::getSocket();
-        if (!receiveCanvasSnapshot(sock, context))
-        {
-            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "REFRESH FAILED - PRESS A");
-            topMode = TOP_MODE_STATUS;
-            return false;
-        }
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-        gDisconnectReason[0] = '\0';
-        setAdminNotice(updateAvailable ? "RECONNECTED - UPDATE AVAILABLE" : "RECONNECTED");
-        topMode = supportOnlyMode ? TOP_MODE_TICKETS : TOP_MODE_CANVAS;
+        snprintf(gDisconnectReason, sizeof(gDisconnectReason), "RECONNECTING");
+        setAdminNotice(context && context[0] ? "RECONNECTING" : "CONNECTING");
+        topMode = TOP_MODE_STATUS;
         topRenderFrame = 10;
         return true;
     };
@@ -2388,7 +2446,7 @@ int main(int argc, char **argv)
         char command[256];
         Protocol::buildAdminCanvasCommand(command, sizeof(command), action, canvas.channel[0] ? canvas.channel : "main",
                                           x, y, w, h, color.r, color.g, color.b);
-        if (!NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command)))
+        if (!NetworkManager::sendText(command))
         {
             setAdminNotice("SEND FAILED");
             return false;
@@ -2414,16 +2472,15 @@ int main(int argc, char **argv)
 
         char command[96];
         Protocol::buildSwitchChannel(command, sizeof(command), availableChannels[selectedChannel]);
-        if (!NetworkManager::sendAll(NetworkManager::getSocket(), command, strlen(command)))
+        if (!NetworkManager::sendText(command))
         {
             printf("Failed to request channel switch.\n");
             return false;
         }
 
         printf("Switching to channel %s...\n", availableChannels[selectedChannel]);
-        // The response is consumed by the buffered realtime stream parser. TCP
-        // may combine gate JSON, drawing packets, and canvas metadata in one
-        // recv(), so reading a single line synchronously here is not safe.
+        // Protocol 6 delivers the metadata and snapshot as distinct WebSocket
+        // messages; the realtime event loop consumes both asynchronously.
         return true;
     };
 
@@ -2523,8 +2580,9 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            char request[] = "getCanvas\n";
-            if (!NetworkManager::sendAll(NetworkManager::getSocket(), request, strlen(request))) {
+            char request[48];
+            Protocol::buildGetCanvas(request, sizeof(request));
+            if (!NetworkManager::sendText(request)) {
                 printf("Failed to send refresh request.\n");
                 continue;
             }
@@ -2941,7 +2999,7 @@ int main(int argc, char **argv)
         }
         else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_X))
         {
-            if (recoverIdentity(NetworkManager::getSocket()))
+            if (recoverIdentity())
             {
                 setIdentityNotice("RECOVERING");
             }
@@ -2949,7 +3007,7 @@ int main(int argc, char **argv)
         }
         else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_Y))
         {
-            if (requestBackupCode(NetworkManager::getSocket()))
+            if (requestBackupCode())
             {
                 setIdentityNotice("CODE SENT");
             }
@@ -3320,15 +3378,12 @@ int main(int argc, char **argv)
                     {
                         if (!NetworkManager::checkConnection())
                         {
-                            if (!reconnectSession("draw-reconnect"))
-                            {
-                                UIState::clearPoints();
-                                gRainbowStrokeColorValid = false;
-                                continue;
-                            }
-                            sock = NetworkManager::getSocket();
+                            reconnectSession("draw-reconnect");
+                            UIState::clearPoints();
+                            gRainbowStrokeColorValid = false;
+                            continue;
                         }
-                        sendDrawBatchCommand(sock, UIState::getPoints(), gRainbowStrokeColor,
+                        sendDrawBatchCommand(UIState::getPoints(), gRainbowStrokeColor,
                                              currentBrushSize, effectiveBrushShape());
                         UIState::clearPoints();
                     }
@@ -3379,14 +3434,12 @@ int main(int argc, char **argv)
                     {
                         if (!NetworkManager::checkConnection()) {
                             printf("Connection lost while drawing! Attempting to reconnect...\n");
-                            if (!reconnectSession("draw-reconnect")) {
-                                UIState::clearPoints(); // Clear points if reconnect failed
-                                continue;
-                            }
-                            sock = NetworkManager::getSocket();
+                            reconnectSession("draw-reconnect");
+                            UIState::clearPoints();
+                            continue;
                         }
                         Color drawColor = effectiveDrawColor();
-                        sendDrawBatchCommand(sock, UIState::getPoints(), drawColor,
+                        sendDrawBatchCommand(UIState::getPoints(), drawColor,
                                              currentBrushSize, effectiveBrushShape());
                         UIState::clearPoints();
                     }
@@ -3412,14 +3465,12 @@ int main(int argc, char **argv)
                 {
                     if (!NetworkManager::checkConnection()) {
                         printf("Connection lost while drawing! Attempting to reconnect...\n");
-                        if (!reconnectSession("draw-reconnect")) {
-                            UIState::clearPoints(); // Clear points if reconnect failed
-                            continue;
-                        }
-                        sock = NetworkManager::getSocket();
+                        reconnectSession("draw-reconnect");
+                        UIState::clearPoints();
+                        continue;
                     }
                     Color drawColor = effectiveDrawColor();
-                    sendDrawBatchCommand(sock, UIState::getPoints(), drawColor,
+                    sendDrawBatchCommand(UIState::getPoints(), drawColor,
                                          currentBrushSize, effectiveBrushShape());
                     UIState::clearPoints();
                 }
@@ -3430,175 +3481,168 @@ int main(int argc, char **argv)
             }
         }
 
-        // Server messages
-        if (sock >= 0)
+        // WebSocket messages are already framed and copied out of the network
+        // worker. Keep a per-frame event budget so drawing/rendering cannot be
+        // starved by a busy connection; a canvas snapshot is allowed through as
+        // one large event.
+        NetworkEvent networkEvent;
+        size_t networkBytesThisFrame = 0;
+        int networkEventsThisFrame = 0;
+        while (networkEventsThisFrame < 32 &&
+               (networkBytesThisFrame < 16 * 1024 || networkEventsThisFrame == 0) &&
+               NetworkManager::pollEvent(networkEvent))
         {
-            uint8_t packetBuffer[4096];
-            const size_t receiveBudget = 16 * 1024;
-            size_t receivedThisFrame = 0;
-            bool peerClosed = false;
-            bool receiveFailed = false;
-            while (receivedThisFrame < receiveBudget)
+            networkEventsThisFrame++;
+            networkBytesThisFrame += networkEvent.payload.size();
+
+            if (networkEvent.type == NETWORK_EVENT_CONNECTED)
             {
-                size_t requestSize = std::min(sizeof(packetBuffer), receiveBudget - receivedThisFrame);
-                int recvLen = recv(sock, packetBuffer, requestSize, 0);
-                if (recvLen > 0)
+                realtimeCanvasPending = false;
+                sessionAwaitingSnapshot = sendClientHello(packageType);
+                sessionSnapshotDeadline = sessionAwaitingSnapshot ? osGetTime() + 30000 : 0;
+                if (!sessionAwaitingSnapshot)
                 {
-                    realtimeReceiveBuffer.insert(realtimeReceiveBuffer.end(), packetBuffer, packetBuffer + recvLen);
-                    receivedThisFrame += (size_t)recvLen;
-                    continue;
+                    snprintf(gDisconnectReason, sizeof(gDisconnectReason), "HELLO SEND FAILED");
+                    topMode = TOP_MODE_STATUS;
+                    NetworkManager::reconnect();
                 }
-                if (recvLen == 0)
+                else
                 {
-                    peerClosed = true;
-                    break;
+                    snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SYNCING CANVAS");
+                    setAdminNotice("CONNECTED - SYNCING");
+                    topMode = TOP_MODE_STATUS;
                 }
-                if (errno == EINTR)
-                    continue;
-                if (errno != EWOULDBLOCK && errno != EAGAIN)
-                    receiveFailed = true;
-                break;
+                topRenderFrame = 10;
+                continue;
             }
 
-            if (!realtimeReceiveBuffer.empty())
+            if (networkEvent.type == NETWORK_EVENT_DISCONNECTED || networkEvent.type == NETWORK_EVENT_ERROR)
             {
-                while (!realtimeReceiveBuffer.empty())
-                {
-                    if (realtimeCanvasPending)
-                    {
-                        size_t compressedSize = (size_t)realtimeCanvasMeta.compressedSize;
-                        if (realtimeReceiveBuffer.size() < compressedSize)
-                            break;
+                realtimeCanvasPending = false;
+                sessionAwaitingSnapshot = false;
+                sessionSnapshotDeadline = 0;
+                UIState::clearPoints();
+                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "%s",
+                         networkEvent.type == NETWORK_EVENT_ERROR ? "NETWORK ERROR - RETRYING" : "CONNECTION LOST - RETRYING");
+                setAdminNotice(networkEvent.detail.empty() ? gDisconnectReason : networkEvent.detail.c_str());
+                topMode = TOP_MODE_STATUS;
+                topRenderFrame = 10;
+                continue;
+            }
 
+            if (networkEvent.type == NETWORK_EVENT_TEXT)
+            {
+                if (networkEvent.payload.empty() || networkEvent.payload.size() > 32768)
+                {
+                    NetworkManager::disconnect();
+                    snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SERVER MESSAGE TOO LARGE");
+                    topMode = TOP_MODE_STATUS;
+                    topRenderFrame = 10;
+                    continue;
+                }
+                std::string line(networkEvent.payload.begin(), networkEvent.payload.end());
+                CanvasMeta meta;
+                if (Protocol::parseCanvasMeta(line.c_str(), meta))
+                {
+                    if (!isValidCanvasMeta(meta))
+                    {
+                        setAdminNotice("INVALID CANVAS SIZE");
+                        NetworkManager::reconnect();
+                        continue;
+                    }
+                    realtimeCanvasMeta = meta;
+                    realtimeCanvasPending = true;
+                    sessionAwaitingSnapshot = true;
+                    sessionSnapshotDeadline = osGetTime() + 30000;
+                    continue;
+                }
+
+                char latestVersion[32] = "";
+                char updateReason[48] = "";
+                if (Protocol::parseUpdateRequired(line.c_str(), latestVersion, sizeof(latestVersion),
+                                                  updateReason, sizeof(updateReason)))
+                {
+                    updateAvailable = true;
+                    setAdminNotice("UPDATE AVAILABLE");
+                    continue;
+                }
+                handleJsonControl(line.c_str());
+                // Support-only sessions intentionally have no drawing canvas.
+                // Receiving that gate completes their reconnect handshake.
+                if (supportOnlyMode)
+                {
+                    sessionAwaitingSnapshot = false;
+                    sessionSnapshotDeadline = 0;
+                    gDisconnectReason[0] = '\0';
+                }
+                continue;
+            }
+
+            if (networkEvent.type == NETWORK_EVENT_BINARY)
+            {
+                if (realtimeCanvasPending)
+                {
+                    size_t expectedSize = (size_t)realtimeCanvasMeta.compressedSize;
+                    bool loaded = networkEvent.payload.size() == expectedSize;
+                    if (loaded)
+                    {
                         canvasWidth = realtimeCanvasMeta.width;
                         canvasHeight = realtimeCanvasMeta.height;
                         canvas.setChannel(realtimeCanvasMeta.channel);
-                        bool loaded = canvas.allocate(canvasWidth, canvasHeight) &&
-                                      canvas.loadFromCompressed(realtimeReceiveBuffer.data(), compressedSize);
-                        realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin(), realtimeReceiveBuffer.begin() + compressedSize);
-                        realtimeCanvasPending = false;
-                        if (loaded)
-                        {
-                            fullCanvas = canvas.pixels;
-                            offsetX = offsetY = 0;
-                            clampOffsets(offsetX, offsetY);
-                            canvas.markFullDirty();
-                            Renderer::invalidateMinimap();
-                            syncSelectedChannel();
-                            printf("Loaded realtime canvas %s.\n", canvas.channel);
-                        }
-                        else
-                            setAdminNotice("CANVAS LOAD FAILED");
-                        continue;
+                        loaded = canvas.allocate(canvasWidth, canvasHeight) &&
+                                 canvas.loadFromCompressed(networkEvent.payload.data(), networkEvent.payload.size());
                     }
-
-                    uint8_t frameType = realtimeReceiveBuffer[0];
-                    if (frameType == '{')
+                    realtimeCanvasPending = false;
+                    if (loaded)
                     {
-                        std::vector<uint8_t>::iterator newline = std::find(realtimeReceiveBuffer.begin(), realtimeReceiveBuffer.end(), (uint8_t)'\n');
-                        if (newline == realtimeReceiveBuffer.end())
-                        {
-                            if (realtimeReceiveBuffer.size() > 32768)
-                            {
-                                realtimeReceiveBuffer.clear();
-                                realtimeCanvasPending = false;
-                                NetworkManager::disconnect();
-                                sock = -1;
-                                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SERVER MESSAGE TOO LARGE");
-                                topMode = TOP_MODE_STATUS;
-                                topRenderFrame = 10;
-                            }
-                            break;
-                        }
-
-                        if ((size_t)std::distance(realtimeReceiveBuffer.begin(), newline) > 32768)
-                        {
-                            realtimeReceiveBuffer.clear();
-                            realtimeCanvasPending = false;
-                            NetworkManager::disconnect();
-                            sock = -1;
-                            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SERVER MESSAGE TOO LARGE");
-                            topMode = TOP_MODE_STATUS;
-                            topRenderFrame = 10;
-                            break;
-                        }
-
-                        std::string line(realtimeReceiveBuffer.begin(), newline);
-                        realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin(), newline + 1);
-                        if (line.empty())
-                            continue;
-
-                        CanvasMeta meta;
-                        if (Protocol::parseCanvasMeta(line.c_str(), meta))
-                        {
-                            if (meta.compressedSize <= 0 || meta.compressedSize > 10000000)
-                            {
-                                setAdminNotice("INVALID CANVAS SIZE");
-                                continue;
-                            }
-                            realtimeCanvasMeta = meta;
-                            realtimeCanvasPending = true;
-                        }
-                        else
-                            handleJsonControl(line.c_str());
-                        continue;
-                    }
-
-                    size_t binarySize = 0;
-                    if (frameType == 1)
-                    {
-                        if (realtimeReceiveBuffer.size() < 7)
-                            break;
-                        binarySize = 7 + (size_t)realtimeReceiveBuffer[6] * 4;
-                    }
-                    else if (frameType == 2)
-                        binarySize = 12;
-                    else if (frameType == 3)
-                    {
-                        if (realtimeReceiveBuffer.size() < 6)
-                            break;
-                        binarySize = 6 + (size_t)realtimeReceiveBuffer[5];
+                        fullCanvas = canvas.pixels;
+                        offsetX = offsetY = 0;
+                        clampOffsets(offsetX, offsetY);
+                        canvas.markFullDirty();
+                        Renderer::invalidateMinimap();
+                        syncSelectedChannel();
+                        sessionAwaitingSnapshot = false;
+                        sessionSnapshotDeadline = 0;
+                        gDisconnectReason[0] = '\0';
+                        setAdminNotice(updateAvailable ? "RECONNECTED - UPDATE AVAILABLE" : "CONNECTED");
+                        topMode = supportOnlyMode ? TOP_MODE_TICKETS : TOP_MODE_CANVAS;
+                        topRenderFrame = 10;
+                        printf("Loaded WebSocket canvas %s.\n", canvas.channel);
                     }
                     else
                     {
-                        // Drop only the unrecognized byte so a following JSON or
-                        // binary frame in the same TCP read can still be parsed.
-                        realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin());
-                        continue;
+                        sessionAwaitingSnapshot = false;
+                        sessionSnapshotDeadline = 0;
+                        snprintf(gDisconnectReason, sizeof(gDisconnectReason), "CANVAS LOAD FAILED - RETRYING");
+                        setAdminNotice("CANVAS LOAD FAILED");
+                        topMode = TOP_MODE_STATUS;
+                        NetworkManager::reconnect();
                     }
+                    continue;
+                }
 
-                    if (realtimeReceiveBuffer.size() < binarySize)
-                        break;
-                    if (processBinaryCanvasPackets(realtimeReceiveBuffer.data(), binarySize, canvas,
-                                                   fullCanvas, canvasWidth, canvasHeight, activeDrawLabels))
-                    {
-                        canvas.markFullDirty();
-                        Renderer::invalidateMinimap();
-                    }
-                    realtimeReceiveBuffer.erase(realtimeReceiveBuffer.begin(), realtimeReceiveBuffer.begin() + binarySize);
+                if (!networkEvent.payload.empty() &&
+                    processBinaryCanvasPackets(networkEvent.payload.data(), networkEvent.payload.size(), canvas,
+                                               fullCanvas, canvasWidth, canvasHeight, activeDrawLabels))
+                {
+                    canvas.markFullDirty();
+                    Renderer::invalidateMinimap();
                 }
             }
-            if (peerClosed && sock >= 0)
-            {
-                realtimeReceiveBuffer.clear();
-                realtimeCanvasPending = false;
-                NetworkManager::disconnect();
-                sock = -1;
-                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "CONNECTION LOST");
-                topMode = TOP_MODE_STATUS;
-                topRenderFrame = 10;
-                printf("Server disconnected.\n");
-            }
-            else if (receiveFailed && sock >= 0)
-            {
-                realtimeReceiveBuffer.clear();
-                realtimeCanvasPending = false;
-                NetworkManager::disconnect();
-                sock = -1;
-                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "NETWORK ERROR");
-                topMode = TOP_MODE_STATUS;
-                topRenderFrame = 10;
-            }
+        }
+
+        if (sessionAwaitingSnapshot && !supportOnlyMode &&
+            sessionSnapshotDeadline > 0 && osGetTime() >= sessionSnapshotDeadline)
+        {
+            sessionAwaitingSnapshot = false;
+            sessionSnapshotDeadline = 0;
+            realtimeCanvasPending = false;
+            UIState::clearPoints();
+            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SYNC TIMED OUT - RETRYING");
+            setAdminNotice("SYNC TIMED OUT - RETRYING");
+            topMode = TOP_MODE_STATUS;
+            topRenderFrame = 10;
+            NetworkManager::reconnect();
         }
 
         // Rendering
@@ -3679,7 +3723,7 @@ int main(int argc, char **argv)
             bool renderStaffScope = ticketView == 0 ? isModOrAdmin() : ticketStaffScope;
             int renderedOpenCount = isModOrAdmin() ? ticketStaffNeedsReply : 0;
             const char *renderedIdentityStatus = restrictionActive ? (supportOnlyMode ? "banned" : "muted") : identityInfo.status;
-            Renderer::renderTop(canvas, NetworkManager::isSocketConnected(), updateAvailable, currentColor,
+            Renderer::renderTop(canvas, NetworkManager::isConnected(), updateAvailable, currentColor,
                                 currentBrushSize, currentBrushShape, topMode,
                                 availableChannels, availableChannelCount, selectedChannel,
                                 selectedMenuItem, connectedUsers, connectedUserCount,
@@ -3725,8 +3769,7 @@ int main(int argc, char **argv)
         gfxSwapBuffers();
     }
 
-    if (sock >= 0)
-        close(sock);
+    NetworkManager::disconnect();
     free(buffer);
     aptUnhook(&aptCookie);
     gfxExit();

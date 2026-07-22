@@ -116,6 +116,7 @@ public:
                            const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
                            const char *displayName, const char *packageType);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
+    static void buildGetCanvas(char *buffer, size_t size);
     static void buildSetDisplayName(char *buffer, size_t size, const char *displayName);
     static void buildRulesAccepted(char *buffer, size_t size, const char *version);
     static void buildGetOnboardingState(char *buffer, size_t size);
@@ -136,7 +137,6 @@ public:
     static void buildStaffChatList(char *buffer, size_t size, int beforeId = 0);
     static void buildStaffChatSend(char *buffer, size_t size, const char *message);
     static void buildStaffChatRead(char *buffer, size_t size, int messageId);
-    static void buildUpdateRequest(char *buffer, size_t size);
 };
 
 #endif

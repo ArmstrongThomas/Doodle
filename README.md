@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.4.4`
+- Version: `1.5.0`
 
 ## Features
 
@@ -18,7 +18,8 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Device identity, display name, backup-code recovery, and connected-user list.
 - Mod/admin canvas tools with snapshot, clear, and selection-style fill rectangle.
 - Compressed canvas snapshots using zlib.
-- Server update checks with manifest, size, and SHA-256 verification.
+- Cloudflare-proxied WSS realtime transport with automatic sleep/Wi-Fi recovery, heartbeat detection, and reconnect backoff.
+- HTTPS update checks and downloads with certificate, size, and SHA-256 verification.
 - App metadata/icon via SMDH, including the visible app version/build label.
 - Optional `.cia` packaging when `makerom.exe` is installed.
 
@@ -76,31 +77,33 @@ make
 
 ## Build-Time Configuration
 
-The Makefile exposes release/server variables:
+The Makefile exposes these primary release/server variables:
 
 ```make
-APP_VERSION ?= 1.4.4
+APP_VERSION ?= 1.5.0
 CHAT_ENABLED ?= 0
 TEST_MODE ?= 0
 LOCAL_SERVER_HOST ?= 192.168.1.46
 REMOTE_TEST_SERVER_HOST ?= server2.rpgwo.org
 LIVE_SERVER_HOST ?= doodle.7db.pw
-LIVE_SERVER_TCP_HOST ?= tcp.doodle.7db.pw
-LIVE_SERVER_HTTP_HOST ?= server1.rpgwo.org
-SERVER_TCP_PORT ?= 3030
-SERVER_HTTP_PORT ?= 3000
+LIVE_SERVER_WS_PORT ?= 443
+LIVE_SERVER_WS_PATH ?= /ws/3ds
+LIVE_SERVER_HTTPS_PORT ?= 443
+LOCAL_SERVER_PORT ?= 3000
+REMOTE_TEST_SERVER_HTTPS_PORT ?= 443
 ```
 
 `TEST_MODE` selects the compiled server target:
 
-- `0`: live server, `server1.rpgwo.org` for HTTP/update checks and `tcp.doodle.7db.pw` for raw TCP drawing
-- `1`: local LAN server, `192.168.1.46`
-- `2`: remote test server, `server2.rpgwo.org`
+- `0`: `wss://doodle.7db.pw/ws/3ds` for realtime traffic and `https://doodle.7db.pw` for updates.
+- `1`: `ws://192.168.1.46:3000/ws/3ds` for local LAN testing. The updater is disabled by default.
+- `2`: `wss://server2.rpgwo.org/ws/3ds` and HTTPS on port `443`. The updater is disabled by default.
 
 Build the normal live release:
 
 ```powershell
 make TEST_MODE=0
+make verify-release-config TEST_MODE=0
 ```
 
 Local 3dslink test build with updater prompts disabled:
@@ -123,29 +126,35 @@ When `TEST_MODE=2`, successful builds are copied into the local web public direc
 If that public directory is hosted by the server2 web instance, the FBI remote install URL can stay stable:
 
 ```text
-http://server2.rpgwo.org/builds/CollabDoodle-test-server2.cia
+https://server2.rpgwo.org/builds/CollabDoodle-test-server2.cia
 ```
 
-You can still override the selected host for a one-off build:
+Override the realtime host for a one-off local build:
 
 ```powershell
-make TEST_MODE=1 SERVER_HOST=192.168.4.50
+make TEST_MODE=1 SERVER_WS_HOST=192.168.4.50
 ```
 
-For split-host builds, override the HTTP and TCP targets separately:
+Realtime and update endpoints can be overridden independently:
 
 ```powershell
-make TEST_MODE=0 SERVER_HTTP_HOST=doodle.7db.pw SERVER_TCP_HOST=tcp.doodle.7db.pw
+make TEST_MODE=0 SERVER_WS_HOST=staging.example.com SERVER_WS_PORT=443 SERVER_WS_PATH=/ws/3ds SERVER_WS_SECURE=1 SERVER_HTTPS_HOST=downloads.example.com SERVER_HTTPS_PORT=443
 ```
 
 CIA updater test build using the test title ID but keeping update checks enabled:
 
 ```powershell
-make TEST_MODE=1 DISABLE_UPDATER=0
-make cia TEST_MODE=1 DISABLE_UPDATER=0
+make TEST_MODE=2 DISABLE_UPDATER=0
+make cia TEST_MODE=2 DISABLE_UPDATER=0
 ```
 
-The selected TCP host is compiled into drawing/presence networking. The selected HTTP host is compiled into updater requests. Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds so Collab Doodle stays focused on shared drawing. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. By default test modes also disable client-side update prompts/downloads so test builds can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` when intentionally testing the updater from a test CIA. Test builds show as `Collab Doodle TEST` in app metadata and display a version label like `1.4.4-test1` or `1.4.4-test2` on the top screen.
+`SERVER_WS_HOST`, `SERVER_WS_PORT`, `SERVER_WS_PATH`, and `SERVER_WS_SECURE` control drawing/presence networking. `SERVER_HTTPS_HOST` and `SERVER_HTTPS_PORT` control updater requests. The older `SERVER_HOST` convenience override remains supported and sets both hosts for existing test scripts; use the explicit variables when the realtime and updater hosts differ.
+
+`make verify-release-config TEST_MODE=0` verifies the updater-enable bit and both production endpoints in the linked binary. The build also records all compile-affecting profile values in `build/.build-config`, so switching between release, test, host, or updater settings triggers the required rebuild instead of reusing stale objects.
+
+The updater always uses TLS. If it is intentionally enabled for `TEST_MODE=1`, point `SERVER_HTTPS_HOST` and `SERVER_HTTPS_PORT` at a real HTTPS endpoint whose certificate matches the host; the default local port `3000` is intended for the plain local WebSocket server, not an insecure updater fallback.
+
+Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. Test modes disable update prompts/downloads by default so they can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` only when intentionally testing against HTTPS. Test builds display labels such as `1.5.0-test1` or `1.5.0-test2`.
 
 ## CIA Packaging
 
@@ -181,7 +190,9 @@ CollabDoodle-update.3dsx
 
 ## Updates
 
-The client checks the same Doodle server for `/api/updates/latest`.
+The client checks `https://doodle.7db.pw/api/updates/latest` in release builds. Manifest and artifact transfers use certificate-verified HTTPS; there is no plaintext HTTP fallback.
+
+The updater is independent of the realtime WebSocket connection. If the initial WSS connection fails, the client attempts the HTTPS update path before presenting a terminal connection error. This preserves update recovery after future realtime protocol changes.
 
 When an update is available:
 
@@ -197,6 +208,10 @@ When an update is available:
 - If in-app CIA install fails repeatedly on hardware, the staged CIA path can still be installed manually with FBI as a fallback.
 
 Homebrew Launcher `.3dsx` apps do not currently support a reliable in-app relaunch of the freshly replaced file, so the final step is manual reopen.
+
+### 1.4.4 migration compatibility
+
+Version `1.4.4` clients still connect over direct raw TCP and cannot use Cloudflare's HTTP/WebSocket proxy for realtime traffic. Keep the server's temporary legacy TCP bridge enabled during the upgrade window. If in-app migration from 1.4.4 is required, its legacy update endpoint must also remain reachable long enough to publish the `1.5.0` update. Version `1.5.0` uses WSS and HTTPS; after adoption is sufficient, the legacy TCP listener can be disabled and the origin can be restricted to Cloudflare/tunnel traffic.
 
 ## Repository Notes
 

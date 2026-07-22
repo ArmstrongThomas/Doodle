@@ -34,65 +34,110 @@ include $(DEVKITARM)/3ds_rules
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 WIN_CURDIR	:=	$(shell cygpath -w "$(CURDIR)")
-SOURCES		:=	source
+SOURCES		:=	source vendor/mbedtls/library
 DATA		:=	data
-INCLUDES	:=	include
+INCLUDES	:=	include vendor/mbedtls/include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_VERSION	?=	1.4.4
+APP_VERSION	?=	1.5.0
 CHAT_ENABLED	?=	0
 TEST_MODE	?=	0
 LOCAL_SERVER_HOST	?=	192.168.1.46
 REMOTE_TEST_SERVER_HOST	?=	server2.rpgwo.org
 LIVE_SERVER_HOST	?=	doodle.7db.pw
-LIVE_SERVER_TCP_HOST	?=	tcp.doodle.7db.pw
-LIVE_SERVER_HTTP_HOST	?=	server1.rpgwo.org
-LOCAL_SERVER_HTTP_PORT	?=	3000
-REMOTE_TEST_SERVER_HTTP_PORT	?=	3000
-LIVE_SERVER_HTTP_PORT	?=	80
+LIVE_SERVER_WS_PORT	?=	443
+LIVE_SERVER_WS_PATH	?=	/ws/3ds
+LIVE_SERVER_HTTPS_PORT	?=	443
+LOCAL_SERVER_PORT	?=	3000
+REMOTE_TEST_SERVER_HTTPS_PORT	?=	443
 PUBLIC_BUILD_DIR	?=	$(CURDIR)/../Doodle-Server/public/builds
-ifeq ($(origin SERVER_TCP_HOST), undefined)
+
+ifeq ($(filter $(TEST_MODE),0 1 2),)
+$(error TEST_MODE must be 0 (release), 1 (local test), or 2 (remote test))
+endif
+
+ifeq ($(origin SERVER_WS_HOST), undefined)
 ifneq ($(origin SERVER_HOST), undefined)
-SERVER_TCP_HOST	:=	$(SERVER_HOST)
+SERVER_WS_HOST	:=	$(SERVER_HOST)
 else
 ifeq ($(TEST_MODE),1)
-SERVER_TCP_HOST	:=	$(LOCAL_SERVER_HOST)
+SERVER_WS_HOST	:=	$(LOCAL_SERVER_HOST)
 else ifeq ($(TEST_MODE),2)
-SERVER_TCP_HOST	:=	$(REMOTE_TEST_SERVER_HOST)
+SERVER_WS_HOST	:=	$(REMOTE_TEST_SERVER_HOST)
 else
-SERVER_TCP_HOST	:=	$(LIVE_SERVER_TCP_HOST)
+SERVER_WS_HOST	:=	$(LIVE_SERVER_HOST)
 endif
 endif
 endif
-ifeq ($(origin SERVER_HTTP_HOST), undefined)
+ifeq ($(origin SERVER_WS_PORT), undefined)
+ifeq ($(TEST_MODE),1)
+SERVER_WS_PORT	:=	$(LOCAL_SERVER_PORT)
+else ifeq ($(TEST_MODE),2)
+SERVER_WS_PORT	:=	$(REMOTE_TEST_SERVER_HTTPS_PORT)
+else
+SERVER_WS_PORT	:=	$(LIVE_SERVER_WS_PORT)
+endif
+endif
+SERVER_WS_PATH	?=	$(LIVE_SERVER_WS_PATH)
+# MSYS2 otherwise rewrites the leading slash in this -D value into a host
+# filesystem path before invoking the native devkitARM compiler.
+ifeq ($(findstring -DSERVER_WS_PATH=,$(MSYS2_ARG_CONV_EXCL)),)
+MSYS2_ARG_CONV_EXCL	:=	$(if $(MSYS2_ARG_CONV_EXCL),$(MSYS2_ARG_CONV_EXCL);)-DSERVER_WS_PATH=
+endif
+export MSYS2_ARG_CONV_EXCL
+ifeq ($(origin SERVER_WS_SECURE), undefined)
+ifeq ($(TEST_MODE),1)
+SERVER_WS_SECURE	:=	0
+else
+SERVER_WS_SECURE	:=	1
+endif
+endif
+ifeq ($(origin SERVER_HTTPS_HOST), undefined)
 ifneq ($(origin SERVER_HOST), undefined)
-SERVER_HTTP_HOST	:=	$(SERVER_HOST)
+SERVER_HTTPS_HOST	:=	$(SERVER_HOST)
 else
 ifeq ($(TEST_MODE),1)
-SERVER_HTTP_HOST	:=	$(LOCAL_SERVER_HOST)
+SERVER_HTTPS_HOST	:=	$(LOCAL_SERVER_HOST)
 else ifeq ($(TEST_MODE),2)
-SERVER_HTTP_HOST	:=	$(REMOTE_TEST_SERVER_HOST)
+SERVER_HTTPS_HOST	:=	$(REMOTE_TEST_SERVER_HOST)
 else
-SERVER_HTTP_HOST	:=	$(LIVE_SERVER_HTTP_HOST)
+SERVER_HTTPS_HOST	:=	$(LIVE_SERVER_HOST)
 endif
 endif
 endif
-SERVER_TCP_PORT	?=	3030
-ifeq ($(origin SERVER_HTTP_PORT), undefined)
+ifeq ($(origin SERVER_HTTPS_PORT), undefined)
 ifeq ($(TEST_MODE),1)
-SERVER_HTTP_PORT	:=	$(LOCAL_SERVER_HTTP_PORT)
+SERVER_HTTPS_PORT	:=	$(LOCAL_SERVER_PORT)
 else ifeq ($(TEST_MODE),2)
-SERVER_HTTP_PORT	:=	$(REMOTE_TEST_SERVER_HTTP_PORT)
+SERVER_HTTPS_PORT	:=	$(REMOTE_TEST_SERVER_HTTPS_PORT)
 else
-SERVER_HTTP_PORT	:=	$(LIVE_SERVER_HTTP_PORT)
+SERVER_HTTPS_PORT	:=	$(LIVE_SERVER_HTTPS_PORT)
 endif
 endif
-DISABLE_UPDATER	?=	$(TEST_MODE)
+
+# Release builds update by default; test builds do not. DISABLE_UPDATER remains
+# the compatibility override used by the self-update scripts (0 enables it).
+ifeq ($(origin DISABLE_UPDATER), undefined)
+ifeq ($(TEST_MODE),0)
+DISABLE_UPDATER	:=	0
+else
+DISABLE_UPDATER	:=	1
+endif
+endif
+ifeq ($(filter $(DISABLE_UPDATER),0 1),)
+$(error DISABLE_UPDATER must be 0 or 1)
+endif
+ifeq ($(DISABLE_UPDATER),0)
+UPDATER_ENABLED	:=	1
+else
+UPDATER_ENABLED	:=	0
+endif
+
 ifneq ($(TEST_MODE),0)
 BUILD_TAG	:=	TEST
 APP_BUILD_LABEL	:=	$(APP_VERSION)-test$(TEST_MODE)
 APP_TITLE	:=	Collab Doodle TEST
-APP_DESCRIPTION	:=	Test $(TEST_MODE) build $(APP_VERSION) for $(SERVER_TCP_HOST)
+APP_DESCRIPTION	:=	Test $(TEST_MODE) build $(APP_VERSION) for $(SERVER_WS_HOST)
 else
 BUILD_TAG	:=	RELEASE
 APP_BUILD_LABEL	:=	$(APP_VERSION)
@@ -118,13 +163,15 @@ CFLAGS	+=	$(INCLUDE) -D__3DS__ \
 			-DAPP_VERSION=\"$(APP_VERSION)\" \
 			-DAPP_BUILD_LABEL=\"$(APP_BUILD_LABEL)\" \
 			-DAPP_BUILD_TAG=\"$(BUILD_TAG)\" \
-			-DSERVER_HOST=\"$(SERVER_TCP_HOST)\" \
-			-DSERVER_TCP_HOST=\"$(SERVER_TCP_HOST)\" \
-			-DSERVER_HTTP_HOST=\"$(SERVER_HTTP_HOST)\" \
-			-DSERVER_TCP_PORT=\"$(SERVER_TCP_PORT)\" \
-			-DSERVER_HTTP_PORT=\"$(SERVER_HTTP_PORT)\" \
+			-DSERVER_WS_HOST=\"$(SERVER_WS_HOST)\" \
+			-DSERVER_WS_PORT=\"$(SERVER_WS_PORT)\" \
+			-DSERVER_WS_PATH=\"$(SERVER_WS_PATH)\" \
+			-DSERVER_WS_SECURE=$(SERVER_WS_SECURE) \
+			-DSERVER_HTTPS_HOST=\"$(SERVER_HTTPS_HOST)\" \
+			-DSERVER_HTTPS_PORT=\"$(SERVER_HTTPS_PORT)\" \
 			-DCHAT_ENABLED=$(CHAT_ENABLED) \
-			-DTEST_MODE=$(DISABLE_UPDATER)
+			-DTEST_MODE=$(TEST_MODE) \
+			-DUPDATER_ENABLED=$(UPDATER_ENABLED)
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
@@ -137,6 +184,11 @@ LIBS	:= -lctru -lm -lz
 # include and lib
 #---------------------------------------------------------------------------------
 LIBDIRS := $(CTRULIB) $(DEVKITPRO)/portlibs/3ds
+
+# Every compile-affecting mode/host/flag is recorded in a content-stable stamp.
+# All objects depend on it, so changing command-line or environment settings
+# forces a rebuild without penalizing unchanged incremental builds.
+CONFIG_STAMP	:=	$(TOPDIR)/$(BUILD)/.build-config
 
 
 #---------------------------------------------------------------------------------
@@ -231,16 +283,29 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean cia
+.PHONY: all clean cia verify-release-config FORCE
 
 #---------------------------------------------------------------------------------
-all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
+all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(CONFIG_STAMP) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 ifeq ($(TEST_MODE),2)
 	@mkdir -p "$(PUBLIC_BUILD_DIR)"
 	@cp "$(OUTPUT).3dsx" "$(PUBLIC_BUILD_DIR)/CollabDoodle-test-server2.3dsx"
 	@echo published remote test 3dsx to "$(PUBLIC_BUILD_DIR)/CollabDoodle-test-server2.3dsx"
 endif
+
+verify-release-config: all
+	@if [ "$(TEST_MODE)" != "0" ]; then echo "verify-release-config requires TEST_MODE=0"; exit 1; fi
+	@if [ "$(UPDATER_ENABLED)" != "1" ]; then echo "release updater is not enabled"; exit 1; fi
+	@grep -Fqx 'TEST_MODE=0' "$(CONFIG_STAMP)"
+	@grep -Fqx 'DISABLE_UPDATER=0' "$(CONFIG_STAMP)"
+	@grep -Fqx 'UPDATER_ENABLED=1' "$(CONFIG_STAMP)"
+	@grep -Fqx 'SERVER_WS_HOST=$(LIVE_SERVER_HOST)' "$(CONFIG_STAMP)"
+	@grep -Fqx 'SERVER_WS_SECURE=1' "$(CONFIG_STAMP)"
+	@grep -Fqx 'SERVER_HTTPS_HOST=$(LIVE_SERVER_HOST)' "$(CONFIG_STAMP)"
+	@grep -Fqx 'SERVER_HTTPS_PORT=$(LIVE_SERVER_HTTPS_PORT)' "$(CONFIG_STAMP)"
+	@$(DEVKITARM)/bin/arm-none-eabi-strings "$(OUTPUT).elf" | grep -Fq 'DoodleBuildConfig:test=0;updater=1;ws_secure=1;ws=$(LIVE_SERVER_HOST):$(LIVE_SERVER_WS_PORT)$(LIVE_SERVER_WS_PATH);https=$(LIVE_SERVER_HOST):$(LIVE_SERVER_HTTPS_PORT)'
+	@echo "verified release config: updater enabled; WSS $(LIVE_SERVER_HOST):$(LIVE_SERVER_WS_PORT)$(LIVE_SERVER_WS_PATH)"
 
 cia:
 	@powershell -ExecutionPolicy Bypass -File "$(WIN_CURDIR)\scripts\build-cia.ps1" -ProjectRoot "$(WIN_CURDIR)" -AppVersion "$(APP_VERSION)" -TestMode $(TEST_MODE) -AppTitle "$(APP_TITLE)" -AppDescription "$(APP_DESCRIPTION)" -AppAuthor "$(APP_AUTHOR)"
@@ -252,6 +317,47 @@ endif
 
 $(BUILD):
 	@mkdir -p $@
+
+FORCE:
+
+$(CONFIG_STAMP): FORCE | $(BUILD)
+	@{ printf '%s\n' \
+		'APP_VERSION=$(APP_VERSION)' \
+		'TEST_MODE=$(TEST_MODE)' \
+		'DISABLE_UPDATER=$(DISABLE_UPDATER)' \
+		'UPDATER_ENABLED=$(UPDATER_ENABLED)' \
+		'APP_BUILD_LABEL=$(APP_BUILD_LABEL)' \
+		'APP_BUILD_TAG=$(BUILD_TAG)' \
+		'APP_TITLE=$(APP_TITLE)' \
+		'APP_DESCRIPTION=$(APP_DESCRIPTION)' \
+		'APP_AUTHOR=$(APP_AUTHOR)' \
+		'SERVER_WS_HOST=$(SERVER_WS_HOST)' \
+		'SERVER_WS_PORT=$(SERVER_WS_PORT)' \
+		'SERVER_WS_PATH=$(SERVER_WS_PATH)' \
+		'SERVER_WS_SECURE=$(SERVER_WS_SECURE)' \
+		'SERVER_HTTPS_HOST=$(SERVER_HTTPS_HOST)' \
+		'SERVER_HTTPS_PORT=$(SERVER_HTTPS_PORT)' \
+		'CHAT_ENABLED=$(CHAT_ENABLED)' \
+		'SOURCES=$(SOURCES)' \
+		'DATA=$(DATA)' \
+		'INCLUDES=$(INCLUDES)' \
+		'CFLAGS=$(CFLAGS)' \
+		'CXXFLAGS=$(CXXFLAGS)' \
+		'ASFLAGS=$(ASFLAGS)' \
+		'LDFLAGS=$(LDFLAGS)' \
+		'LIBS=$(LIBS)' \
+		'LIBDIRS=$(LIBDIRS)' \
+		'NO_SMDH=$(NO_SMDH)' \
+		'ROMFS=$(ROMFS)' \
+		'_3DSXFLAGS=$(_3DSXFLAGS)' \
+		'MSYS2_ARG_CONV_EXCL=$(MSYS2_ARG_CONV_EXCL)'; \
+	} > "$@.tmp"
+	@if [ -r "$@" ] && cmp -s "$@.tmp" "$@"; then \
+		rm -f "$@.tmp"; \
+	else \
+		mv -f "$@.tmp" "$@"; \
+		echo "build configuration changed; rebuilding objects"; \
+	fi
 
 ifneq ($(GFXBUILD),$(BUILD))
 $(GFXBUILD):
@@ -283,6 +389,9 @@ else
 $(OUTPUT).3dsx	:	$(OUTPUT).elf $(_3DSXDEPS)
 
 $(OFILES_SOURCES) : $(HFILES)
+$(OFILES_SOURCES) : $(CONFIG_STAMP)
+
+$(OUTPUT).smdh : $(CONFIG_STAMP)
 
 $(OUTPUT).elf	:	$(OFILES)
 
@@ -290,6 +399,12 @@ $(OUTPUT).elf	:	$(OFILES)
 # you need a rule like this for each extension you use as binary data
 #---------------------------------------------------------------------------------
 %.bin.o	%_bin.h :	%.bin
+#---------------------------------------------------------------------------------
+	@echo $(notdir $<)
+	@$(bin2o)
+
+#---------------------------------------------------------------------------------
+%.pem.o	%_pem.h :	%.pem
 #---------------------------------------------------------------------------------
 	@echo $(notdir $<)
 	@$(bin2o)

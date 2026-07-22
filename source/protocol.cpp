@@ -417,9 +417,9 @@ void Protocol::buildHello(char *buffer, size_t size, const char *appId, const ch
                           const char *displayName, const char *packageType)
 {
     snprintf(buffer, size,
-             "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":5,\"updaterSupported\":%s,"
+             "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":6,\"updaterSupported\":%s,"
              "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\","
-             "\"deviceModel\":\"%s\",\"displayName\":\"%s\"}\n",
+             "\"deviceModel\":\"%s\",\"displayName\":\"%s\"}",
              appId, version, updaterSupported ? "true" : "false",
              packageType ? packageType : "3dsx",
              deviceId ? deviceId : "", deviceSecret ? deviceSecret : "", hardwareId ? hardwareId : "",
@@ -429,26 +429,31 @@ void Protocol::buildHello(char *buffer, size_t size, const char *appId, const ch
 
 void Protocol::buildSwitchChannel(char *buffer, size_t size, const char *channel)
 {
-    snprintf(buffer, size, "{\"type\":\"switchChannel\",\"channel\":\"%s\"}\n", channel);
+    snprintf(buffer, size, "{\"type\":\"switchChannel\",\"channel\":\"%s\"}", channel);
+}
+
+void Protocol::buildGetCanvas(char *buffer, size_t size)
+{
+    snprintf(buffer, size, "{\"type\":\"getCanvas\"}");
 }
 
 void Protocol::buildSetDisplayName(char *buffer, size_t size, const char *displayName)
 {
     char safeName[25];
     jsonSafeString(displayName, safeName, sizeof(safeName));
-    snprintf(buffer, size, "{\"type\":\"setDisplayName\",\"displayName\":\"%s\"}\n", safeName);
+    snprintf(buffer, size, "{\"type\":\"setDisplayName\",\"displayName\":\"%s\"}", safeName);
 }
 
 void Protocol::buildRulesAccepted(char *buffer, size_t size, const char *version)
 {
     char safeVersion[32];
     jsonSafeString(version, safeVersion, sizeof(safeVersion));
-    snprintf(buffer, size, "{\"type\":\"rulesAccepted\",\"version\":\"%s\"}\n", safeVersion[0] ? safeVersion : "1");
+    snprintf(buffer, size, "{\"type\":\"rulesAccepted\",\"version\":\"%s\"}", safeVersion[0] ? safeVersion : "1");
 }
 
 void Protocol::buildGetOnboardingState(char *buffer, size_t size)
 {
-    snprintf(buffer, size, "{\"type\":\"getOnboardingState\"}\n");
+    snprintf(buffer, size, "{\"type\":\"getOnboardingState\"}");
 }
 
 void Protocol::buildRecoverIdentity(char *buffer, size_t size, const char *username, const char *backupCode,
@@ -466,13 +471,13 @@ void Protocol::buildRecoverIdentity(char *buffer, size_t size, const char *usern
     jsonSafeString(hardwareId, safeHardware, sizeof(safeHardware));
     snprintf(buffer, size,
              "{\"type\":\"recoverIdentity\",\"username\":\"%s\",\"backupCode\":\"%s\","
-             "\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\"}\n",
+             "\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\"}",
              safeUsername, safeBackup, safeDeviceId, safeSecret, safeHardware);
 }
 
 void Protocol::buildRotateBackupCode(char *buffer, size_t size)
 {
-    snprintf(buffer, size, "{\"type\":\"rotateBackupCode\"}\n");
+    snprintf(buffer, size, "{\"type\":\"rotateBackupCode\"}");
 }
 
 void Protocol::buildModerationCommand(char *buffer, size_t size, const char *action, const char *identityId,
@@ -485,7 +490,7 @@ void Protocol::buildModerationCommand(char *buffer, size_t size, const char *act
     jsonSafeString(identityId, safeIdentity, sizeof(safeIdentity));
     jsonSafeString(reason, safeReason, sizeof(safeReason));
     snprintf(buffer, size,
-             "{\"type\":\"moderation\",\"action\":\"%s\",\"identityId\":\"%s\",\"messageId\":%d,\"reason\":\"%s\"}\n",
+             "{\"type\":\"moderation\",\"action\":\"%s\",\"identityId\":\"%s\",\"messageId\":%d,\"reason\":\"%s\"}",
              safeAction, safeIdentity, messageId, safeReason);
 }
 
@@ -499,7 +504,7 @@ void Protocol::buildAdminCanvasCommand(char *buffer, size_t size, const char *ac
     snprintf(buffer, size,
              "{\"type\":\"adminCanvas\",\"action\":\"%s\",\"channel\":\"%s\","
              "\"rect\":{\"x\":%d,\"y\":%d,\"width\":%d,\"height\":%d},"
-             "\"color\":[%d,%d,%d]}\n",
+             "\"color\":[%d,%d,%d]}",
              safeAction, safeChannel, x, y, width, height, r, g, b);
 }
 
@@ -511,7 +516,7 @@ void Protocol::buildTicketCreate(char *buffer, size_t size, const char *category
     jsonSafeString(category, safeCategory, sizeof(safeCategory));
     jsonSafeString(subject, safeSubject, sizeof(safeSubject));
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
-    snprintf(buffer, size, "{\"type\":\"ticketCreate\",\"category\":\"%s\",\"subject\":\"%s\",\"message\":\"%s\"}\n",
+    snprintf(buffer, size, "{\"type\":\"ticketCreate\",\"category\":\"%s\",\"subject\":\"%s\",\"message\":\"%s\"}",
              safeCategory, safeSubject, safeMessage);
 }
 
@@ -522,13 +527,13 @@ void Protocol::buildTicketList(char *buffer, size_t size, bool staff, const char
     jsonSafeString(status, safeStatus, sizeof(safeStatus));
     jsonSafeString(category, safeCategory, sizeof(safeCategory));
     snprintf(buffer, size,
-             "{\"type\":\"ticketList\",\"scope\":\"%s\",\"status\":\"%s\",\"category\":\"%s\",\"beforeId\":%d,\"limit\":6}\n",
+             "{\"type\":\"ticketList\",\"scope\":\"%s\",\"status\":\"%s\",\"category\":\"%s\",\"beforeId\":%d,\"limit\":6}",
              staff ? "staff" : "mine", safeStatus, safeCategory, std::max(0, beforeId));
 }
 
 void Protocol::buildTicketGet(char *buffer, size_t size, int ticketId, int beforeMessageId)
 {
-    snprintf(buffer, size, "{\"type\":\"ticketGet\",\"ticketId\":%d,\"beforeMessageId\":%d,\"limit\":6}\n",
+    snprintf(buffer, size, "{\"type\":\"ticketGet\",\"ticketId\":%d,\"beforeMessageId\":%d,\"limit\":6}",
              std::max(0, ticketId), std::max(0, beforeMessageId));
 }
 
@@ -536,7 +541,7 @@ void Protocol::buildTicketReply(char *buffer, size_t size, int ticketId, const c
 {
     char safeMessage[241];
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
-    snprintf(buffer, size, "{\"type\":\"ticketReply\",\"ticketId\":%d,\"staff\":%s,\"message\":\"%s\"}\n",
+    snprintf(buffer, size, "{\"type\":\"ticketReply\",\"ticketId\":%d,\"staff\":%s,\"message\":\"%s\"}",
              std::max(0, ticketId), staff ? "true" : "false", safeMessage);
 }
 
@@ -546,38 +551,33 @@ void Protocol::buildTicketStatus(char *buffer, size_t size, int ticketId, const 
     char safeMessage[241];
     jsonSafeString(status, safeStatus, sizeof(safeStatus));
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
-    snprintf(buffer, size, "{\"type\":\"ticketStatus\",\"ticketId\":%d,\"status\":\"%s\",\"message\":\"%s\"}\n",
+    snprintf(buffer, size, "{\"type\":\"ticketStatus\",\"ticketId\":%d,\"status\":\"%s\",\"message\":\"%s\"}",
              std::max(0, ticketId), safeStatus, safeMessage);
 }
 
 void Protocol::buildTicketApproveUnban(char *buffer, size_t size, int ticketId)
 {
-    snprintf(buffer, size, "{\"type\":\"ticketApproveUnban\",\"ticketId\":%d}\n", std::max(0, ticketId));
+    snprintf(buffer, size, "{\"type\":\"ticketApproveUnban\",\"ticketId\":%d}", std::max(0, ticketId));
 }
 
 void Protocol::buildTicketCounts(char *buffer, size_t size)
 {
-    snprintf(buffer, size, "{\"type\":\"ticketCounts\"}\n");
+    snprintf(buffer, size, "{\"type\":\"ticketCounts\"}");
 }
 
 void Protocol::buildStaffChatList(char *buffer, size_t size, int beforeId)
 {
-    snprintf(buffer, size, "{\"type\":\"staffChatList\",\"beforeId\":%d,\"limit\":8}\n", std::max(0, beforeId));
+    snprintf(buffer, size, "{\"type\":\"staffChatList\",\"beforeId\":%d,\"limit\":8}", std::max(0, beforeId));
 }
 
 void Protocol::buildStaffChatSend(char *buffer, size_t size, const char *message)
 {
     char safeMessage[241];
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
-    snprintf(buffer, size, "{\"type\":\"staffChatSend\",\"message\":\"%s\"}\n", safeMessage);
+    snprintf(buffer, size, "{\"type\":\"staffChatSend\",\"message\":\"%s\"}", safeMessage);
 }
 
 void Protocol::buildStaffChatRead(char *buffer, size_t size, int messageId)
 {
-    snprintf(buffer, size, "{\"type\":\"staffChatRead\",\"messageId\":%d}\n", std::max(0, messageId));
-}
-
-void Protocol::buildUpdateRequest(char *buffer, size_t size)
-{
-    snprintf(buffer, size, "GET /api/updates/latest HTTP/1.0\r\nHost: %s\r\n\r\n", SERVER_HTTP_HOST);
+    snprintf(buffer, size, "{\"type\":\"staffChatRead\",\"messageId\":%d}", std::max(0, messageId));
 }

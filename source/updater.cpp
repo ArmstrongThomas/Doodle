@@ -1,16 +1,19 @@
 #include "updater.h"
-#include "network.h"
+#include "https_client.h"
 #include <3ds.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <netdb.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <limits.h>
+#include <ctype.h>
 
 static const char *UPDATE_FINAL_PATH = "sdmc:/3ds/CollabDoodle-update.3dsx";
 static const int INSTALL_PROGRESS_OFFSET = 1000000;
+static const int MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
+static const char *EXPECTED_APP_ID = "collab-doodle";
 static char gLastUpdateError[160] = "";
 
 static void setUpdateError(const char *fmt, ...)
@@ -159,49 +162,303 @@ static bool fileSha256(const char *path, char outHex[65])
     unsigned char buffer[2048];
     while (true)
     {
-        int read = fread(buffer, 1, sizeof(buffer), file);
+        size_t read = fread(buffer, 1, sizeof(buffer), file);
         if (read > 0)
-            sha256Update(state, buffer, read);
-        if (read < (int)sizeof(buffer))
+            sha256Update(state, buffer, (int)read);
+        if (read < sizeof(buffer))
             break;
     }
+    bool ok = ferror(file) == 0;
     fclose(file);
+    if (!ok)
+        return false;
     sha256Final(state, outHex);
+    return true;
+}
+
+static void skipJsonWhitespace(const char *&ptr)
+{
+    while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n')
+        ++ptr;
+}
+
+static bool appendJsonByte(char *out, size_t outSize, size_t &length, char value)
+{
+    if (!out || outSize == 0 || length + 1 >= outSize)
+        return false;
+    out[length++] = value;
+    out[length] = '\0';
+    return true;
+}
+
+static bool parseJsonQuotedString(const char *&ptr, char *out, size_t outSize)
+{
+    if (!ptr || *ptr != '"' || !out || outSize == 0)
+        return false;
+    ++ptr;
+    size_t length = 0;
+    out[0] = '\0';
+    while (*ptr && *ptr != '"')
+    {
+        unsigned char value = (unsigned char)*ptr++;
+        if (value < 0x20)
+            return false;
+        if (value != '\\')
+        {
+            if (!appendJsonByte(out, outSize, length, (char)value))
+                return false;
+            continue;
+        }
+
+        char escaped = *ptr++;
+        if (!escaped)
+            return false;
+        if (escaped == '"' || escaped == '\\' || escaped == '/')
+            value = (unsigned char)escaped;
+        else if (escaped == 'b') value = '\b';
+        else if (escaped == 'f') value = '\f';
+        else if (escaped == 'n') value = '\n';
+        else if (escaped == 'r') value = '\r';
+        else if (escaped == 't') value = '\t';
+        else if (escaped == 'u')
+        {
+            unsigned int codepoint = 0;
+            for (int i = 0; i < 4; ++i)
+            {
+                unsigned char digit = (unsigned char)*ptr++;
+                if (!isxdigit(digit))
+                    return false;
+                codepoint <<= 4;
+                codepoint |= digit >= '0' && digit <= '9' ? digit - '0' :
+                             digit >= 'a' && digit <= 'f' ? digit - 'a' + 10 : digit - 'A' + 10;
+            }
+            value = (codepoint >= 0x20 && codepoint <= 0x7e) ? (unsigned char)codepoint : '?';
+        }
+        else
+            return false;
+        if (!appendJsonByte(out, outSize, length, (char)value))
+            return false;
+    }
+    if (*ptr != '"')
+        return false;
+    ++ptr;
+    return true;
+}
+
+static bool skipJsonValue(const char *&ptr, int depth);
+
+static bool skipJsonObject(const char *&ptr, int depth)
+{
+    if (*ptr++ != '{' || depth > 12)
+        return false;
+    skipJsonWhitespace(ptr);
+    if (*ptr == '}')
+    {
+        ++ptr;
+        return true;
+    }
+    while (*ptr)
+    {
+        char key[96];
+        if (!parseJsonQuotedString(ptr, key, sizeof(key)))
+            return false;
+        skipJsonWhitespace(ptr);
+        if (*ptr++ != ':')
+            return false;
+        if (!skipJsonValue(ptr, depth + 1))
+            return false;
+        skipJsonWhitespace(ptr);
+        if (*ptr == '}')
+        {
+            ++ptr;
+            return true;
+        }
+        if (*ptr++ != ',')
+            return false;
+        skipJsonWhitespace(ptr);
+    }
+    return false;
+}
+
+static bool skipJsonArray(const char *&ptr, int depth)
+{
+    if (*ptr++ != '[' || depth > 12)
+        return false;
+    skipJsonWhitespace(ptr);
+    if (*ptr == ']')
+    {
+        ++ptr;
+        return true;
+    }
+    while (*ptr)
+    {
+        if (!skipJsonValue(ptr, depth + 1))
+            return false;
+        skipJsonWhitespace(ptr);
+        if (*ptr == ']')
+        {
+            ++ptr;
+            return true;
+        }
+        if (*ptr++ != ',')
+            return false;
+        skipJsonWhitespace(ptr);
+    }
+    return false;
+}
+
+static bool skipJsonNumber(const char *&ptr)
+{
+    const char *start = ptr;
+    if (*ptr == '-') ++ptr;
+    if (*ptr == '0')
+        ++ptr;
+    else
+    {
+        if (!isdigit((unsigned char)*ptr)) return false;
+        while (isdigit((unsigned char)*ptr)) ++ptr;
+    }
+    if (*ptr == '.')
+    {
+        ++ptr;
+        if (!isdigit((unsigned char)*ptr)) return false;
+        while (isdigit((unsigned char)*ptr)) ++ptr;
+    }
+    if (*ptr == 'e' || *ptr == 'E')
+    {
+        ++ptr;
+        if (*ptr == '+' || *ptr == '-') ++ptr;
+        if (!isdigit((unsigned char)*ptr)) return false;
+        while (isdigit((unsigned char)*ptr)) ++ptr;
+    }
+    return ptr > start;
+}
+
+static bool skipJsonValue(const char *&ptr, int depth)
+{
+    if (depth > 12)
+        return false;
+    skipJsonWhitespace(ptr);
+    if (*ptr == '"')
+    {
+        char discarded[512];
+        return parseJsonQuotedString(ptr, discarded, sizeof(discarded));
+    }
+    if (*ptr == '{') return skipJsonObject(ptr, depth);
+    if (*ptr == '[') return skipJsonArray(ptr, depth);
+    if (strncmp(ptr, "true", 4) == 0) { ptr += 4; return true; }
+    if (strncmp(ptr, "false", 5) == 0) { ptr += 5; return true; }
+    if (strncmp(ptr, "null", 4) == 0) { ptr += 4; return true; }
+    return skipJsonNumber(ptr);
+}
+
+static bool findTopLevelJsonValue(const char *text, const char *wantedKey, const char *&value)
+{
+    if (!text || !wantedKey)
+        return false;
+    const char *ptr = text;
+    skipJsonWhitespace(ptr);
+    if (*ptr++ != '{')
+        return false;
+    skipJsonWhitespace(ptr);
+    const char *match = NULL;
+    if (*ptr == '}')
+        ++ptr;
+    else
+    {
+        while (*ptr)
+        {
+            char key[96];
+            if (!parseJsonQuotedString(ptr, key, sizeof(key)))
+                return false;
+            skipJsonWhitespace(ptr);
+            if (*ptr++ != ':')
+                return false;
+            skipJsonWhitespace(ptr);
+            const char *candidate = ptr;
+            if (!skipJsonValue(ptr, 1))
+                return false;
+            if (strcmp(key, wantedKey) == 0)
+            {
+                if (match)
+                    return false;
+                match = candidate;
+            }
+            skipJsonWhitespace(ptr);
+            if (*ptr == '}')
+            {
+                ++ptr;
+                break;
+            }
+            if (*ptr++ != ',')
+                return false;
+            skipJsonWhitespace(ptr);
+        }
+    }
+    skipJsonWhitespace(ptr);
+    if (*ptr != '\0' || !match)
+        return false;
+    value = match;
     return true;
 }
 
 static bool parseJsonString(const char *text, const char *key, char *out, size_t outSize)
 {
-    out[0] = '\0';
-    const char *ptr = strstr(text, key);
-    if (!ptr)
+    const char *value = NULL;
+    if (!findTopLevelJsonValue(text, key, value))
         return false;
-    ptr += strlen(key);
-    const char *end = strchr(ptr, '"');
-    if (!end)
+    return parseJsonQuotedString(value, out, outSize);
+}
+
+static bool parseJsonPositiveInt(const char *text, const char *key, int &result)
+{
+    const char *value = NULL;
+    if (!findTopLevelJsonValue(text, key, value) || !isdigit((unsigned char)*value))
         return false;
-    size_t len = end - ptr;
-    if (len >= outSize)
-        len = outSize - 1;
-    memcpy(out, ptr, len);
-    out[len] = '\0';
+    unsigned long long parsed = 0;
+    while (isdigit((unsigned char)*value))
+    {
+        parsed = parsed * 10 + (*value++ - '0');
+        if (parsed > (unsigned long long)INT_MAX)
+            return false;
+    }
+    skipJsonWhitespace(value);
+    if (*value != ',' && *value != '}')
+        return false;
+    if (parsed == 0)
+        return false;
+    result = (int)parsed;
     return true;
 }
 
-static int parseJsonInt(const char *text, const char *key)
+static bool parseVersion(const char *version, int parts[3])
 {
-    const char *ptr = strstr(text, key);
-    if (!ptr)
-        return 0;
-    return atoi(ptr + strlen(key));
+    if (!version)
+        return false;
+    const char *ptr = version;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (!isdigit((unsigned char)*ptr))
+            return false;
+        int value = 0;
+        while (isdigit((unsigned char)*ptr))
+        {
+            value = value * 10 + (*ptr++ - '0');
+            if (value > 999999)
+                return false;
+        }
+        parts[i] = value;
+        if (i < 2)
+        {
+            if (*ptr++ != '.')
+                return false;
+        }
+    }
+    return *ptr == '\0';
 }
 
-static int compareVersions(const char *left, const char *right)
+static int compareVersionParts(const int leftParts[3], const int rightParts[3])
 {
-    int leftParts[3] = {0, 0, 0};
-    int rightParts[3] = {0, 0, 0};
-    sscanf(left ? left : "0.0.0", "%d.%d.%d", &leftParts[0], &leftParts[1], &leftParts[2]);
-    sscanf(right ? right : "0.0.0", "%d.%d.%d", &rightParts[0], &rightParts[1], &rightParts[2]);
 
     for (int i = 0; i < 3; i++)
     {
@@ -213,61 +470,61 @@ static int compareVersions(const char *left, const char *right)
     return 0;
 }
 
-static bool connectHttp(const char *serverDomain, const char *httpPort, int &sock)
+static bool isHexSha256(const char *digest)
 {
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
+    if (!digest || strlen(digest) != 64)
         return false;
-
-    struct addrinfo hints;
-    struct addrinfo *result;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(serverDomain, httpPort, &hints, &result) != 0)
+    for (int i = 0; i < 64; ++i)
     {
-        close(sock);
-        sock = -1;
-        return false;
+        if (!isxdigit((unsigned char)digest[i]))
+            return false;
     }
-
-    bool connected = false;
-    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next)
-    {
-        if (::connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
-        {
-            connected = true;
-            break;
-        }
-    }
-    freeaddrinfo(result);
-    if (!connected)
-    {
-        close(sock);
-        sock = -1;
-    }
-    return connected;
+    return true;
 }
 
-static bool readHttpResponse(int sock, char *response, int responseSize, int &responseLen)
+static bool isSafeArtifactName(const char *name)
 {
-    responseLen = 0;
-    while (responseLen < responseSize - 1)
+    if (!name || !name[0])
+        return false;
+    for (const unsigned char *ptr = (const unsigned char *)name; *ptr; ++ptr)
     {
-        int len = recv(sock, response + responseLen, responseSize - 1 - responseLen, 0);
-        if (len <= 0)
-            break;
-        responseLen += len;
+        if (!(isalnum(*ptr) || *ptr == '.' || *ptr == '-' || *ptr == '_'))
+            return false;
     }
-    response[responseLen] = '\0';
-    return responseLen > 0;
+    return true;
 }
 
-static const char *httpBody(char *response)
+static bool artifactNameMatchesType(const char *name, const char *packageType)
 {
-    char *body = strstr(response, "\r\n\r\n");
-    return body ? body + 4 : response;
+    if (!name || !packageType)
+        return false;
+    const char *extension = strcmp(packageType, "cia") == 0 ? ".cia" : ".3dsx";
+    size_t nameLength = strlen(name);
+    size_t extensionLength = strlen(extension);
+    return nameLength > extensionLength && strcasecmp(name + nameLength - extensionLength, extension) == 0;
+}
+
+struct ManifestSink
+{
+    char *buffer;
+    size_t capacity;
+    size_t length;
+};
+
+static bool appendManifestBody(const unsigned char *data, size_t length, void *userData)
+{
+    ManifestSink *sink = (ManifestSink *)userData;
+    if (!sink || sink->length > sink->capacity || length > sink->capacity - sink->length)
+        return false;
+    for (size_t i = 0; i < length; ++i)
+    {
+        if (data[i] == 0)
+            return false;
+    }
+    memcpy(sink->buffer + sink->length, data, length);
+    sink->length += length;
+    sink->buffer[sink->length] = '\0';
+    return true;
 }
 
 bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, const char *currentVersion, UpdateManifest &manifest)
@@ -278,52 +535,148 @@ bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, cons
 bool Updater::fetchManifest(const char *serverDomain, const char *httpPort, const char *currentVersion,
                             const char *packageType, UpdateManifest &manifest)
 {
+    setUpdateError("");
     memset(&manifest, 0, sizeof(manifest));
 
-    int sock = -1;
-    if (!connectHttp(serverDomain, httpPort, sock))
-        return false;
-
     const char *cleanPackage = (packageType && strcmp(packageType, "cia") == 0) ? "cia" : "3dsx";
-    char request[224];
-    snprintf(request, sizeof(request), "GET /api/updates/latest?package=%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
-             cleanPackage, serverDomain);
-    if (!NetworkManager::sendAll(sock, request, strlen(request)))
+    char path[96];
+    snprintf(path, sizeof(path), "/api/updates/latest?package=%s", cleanPackage);
+
+    char body[8192];
+    ManifestSink sink = {body, sizeof(body) - 1, 0};
+    body[0] = '\0';
+    HttpsResponse response;
+    char httpsError[160];
+    if (!HttpsClient::get(serverDomain, httpPort, path, sizeof(body) - 1,
+                          appendManifestBody, &sink, response,
+                          httpsError, sizeof(httpsError)))
     {
-        close(sock);
+        setUpdateError("MANIFEST HTTPS: %s", httpsError);
         return false;
     }
 
-    char response[8192];
-    int responseLen = 0;
-    bool ok = readHttpResponse(sock, response, sizeof(response), responseLen);
-    close(sock);
-    if (!ok)
+    if (response.bodyBytes != sink.length)
+    {
+        setUpdateError("MANIFEST BODY LENGTH MISMATCH");
         return false;
+    }
 
-    const char *body = httpBody(response);
-    if (!parseJsonString(body, "\"latestVersion\":\"", manifest.latestVersion, sizeof(manifest.latestVersion)))
+    char appId[32];
+    if (!parseJsonString(body, "appId", appId, sizeof(appId)) || strcmp(appId, EXPECTED_APP_ID) != 0 ||
+        !parseJsonString(body, "latestVersion", manifest.latestVersion, sizeof(manifest.latestVersion)))
+    {
+        setUpdateError("MANIFEST JSON INVALID");
         return false;
+    }
 
-    parseJsonString(body, "\"releaseNotes\":\"", manifest.releaseNotes, sizeof(manifest.releaseNotes));
-    parseJsonString(body, "\"artifactUrl\":\"", manifest.artifactUrl, sizeof(manifest.artifactUrl));
-    parseJsonString(body, "\"artifactName\":\"", manifest.artifactName, sizeof(manifest.artifactName));
-    parseJsonString(body, "\"artifactType\":\"", manifest.artifactType, sizeof(manifest.artifactType));
-    parseJsonString(body, "\"sha256\":\"", manifest.sha256, sizeof(manifest.sha256));
-    manifest.artifactSize = parseJsonInt(body, "\"artifactSize\":");
-    manifest.available = compareVersions(manifest.latestVersion, currentVersion) > 0;
+    int latestParts[3];
+    int currentParts[3];
+    if (!parseVersion(manifest.latestVersion, latestParts) || !parseVersion(currentVersion, currentParts))
+    {
+        setUpdateError("MANIFEST VERSION INVALID");
+        return false;
+    }
+
+    parseJsonString(body, "releaseNotes", manifest.releaseNotes, sizeof(manifest.releaseNotes));
+    parseJsonString(body, "artifactUrl", manifest.artifactUrl, sizeof(manifest.artifactUrl));
+    parseJsonString(body, "artifactName", manifest.artifactName, sizeof(manifest.artifactName));
+    parseJsonString(body, "artifactType", manifest.artifactType, sizeof(manifest.artifactType));
+    parseJsonString(body, "sha256", manifest.sha256, sizeof(manifest.sha256));
+    parseJsonPositiveInt(body, "artifactSize", manifest.artifactSize);
+    manifest.available = compareVersionParts(latestParts, currentParts) > 0;
+
+    if (manifest.available &&
+        (!manifest.artifactUrl[0] || !isSafeArtifactName(manifest.artifactName) ||
+         !artifactNameMatchesType(manifest.artifactName, cleanPackage) ||
+         strcmp(manifest.artifactType, cleanPackage) != 0 || !isHexSha256(manifest.sha256) ||
+         manifest.artifactSize <= 0 || manifest.artifactSize > MAX_ARTIFACT_BYTES))
+    {
+        setUpdateError("MANIFEST ARTIFACT INVALID");
+        memset(&manifest, 0, sizeof(manifest));
+        return false;
+    }
     return true;
 }
 
-static const char *artifactPathFromUrl(const char *artifactUrl)
+static bool artifactPathFromUrl(const char *artifactUrl, const char *serverDomain, const char *httpsPort,
+                                const char *artifactName, char *outPath, size_t outSize)
 {
-    const char *path = strstr(artifactUrl, "/updates/");
-    return path ? path : NULL;
+    if (!artifactUrl || !serverDomain || !httpsPort || !artifactName || !outPath || outSize == 0)
+        return false;
+    for (const unsigned char *ptr = (const unsigned char *)artifactUrl; *ptr; ++ptr)
+    {
+        if (*ptr <= 0x20 || *ptr == 0x7f || *ptr == '\\' || *ptr == '#')
+            return false;
+    }
+
+    const char *path = artifactUrl;
+    if (strncasecmp(artifactUrl, "https://", 8) == 0)
+    {
+        const char *authority = artifactUrl + 8;
+        const char *pathStart = strchr(authority, '/');
+        if (!pathStart || pathStart == authority)
+            return false;
+        size_t authorityLength = (size_t)(pathStart - authority);
+        if (authorityLength >= 320 || memchr(authority, '@', authorityLength))
+            return false;
+        char authorityCopy[320];
+        memcpy(authorityCopy, authority, authorityLength);
+        authorityCopy[authorityLength] = '\0';
+
+        char *host = authorityCopy;
+        const char *port = "443";
+        char *colon = strrchr(authorityCopy, ':');
+        if (colon)
+        {
+            if (strchr(authorityCopy, ':') != colon)
+                return false;
+            *colon = '\0';
+            port = colon + 1;
+        }
+        if (!host[0] || !port[0] || strcasecmp(host, serverDomain) != 0 || strcmp(port, httpsPort) != 0)
+            return false;
+        path = pathStart;
+    }
+    else if (strstr(artifactUrl, "://"))
+        return false;
+
+    char expectedPath[160];
+    int expectedLength = snprintf(expectedPath, sizeof(expectedPath), "/updates/%s", artifactName);
+    if (expectedLength <= 0 || expectedLength >= (int)sizeof(expectedPath) ||
+        strncmp(path, expectedPath, (size_t)expectedLength) != 0 ||
+        (path[expectedLength] != '\0' && path[expectedLength] != '?'))
+        return false;
+    int written = snprintf(outPath, outSize, "%s", path);
+    return written > 0 && written < (int)outSize;
 }
 
-static void makeSiblingPath(const char *targetPath, const char *suffix, char *out, size_t outSize)
+struct DownloadSink
 {
-    snprintf(out, outSize, "%s%s", targetPath && targetPath[0] ? targetPath : UPDATE_FINAL_PATH, suffix);
+    FILE *file;
+    size_t written;
+    int expected;
+    UpdateProgressCallback progress;
+    void *progressUserData;
+};
+
+static bool writeDownloadBody(const unsigned char *data, size_t length, void *userData)
+{
+    DownloadSink *sink = (DownloadSink *)userData;
+    if (!sink || !sink->file || length > (size_t)0x7fffffff ||
+        sink->written > (size_t)0x7fffffff - length)
+        return false;
+    if (fwrite(data, 1, length, sink->file) != length)
+        return false;
+    sink->written += length;
+    if (sink->progress)
+        sink->progress((int)sink->written, sink->expected, sink->progressUserData);
+    return true;
+}
+
+static bool makeSiblingPath(const char *targetPath, const char *suffix, char *out, size_t outSize)
+{
+    int written = snprintf(out, outSize, "%s%s", targetPath && targetPath[0] ? targetPath : UPDATE_FINAL_PATH, suffix);
+    return written > 0 && written < (int)outSize;
 }
 
 static bool replaceWithBackup(const char *partPath, const char *targetPath)
@@ -332,9 +685,24 @@ static bool replaceWithBackup(const char *partPath, const char *targetPath)
         targetPath = UPDATE_FINAL_PATH;
 
     char backupPath[320];
-    makeSiblingPath(targetPath, ".bak", backupPath, sizeof(backupPath));
-    remove(backupPath);
-    rename(targetPath, backupPath);
+    if (!makeSiblingPath(targetPath, ".bak", backupPath, sizeof(backupPath)))
+    {
+        setUpdateError("UPDATE TARGET PATH TOO LONG");
+        return false;
+    }
+
+    struct stat targetInfo;
+    bool hadTarget = stat(targetPath, &targetInfo) == 0;
+    if (hadTarget && remove(backupPath) != 0 && errno != ENOENT)
+    {
+        setUpdateError("REMOVE OLD BACKUP ERR %d", errno);
+        return false;
+    }
+    if (hadTarget && rename(targetPath, backupPath) != 0)
+    {
+        setUpdateError("BACKUP UPDATE FILE ERR %d", errno);
+        return false;
+    }
 
     if (rename(partPath, targetPath) == 0)
     {
@@ -342,7 +710,11 @@ static bool replaceWithBackup(const char *partPath, const char *targetPath)
         return true;
     }
 
-    rename(backupPath, targetPath);
+    int replaceError = errno;
+    if (hadTarget && rename(backupPath, targetPath) != 0)
+        setUpdateError("REPLACE ERR %d; RESTORE ERR %d", replaceError, errno);
+    else
+        setUpdateError("REPLACE UPDATE FILE ERR %d", replaceError);
     return false;
 }
 
@@ -397,6 +769,11 @@ static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned lon
         setUpdateError("NO CIA PATH");
         return UPDATE_DOWNLOAD_INSTALL_FAILED;
     }
+    if (expectedTitleId == 0)
+    {
+        setUpdateError("INSTALLED TITLE ID UNAVAILABLE");
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
 
     FILE *file = fopen(ciaPath, "rb");
     if (!file)
@@ -405,10 +782,14 @@ static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned lon
         return UPDATE_DOWNLOAD_INSTALL_FAILED;
     }
 
-    fseek(file, 0, SEEK_END);
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        setUpdateError("CIA SEEK ERR %d", errno);
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
+    }
     long fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    if (fileSize <= 0)
+    if (fileSize <= 0 || fseek(file, 0, SEEK_SET) != 0)
     {
         setUpdateError("CIA SIZE %ld", fileSize);
         fclose(file);
@@ -430,10 +811,11 @@ static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned lon
     bool haveCiaInfo = readCiaInfo(ciaPath, info, media);
     if (!haveCiaInfo)
     {
-        media = MEDIATYPE_SD;
-        printf("CIA metadata unavailable; continuing with SD install.\n");
+        amExit();
+        fclose(file);
+        return UPDATE_DOWNLOAD_INSTALL_FAILED;
     }
-    if (haveCiaInfo && expectedTitleId != 0 && info.titleID != (u64)expectedTitleId)
+    if (info.titleID != (u64)expectedTitleId)
     {
         setUpdateError("TITLE MISMATCH GOT %08lX%08lX EXP %08lX%08lX",
                        (unsigned long)(info.titleID >> 32), (unsigned long)(info.titleID & 0xffffffff),
@@ -475,6 +857,7 @@ static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned lon
         size_t read = fread(buffer, 1, 64 * 1024, file);
         if (read == 0)
         {
+            setUpdateError("CIA READ ERR %d", ferror(file) ? errno : 0);
             ok = false;
             break;
         }
@@ -493,6 +876,11 @@ static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned lon
         if (progress)
             progress(INSTALL_PROGRESS_OFFSET + offset, (int)fileSize, userData);
     }
+    if (ferror(file))
+    {
+        setUpdateError("CIA READ ERR %d", errno);
+        ok = false;
+    }
 
     free(buffer);
     fclose(file);
@@ -505,6 +893,8 @@ static UpdateDownloadResult installCiaFromFile(const char *ciaPath, unsigned lon
     }
 
     ret = AM_FinishCiaInstall(ciaHandle);
+    if (R_FAILED(ret))
+        AM_CancelCIAInstall(ciaHandle);
     amExit();
     if (R_FAILED(ret))
     {
@@ -525,113 +915,83 @@ const char *Updater::lastError()
 UpdateDownloadResult Updater::downloadUpdate(const char *serverDomain, const char *httpPort, const UpdateManifest &manifest,
                                              const char *targetPath, UpdateProgressCallback progress, void *userData)
 {
+    setUpdateError("");
     if (!manifest.available)
         return UPDATE_DOWNLOAD_NO_UPDATE;
-    if (!manifest.artifactUrl[0])
+    if (!manifest.artifactUrl[0] || !isSafeArtifactName(manifest.artifactName) ||
+        (strcmp(manifest.artifactType, "cia") != 0 && strcmp(manifest.artifactType, "3dsx") != 0) ||
+        !artifactNameMatchesType(manifest.artifactName, manifest.artifactType))
         return UPDATE_DOWNLOAD_NO_ARTIFACT;
+    if (!isHexSha256(manifest.sha256))
+    {
+        setUpdateError("ARTIFACT CHECKSUM INVALID");
+        return UPDATE_DOWNLOAD_CHECKSUM_MISMATCH;
+    }
+    if (manifest.artifactSize <= 0 || manifest.artifactSize > MAX_ARTIFACT_BYTES)
+    {
+        setUpdateError("ARTIFACT SIZE INVALID");
+        return UPDATE_DOWNLOAD_SIZE_MISMATCH;
+    }
 
-    const char *path = artifactPathFromUrl(manifest.artifactUrl);
-    if (!path)
+    char downloadPath[320];
+    if (!artifactPathFromUrl(manifest.artifactUrl, serverDomain, httpPort,
+                             manifest.artifactName, downloadPath, sizeof(downloadPath)))
+    {
+        setUpdateError("ARTIFACT URL MUST BE SAME-ORIGIN HTTPS");
         return UPDATE_DOWNLOAD_NO_ARTIFACT;
-
-    int sock = -1;
-    if (!connectHttp(serverDomain, httpPort, sock))
-        return UPDATE_DOWNLOAD_FAILED;
+    }
 
     char partPath[320];
     if (targetPath && strncmp(targetPath, "sdmc:/cias/", 11) == 0)
         mkdir("sdmc:/cias", 0777);
-    makeSiblingPath(targetPath, ".part", partPath, sizeof(partPath));
-    remove(partPath);
-
-    char request[320];
-    snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, serverDomain);
-    if (!NetworkManager::sendAll(sock, request, strlen(request)))
+    if (!makeSiblingPath(targetPath, ".part", partPath, sizeof(partPath)))
     {
-        close(sock);
+        setUpdateError("UPDATE TARGET PATH TOO LONG");
         return UPDATE_DOWNLOAD_FAILED;
     }
+    remove(partPath);
 
     FILE *file = fopen(partPath, "wb");
     if (!file)
     {
-        close(sock);
+        setUpdateError("OPEN UPDATE FILE ERR %d", errno);
         return UPDATE_DOWNLOAD_FAILED;
     }
 
-    char buffer[2048];
-    bool headerDone = false;
-    int written = 0;
-    char headerBuffer[4096];
-    int headerLen = 0;
-
-    while (true)
+    DownloadSink sink = {file, 0, manifest.artifactSize, progress, userData};
+    HttpsResponse response;
+    char httpsError[160];
+    bool downloaded = HttpsClient::get(serverDomain, httpPort, downloadPath,
+                                       (size_t)manifest.artifactSize,
+                                       writeDownloadBody, &sink, response,
+                                       httpsError, sizeof(httpsError));
+    int closeResult = fclose(file);
+    if (!downloaded)
     {
-        int len = recv(sock, buffer, sizeof(buffer), 0);
-        if (len <= 0)
-            break;
-
-        if (!headerDone)
-        {
-            int copyLen = len;
-            if (headerLen + copyLen > (int)sizeof(headerBuffer) - 1)
-                copyLen = sizeof(headerBuffer) - 1 - headerLen;
-            if (copyLen > 0)
-            {
-                memcpy(headerBuffer + headerLen, buffer, copyLen);
-                headerLen += copyLen;
-                headerBuffer[headerLen] = '\0';
-            }
-
-            char *body = strstr(headerBuffer, "\r\n\r\n");
-            if (body)
-            {
-                body += 4;
-                headerDone = true;
-                int bodyOffset = body - headerBuffer;
-                int bodyLen = headerLen - bodyOffset;
-                if (bodyLen > 0)
-                {
-                    fwrite(body, 1, bodyLen, file);
-                    written += bodyLen;
-                    if (progress)
-                        progress(written, manifest.artifactSize, userData);
-                }
-                if (copyLen < len)
-                {
-                    fwrite(buffer + copyLen, 1, len - copyLen, file);
-                    written += len - copyLen;
-                    if (progress)
-                        progress(written, manifest.artifactSize, userData);
-                }
-            }
-        }
-        else
-        {
-            fwrite(buffer, 1, len, file);
-            written += len;
-            if (progress)
-                progress(written, manifest.artifactSize, userData);
-        }
+        setUpdateError("DOWNLOAD HTTPS: %s", httpsError);
+        remove(partPath);
+        return UPDATE_DOWNLOAD_FAILED;
+    }
+    if (closeResult != 0)
+    {
+        setUpdateError("CLOSE UPDATE FILE ERR %d", errno);
+        remove(partPath);
+        return UPDATE_DOWNLOAD_FAILED;
     }
 
-    fclose(file);
-    close(sock);
-
-    if (manifest.artifactSize > 0 && written != manifest.artifactSize)
+    if (sink.written != (size_t)manifest.artifactSize)
     {
+        setUpdateError("DOWNLOAD SIZE %lu EXPECTED %d", (unsigned long)sink.written, manifest.artifactSize);
         remove(partPath);
         return UPDATE_DOWNLOAD_SIZE_MISMATCH;
     }
 
-    if (manifest.sha256[0])
+    char digest[65];
+    if (!fileSha256(partPath, digest) || strcasecmp(digest, manifest.sha256) != 0)
     {
-        char digest[65];
-        if (!fileSha256(partPath, digest) || strcasecmp(digest, manifest.sha256) != 0)
-        {
-            remove(partPath);
-            return UPDATE_DOWNLOAD_CHECKSUM_MISMATCH;
-        }
+        setUpdateError("DOWNLOAD CHECKSUM MISMATCH");
+        remove(partPath);
+        return UPDATE_DOWNLOAD_CHECKSUM_MISMATCH;
     }
 
     if (!replaceWithBackup(partPath, targetPath && targetPath[0] ? targetPath : UPDATE_FINAL_PATH))
