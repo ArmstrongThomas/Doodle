@@ -4,28 +4,42 @@
 #include <stdlib.h>
 #include <algorithm>
 
-static int jsonInt(const char *line, const char *key)
+static const char *findInRange(const char *start, const char *end, const char *key)
 {
-    const char *ptr = strstr(line, key);
-    if (!ptr)
-        return 0;
-    return atoi(ptr + strlen(key));
+    if (!start || !key)
+        return NULL;
+    if (!end)
+        return strstr(start, key);
+
+    const size_t keyLength = strlen(key);
+    if (keyLength == 0)
+        return start;
+    for (const char *ptr = start; ptr < end && *ptr; ptr++)
+    {
+        if ((size_t)(end - ptr) < keyLength)
+            break;
+        if (memcmp(ptr, key, keyLength) == 0)
+            return ptr;
+    }
+    return NULL;
 }
 
-static void jsonString(const char *line, const char *key, char *out, size_t outSize)
+static bool jsonStringRange(const char *start, const char *end, const char *key, char *out, size_t outSize)
 {
     if (!out || outSize == 0)
-        return;
+        return false;
     out[0] = '\0';
-    const char *ptr = strstr(line, key);
+
+    const char *ptr = findInRange(start, end, key);
     if (!ptr)
-        return;
+        return false;
     ptr += strlen(key);
+
     size_t used = 0;
-    while (*ptr && *ptr != '"')
+    while ((!end || ptr < end) && *ptr && *ptr != '"')
     {
         char value = *ptr++;
-        if (value == '\\' && *ptr)
+        if (value == '\\' && (!end || ptr < end) && *ptr)
         {
             char escaped = *ptr++;
             if (escaped == 'n' || escaped == 'r' || escaped == 't')
@@ -37,6 +51,85 @@ static void jsonString(const char *line, const char *key, char *out, size_t outS
             out[used++] = value;
     }
     out[used] = '\0';
+    return true;
+}
+
+static bool jsonIntRange(const char *start, const char *end, const char *key, int &value)
+{
+    const char *ptr = findInRange(start, end, key);
+    if (!ptr)
+        return false;
+    ptr += strlen(key);
+    while ((!end || ptr < end) && *ptr && (*ptr == ' ' || *ptr == '\t'))
+        ptr++;
+    value = atoi(ptr);
+    return true;
+}
+
+static bool jsonBoolRange(const char *start, const char *end, const char *key, bool &value)
+{
+    const char *ptr = findInRange(start, end, key);
+    if (!ptr)
+        return false;
+    ptr += strlen(key);
+    while ((!end || ptr < end) && *ptr && (*ptr == ' ' || *ptr == '\t'))
+        ptr++;
+    if ((!end || ptr + 4 <= end) && strncmp(ptr, "true", 4) == 0)
+    {
+        value = true;
+        return true;
+    }
+    if ((!end || ptr + 5 <= end) && strncmp(ptr, "false", 5) == 0)
+    {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+static const char *jsonObjectEnd(const char *start)
+{
+    if (!start || *start != '{')
+        return NULL;
+
+    int depth = 0;
+    bool inString = false;
+    bool escaped = false;
+    for (const char *ptr = start; *ptr; ptr++)
+    {
+        if (inString)
+        {
+            if (escaped)
+                escaped = false;
+            else if (*ptr == '\\')
+                escaped = true;
+            else if (*ptr == '"')
+                inString = false;
+            continue;
+        }
+        if (*ptr == '"')
+        {
+            inString = true;
+            continue;
+        }
+        if (*ptr == '{')
+            depth++;
+        else if (*ptr == '}' && --depth == 0)
+            return ptr;
+    }
+    return NULL;
+}
+
+static int jsonInt(const char *line, const char *key)
+{
+    int value = 0;
+    jsonIntRange(line, NULL, key, value);
+    return value;
+}
+
+static void jsonString(const char *line, const char *key, char *out, size_t outSize)
+{
+    jsonStringRange(line, NULL, key, out, outSize);
 }
 
 static void jsonSafeString(const char *input, char *out, size_t outSize)
@@ -46,14 +139,46 @@ static void jsonSafeString(const char *input, char *out, size_t outSize)
         return;
     for (size_t i = 0; input && input[i] && j + 1 < outSize; i++)
     {
-        char c = input[i];
-        if (c == '"' || c == '\\')
-            continue;
-        if ((unsigned char)c < 32)
-            continue;
-        out[j++] = c;
+        const unsigned char c = (unsigned char)input[i];
+        const char *escape = NULL;
+        if (c == '"')
+            escape = "\\\"";
+        else if (c == '\\')
+            escape = "\\\\";
+        else if (c == '\n')
+            escape = "\\n";
+        else if (c == '\r')
+            escape = "\\r";
+        else if (c == '\t')
+            escape = "\\t";
+
+        if (escape)
+        {
+            if (j + 2 >= outSize)
+                break;
+            out[j++] = escape[0];
+            out[j++] = escape[1];
+        }
+        else if (c >= 32)
+            out[j++] = (char)c;
     }
     out[j] = '\0';
+}
+
+static void parseIdentityFields(const char *start, const char *end, IdentityInfo &identity)
+{
+    identity.muteSecondsRemaining = 0;
+    identity.banSecondsRemaining = 0;
+    jsonStringRange(start, end, "\"id\":\"", identity.identityId, sizeof(identity.identityId));
+    if (!identity.identityId[0])
+        jsonStringRange(start, end, "\"identityId\":\"", identity.identityId, sizeof(identity.identityId));
+    jsonStringRange(start, end, "\"username\":\"", identity.username, sizeof(identity.username));
+    jsonStringRange(start, end, "\"displayName\":\"", identity.displayName, sizeof(identity.displayName));
+    jsonStringRange(start, end, "\"role\":\"", identity.role, sizeof(identity.role));
+    jsonStringRange(start, end, "\"status\":\"", identity.status, sizeof(identity.status));
+    jsonIntRange(start, end, "\"muteSecondsRemaining\":", identity.muteSecondsRemaining);
+    jsonIntRange(start, end, "\"banSecondsRemaining\":", identity.banSecondsRemaining);
+    jsonStringRange(start, end, "\"banReason\":\"", identity.restrictionReason, sizeof(identity.restrictionReason));
 }
 
 bool Protocol::parseCanvasMeta(const char *line, CanvasMeta &meta)
@@ -71,32 +196,89 @@ bool Protocol::parseCanvasMeta(const char *line, CanvasMeta &meta)
 
 bool Protocol::parseChannels(const char *line, char channels[][25], int maxChannels, int &count, char *currentChannel)
 {
+    return parseChannels(line, channels, NULL, maxChannels, count, currentChannel);
+}
+
+bool Protocol::parseChannels(const char *line, char channels[][25], ChannelInfo *channelInfo,
+                             int maxChannels, int &count, char *currentChannel)
+{
     if (!line || !strstr(line, "\"type\":\"channels\""))
         return false;
 
     count = 0;
-    jsonString(line, "\"currentChannel\":\"", currentChannel, 25);
+    if (currentChannel)
+        jsonString(line, "\"currentChannel\":\"", currentChannel, 25);
 
     const char *ptr = strstr(line, "\"channels\":[");
+    if (ptr && channels && maxChannels > 0)
+    {
+        ptr += strlen("\"channels\":[");
+        while (*ptr && *ptr != ']' && count < maxChannels)
+        {
+            while (*ptr && *ptr != ']' && *ptr != '"')
+                ptr++;
+            if (!*ptr || *ptr == ']')
+                break;
+            ptr++;
+            const char *end = strchr(ptr, '"');
+            if (!end)
+                break;
+            size_t len = end - ptr;
+            if (len > 24)
+                len = 24;
+            memcpy(channels[count], ptr, len);
+            channels[count][len] = '\0';
+            count++;
+            ptr = end + 1;
+        }
+    }
+
+    if (!channelInfo || maxChannels <= 0)
+        return true;
+
+    for (int i = 0; i < maxChannels; i++)
+        memset(&channelInfo[i], 0, sizeof(channelInfo[i]));
+    ptr = strstr(line, "\"channelInfo\":[");
     if (!ptr)
         return true;
-    ptr += strlen("\"channels\":[");
-    while (*ptr && *ptr != ']' && count < maxChannels)
+    ptr += strlen("\"channelInfo\":[");
+    int infoOrdinal = 0;
+    while (*ptr && *ptr != ']' && infoOrdinal < maxChannels)
     {
-        while (*ptr && *ptr != ']' && *ptr != '"')
+        while (*ptr && *ptr != ']' && *ptr != '{')
             ptr++;
         if (!*ptr || *ptr == ']')
             break;
-        ptr++;
-        const char *end = strchr(ptr, '"');
+        const char *end = jsonObjectEnd(ptr);
         if (!end)
             break;
-        size_t len = end - ptr;
-        if (len > 24)
-            len = 24;
-        memcpy(channels[count], ptr, len);
-        channels[count][len] = '\0';
-        count++;
+
+        ChannelInfo parsed;
+        memset(&parsed, 0, sizeof(parsed));
+        jsonStringRange(ptr, end, "\"name\":\"", parsed.name, sizeof(parsed.name));
+        jsonIntRange(ptr, end, "\"userCount\":", parsed.userCount);
+        jsonBoolRange(ptr, end, "\"staffOnly\":", parsed.staffOnly);
+        jsonBoolRange(ptr, end, "\"adminOnly\":", parsed.adminOnly);
+        jsonBoolRange(ptr, end, "\"readOnly\":", parsed.readOnly);
+
+        int target = -1;
+        for (int i = 0; i < count; i++)
+        {
+            if (parsed.name[0] && strcmp(channels[i], parsed.name) == 0)
+            {
+                target = i;
+                break;
+            }
+        }
+        if (target < 0 && infoOrdinal < count)
+            target = infoOrdinal;
+        if (target >= 0 && target < maxChannels)
+        {
+            if (!parsed.name[0])
+                snprintf(parsed.name, sizeof(parsed.name), "%s", channels[target]);
+            channelInfo[target] = parsed;
+        }
+        infoOrdinal++;
         ptr = end + 1;
     }
     return true;
@@ -114,26 +296,53 @@ bool Protocol::parseUpdateRequired(const char *line, char *latestVersion, size_t
 
 bool Protocol::parsePresence(const char *line, PresenceUser *users, int maxUsers, int &count)
 {
+    PresenceInfo presence;
+    return parsePresence(line, users, maxUsers, count, presence);
+}
+
+bool Protocol::parsePresence(const char *line, PresenceUser *users, int maxUsers, int &count,
+                             PresenceInfo &presence)
+{
     if (!line || !strstr(line, "\"type\":\"presence\""))
         return false;
 
     count = 0;
-    const char *ptr = line;
-    while (count < maxUsers)
+    memset(&presence, 0, sizeof(presence));
+    const char *usersStart = strstr(line, "\"users\":[");
+    const char *envelopeEnd = usersStart ? usersStart : NULL;
+    jsonStringRange(line, envelopeEnd, "\"channel\":\"", presence.channel, sizeof(presence.channel));
+    jsonIntRange(line, NULL, "\"total\":", presence.total);
+    jsonBoolRange(line, NULL, "\"truncated\":", presence.truncated);
+
+    if (!users || maxUsers <= 0 || !usersStart)
+        return true;
+
+    const char *ptr = usersStart + strlen("\"users\":[");
+    while (*ptr && *ptr != ']' && count < maxUsers)
     {
-        ptr = strstr(ptr, "\"id\":\"");
-        if (!ptr)
+        while (*ptr && *ptr != ']' && *ptr != '{')
+            ptr++;
+        if (!*ptr || *ptr == ']')
             break;
+        const char *end = jsonObjectEnd(ptr);
+        if (!end)
+            break;
+
         memset(&users[count], 0, sizeof(users[count]));
-        jsonString(ptr, "\"identityId\":\"", users[count].identityId, sizeof(users[count].identityId));
-        jsonString(ptr, "\"username\":\"", users[count].username, sizeof(users[count].username));
-        jsonString(ptr, "\"displayName\":\"", users[count].displayName, sizeof(users[count].displayName));
-        jsonString(ptr, "\"role\":\"", users[count].role, sizeof(users[count].role));
-        jsonString(ptr, "\"status\":\"", users[count].status, sizeof(users[count].status));
-        jsonString(ptr, "\"deviceModel\":\"", users[count].deviceModel, sizeof(users[count].deviceModel));
-        jsonString(ptr, "\"deviceModelLabel\":\"", users[count].deviceModelLabel, sizeof(users[count].deviceModelLabel));
-        users[count].muteSecondsRemaining = jsonInt(ptr, "\"muteSecondsRemaining\":");
-        users[count].banSecondsRemaining = jsonInt(ptr, "\"banSecondsRemaining\":");
+        jsonStringRange(ptr, end, "\"id\":\"", users[count].id, sizeof(users[count].id));
+        jsonStringRange(ptr, end, "\"identityId\":\"", users[count].identityId, sizeof(users[count].identityId));
+        jsonStringRange(ptr, end, "\"username\":\"", users[count].username, sizeof(users[count].username));
+        jsonStringRange(ptr, end, "\"displayName\":\"", users[count].displayName, sizeof(users[count].displayName));
+        jsonStringRange(ptr, end, "\"role\":\"", users[count].role, sizeof(users[count].role));
+        jsonStringRange(ptr, end, "\"status\":\"", users[count].status, sizeof(users[count].status));
+        jsonStringRange(ptr, end, "\"channel\":\"", users[count].channel, sizeof(users[count].channel));
+        jsonStringRange(ptr, end, "\"clientType\":\"", users[count].clientType, sizeof(users[count].clientType));
+        jsonStringRange(ptr, end, "\"deviceModel\":\"", users[count].deviceModel, sizeof(users[count].deviceModel));
+        jsonStringRange(ptr, end, "\"deviceModelLabel\":\"", users[count].deviceModelLabel, sizeof(users[count].deviceModelLabel));
+        jsonIntRange(ptr, end, "\"sessionCount\":", users[count].sessionCount);
+        jsonIntRange(ptr, end, "\"muteSecondsRemaining\":", users[count].muteSecondsRemaining);
+        jsonIntRange(ptr, end, "\"banSecondsRemaining\":", users[count].banSecondsRemaining);
+        jsonBoolRange(ptr, end, "\"readOnly\":", users[count].readOnly);
         if (!users[count].displayName[0])
             snprintf(users[count].displayName, sizeof(users[count].displayName), "USER");
         if (!users[count].role[0])
@@ -143,9 +352,15 @@ bool Protocol::parsePresence(const char *line, PresenceUser *users, int maxUsers
         if (!users[count].deviceModelLabel[0])
             snprintf(users[count].deviceModelLabel, sizeof(users[count].deviceModelLabel),
                      "%s", users[count].deviceModel[0] ? users[count].deviceModel : "Unknown");
+        if (users[count].sessionCount <= 0)
+            users[count].sessionCount = 1;
         count++;
-        ptr += strlen("\"id\":\"");
+        ptr = end + 1;
     }
+    if (presence.total <= 0)
+        presence.total = count;
+    if (presence.total > count)
+        presence.truncated = true;
     return true;
 }
 
@@ -153,13 +368,7 @@ bool Protocol::parseIdentityAccepted(const char *line, IdentityInfo &identity)
 {
     if (!line || !strstr(line, "\"type\":\"identityAccepted\""))
         return false;
-    jsonString(line, "\"username\":\"", identity.username, sizeof(identity.username));
-    jsonString(line, "\"displayName\":\"", identity.displayName, sizeof(identity.displayName));
-    jsonString(line, "\"role\":\"", identity.role, sizeof(identity.role));
-    jsonString(line, "\"status\":\"", identity.status, sizeof(identity.status));
-    identity.muteSecondsRemaining = jsonInt(line, "\"muteSecondsRemaining\":");
-    identity.banSecondsRemaining = jsonInt(line, "\"banSecondsRemaining\":");
-    jsonString(line, "\"banReason\":\"", identity.restrictionReason, sizeof(identity.restrictionReason));
+    parseIdentityFields(line, NULL, identity);
     if (!identity.displayName[0])
         strcpy(identity.displayName, "3DS User");
     if (!identity.username[0])
@@ -341,9 +550,20 @@ bool Protocol::parseTicketListStart(const char *line, char *scope, size_t scopeS
 
 bool Protocol::parseTicketListEnd(const char *line, int &nextBeforeId)
 {
+    TicketCursor nextCursor;
+    if (!parseTicketListEnd(line, nextCursor))
+        return false;
+    nextBeforeId = nextCursor.id;
+    return true;
+}
+
+bool Protocol::parseTicketListEnd(const char *line, TicketCursor &nextCursor)
+{
     if (!line || !strstr(line, "\"type\":\"ticketListEnd\""))
         return false;
-    nextBeforeId = jsonInt(line, "\"nextBeforeId\":");
+    memset(&nextCursor, 0, sizeof(nextCursor));
+    nextCursor.id = jsonInt(line, "\"nextBeforeId\":");
+    jsonString(line, "\"nextBeforeUpdatedAt\":\"", nextCursor.updatedAt, sizeof(nextCursor.updatedAt));
     return true;
 }
 
@@ -412,19 +632,92 @@ bool Protocol::parseStaffChatResult(const char *line, bool &ok, char *error, siz
     return true;
 }
 
+bool Protocol::parseModerationResult(const char *line, ModerationResult &result)
+{
+    if (!line || !strstr(line, "\"type\":\"moderationResult\""))
+        return false;
+
+    memset(&result, 0, sizeof(result));
+    jsonBoolRange(line, NULL, "\"ok\":", result.ok);
+    jsonString(line, "\"action\":\"", result.action, sizeof(result.action));
+    jsonString(line, "\"error\":\"", result.error, sizeof(result.error));
+
+    const char *identityKey = strstr(line, "\"identity\":");
+    if (identityKey)
+    {
+        const char *identityStart = strchr(identityKey + strlen("\"identity\":"), '{');
+        const char *identityEnd = jsonObjectEnd(identityStart);
+        if (identityStart && identityEnd)
+        {
+            parseIdentityFields(identityStart, identityEnd, result.identity);
+            result.hasIdentity = result.identity.identityId[0] || result.identity.username[0];
+            if (result.hasIdentity)
+            {
+                if (!result.identity.displayName[0])
+                    snprintf(result.identity.displayName, sizeof(result.identity.displayName), "3DS User");
+                if (!result.identity.role[0])
+                    snprintf(result.identity.role, sizeof(result.identity.role), "user");
+                if (!result.identity.status[0])
+                    snprintf(result.identity.status, sizeof(result.identity.status), "active");
+            }
+        }
+    }
+    return true;
+}
+
 void Protocol::buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
                           const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
                           const char *displayName, const char *packageType)
 {
-    snprintf(buffer, size,
-             "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":6,\"updaterSupported\":%s,"
-             "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\","
-             "\"deviceModel\":\"%s\",\"displayName\":\"%s\"}",
-             appId, version, updaterSupported ? "true" : "false",
-             packageType ? packageType : "3dsx",
-             deviceId ? deviceId : "", deviceSecret ? deviceSecret : "", hardwareId ? hardwareId : "",
-             deviceModel ? deviceModel : "3ds-family",
-             displayName ? displayName : "3DS User");
+    buildHello(buffer, size, appId, version, updaterSupported, deviceId, deviceSecret, hardwareId,
+               deviceModel, displayName, packageType, NULL);
+}
+
+void Protocol::buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
+                          const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
+                          const char *displayName, const char *packageType, const char *preferredChannel)
+{
+    char safeAppId[40];
+    char safeVersion[32];
+    char safePackageType[12];
+    char safeDeviceId[48];
+    char safeDeviceSecret[64];
+    char safeHardwareId[64];
+    char safeDeviceModel[24];
+    char safeDisplayName[25];
+    char safePreferredChannel[25];
+    jsonSafeString(appId, safeAppId, sizeof(safeAppId));
+    jsonSafeString(version, safeVersion, sizeof(safeVersion));
+    jsonSafeString(packageType ? packageType : "3dsx", safePackageType, sizeof(safePackageType));
+    jsonSafeString(deviceId, safeDeviceId, sizeof(safeDeviceId));
+    jsonSafeString(deviceSecret, safeDeviceSecret, sizeof(safeDeviceSecret));
+    jsonSafeString(hardwareId, safeHardwareId, sizeof(safeHardwareId));
+    jsonSafeString(deviceModel ? deviceModel : "3ds-family", safeDeviceModel, sizeof(safeDeviceModel));
+    jsonSafeString(displayName ? displayName : "3DS User", safeDisplayName, sizeof(safeDisplayName));
+    jsonSafeString(preferredChannel, safePreferredChannel, sizeof(safePreferredChannel));
+
+    const char *capabilities =
+        "\"capabilities\":[\"ui2-channel-info\",\"ui2-presence-compact\",\"ui2-ticket-cursor\"]";
+    if (safePreferredChannel[0])
+    {
+        snprintf(buffer, size,
+                 "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":6,\"updaterSupported\":%s,"
+                 "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\","
+                 "\"deviceModel\":\"%s\",\"displayName\":\"%s\",%s,\"preferredChannel\":\"%s\"}",
+                 safeAppId, safeVersion, updaterSupported ? "true" : "false", safePackageType,
+                 safeDeviceId, safeDeviceSecret, safeHardwareId, safeDeviceModel, safeDisplayName,
+                 capabilities, safePreferredChannel);
+    }
+    else
+    {
+        snprintf(buffer, size,
+                 "{\"type\":\"hello\",\"appId\":\"%s\",\"version\":\"%s\",\"protocol\":6,\"updaterSupported\":%s,"
+                 "\"packageType\":\"%s\",\"deviceId\":\"%s\",\"deviceSecret\":\"%s\",\"hardwareId\":\"%s\","
+                 "\"deviceModel\":\"%s\",\"displayName\":\"%s\",%s}",
+                 safeAppId, safeVersion, updaterSupported ? "true" : "false", safePackageType,
+                 safeDeviceId, safeDeviceSecret, safeHardwareId, safeDeviceModel, safeDisplayName,
+                 capabilities);
+    }
 }
 
 void Protocol::buildSwitchChannel(char *buffer, size_t size, const char *channel)
@@ -485,7 +778,7 @@ void Protocol::buildModerationCommand(char *buffer, size_t size, const char *act
 {
     char safeAction[24];
     char safeIdentity[48];
-    char safeReason[80];
+    char safeReason[161];
     jsonSafeString(action, safeAction, sizeof(safeAction));
     jsonSafeString(identityId, safeIdentity, sizeof(safeIdentity));
     jsonSafeString(reason, safeReason, sizeof(safeReason));
@@ -510,9 +803,9 @@ void Protocol::buildAdminCanvasCommand(char *buffer, size_t size, const char *ac
 
 void Protocol::buildTicketCreate(char *buffer, size_t size, const char *category, const char *subject, const char *message)
 {
-    char safeCategory[12];
-    char safeSubject[65];
-    char safeMessage[241];
+    char safeCategory[24];
+    char safeSubject[129];
+    char safeMessage[481];
     jsonSafeString(category, safeCategory, sizeof(safeCategory));
     jsonSafeString(subject, safeSubject, sizeof(safeSubject));
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
@@ -531,6 +824,21 @@ void Protocol::buildTicketList(char *buffer, size_t size, bool staff, const char
              staff ? "staff" : "mine", safeStatus, safeCategory, std::max(0, beforeId));
 }
 
+void Protocol::buildTicketList(char *buffer, size_t size, bool staff, const char *status, const char *category,
+                               const TicketCursor &before)
+{
+    char safeStatus[20];
+    char safeCategory[12];
+    char safeUpdatedAt[25];
+    jsonSafeString(status, safeStatus, sizeof(safeStatus));
+    jsonSafeString(category, safeCategory, sizeof(safeCategory));
+    jsonSafeString(before.updatedAt, safeUpdatedAt, sizeof(safeUpdatedAt));
+    snprintf(buffer, size,
+             "{\"type\":\"ticketList\",\"scope\":\"%s\",\"status\":\"%s\",\"category\":\"%s\","
+             "\"beforeUpdatedAt\":\"%s\",\"beforeId\":%d,\"limit\":6}",
+             staff ? "staff" : "mine", safeStatus, safeCategory, safeUpdatedAt, std::max(0, before.id));
+}
+
 void Protocol::buildTicketGet(char *buffer, size_t size, int ticketId, int beforeMessageId)
 {
     snprintf(buffer, size, "{\"type\":\"ticketGet\",\"ticketId\":%d,\"beforeMessageId\":%d,\"limit\":6}",
@@ -539,7 +847,7 @@ void Protocol::buildTicketGet(char *buffer, size_t size, int ticketId, int befor
 
 void Protocol::buildTicketReply(char *buffer, size_t size, int ticketId, const char *message, bool staff)
 {
-    char safeMessage[241];
+    char safeMessage[481];
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
     snprintf(buffer, size, "{\"type\":\"ticketReply\",\"ticketId\":%d,\"staff\":%s,\"message\":\"%s\"}",
              std::max(0, ticketId), staff ? "true" : "false", safeMessage);
@@ -548,7 +856,7 @@ void Protocol::buildTicketReply(char *buffer, size_t size, int ticketId, const c
 void Protocol::buildTicketStatus(char *buffer, size_t size, int ticketId, const char *status, const char *message)
 {
     char safeStatus[20];
-    char safeMessage[241];
+    char safeMessage[481];
     jsonSafeString(status, safeStatus, sizeof(safeStatus));
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
     snprintf(buffer, size, "{\"type\":\"ticketStatus\",\"ticketId\":%d,\"status\":\"%s\",\"message\":\"%s\"}",
@@ -572,7 +880,7 @@ void Protocol::buildStaffChatList(char *buffer, size_t size, int beforeId)
 
 void Protocol::buildStaffChatSend(char *buffer, size_t size, const char *message)
 {
-    char safeMessage[241];
+    char safeMessage[481];
     jsonSafeString(message, safeMessage, sizeof(safeMessage));
     snprintf(buffer, size, "{\"type\":\"staffChatSend\",\"message\":\"%s\"}", safeMessage);
 }

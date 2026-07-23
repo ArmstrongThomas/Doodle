@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "ui_canvas.h"
 #include <algorithm>
 #include <math.h>
 #include <stdio.h>
@@ -57,7 +58,6 @@ static void setTopPixel(u8 *target, int width, int height, int screenX, int scre
 {
     if (screenX < 0 || screenX >= width || screenY < 0 || screenY >= height)
         return;
-
     int idx = 3 * (screenY * width + screenX);
     target[idx] = r;
     target[idx + 1] = g;
@@ -66,8 +66,8 @@ static void setTopPixel(u8 *target, int width, int height, int screenX, int scre
 
 static void fillTopRect(u8 *target, int width, int height, int x, int y, int w, int h, u8 r, u8 g, u8 b)
 {
-    for (int py = y; py < y + h; py++)
-        for (int px = x; px < x + w; px++)
+    for (int py = std::max(0, y); py < std::min(height, y + h); py++)
+        for (int px = std::max(0, x); px < std::min(width, x + w); px++)
             setTopPixel(target, width, height, px, py, r, g, b);
 }
 
@@ -85,155 +85,17 @@ static void strokeTopRect(u8 *target, int width, int height, int x, int y, int w
     }
 }
 
-static void drawGlyph(u8 *target, int width, int height, int x, int y, char c, u8 r, u8 g, u8 b)
-{
-    u8 glyph[7] = {0};
-    switch (c)
-    {
-        case '0': { u8 g[7] = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case '1': { u8 g[7] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
-        case '2': { u8 g[7] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}; memcpy(glyph,g,7); break; }
-        case '3': { u8 g[7] = {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
-        case '4': { u8 g[7] = {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}; memcpy(glyph,g,7); break; }
-        case '5': { u8 g[7] = {0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
-        case '6': { u8 g[7] = {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case '7': { u8 g[7] = {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}; memcpy(glyph,g,7); break; }
-        case '8': { u8 g[7] = {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case '9': { u8 g[7] = {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}; memcpy(glyph,g,7); break; }
-        case 'A': { u8 g[7] = {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'B': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
-        case 'C': { u8 g[7] = {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case 'D': { u8 g[7] = {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
-        case 'E': { u8 g[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}; memcpy(glyph,g,7); break; }
-        case 'F': { u8 g[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
-        case 'G': { u8 g[7] = {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}; memcpy(glyph,g,7); break; }
-        case 'H': { u8 g[7] = {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'I': { u8 g[7] = {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
-        case 'J': { u8 g[7] = {0x07,0x02,0x02,0x02,0x12,0x12,0x0C}; memcpy(glyph,g,7); break; }
-        case 'K': { u8 g[7] = {0x11,0x12,0x14,0x18,0x14,0x12,0x11}; memcpy(glyph,g,7); break; }
-        case 'L': { u8 g[7] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; memcpy(glyph,g,7); break; }
-        case 'M': { u8 g[7] = {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'N': { u8 g[7] = {0x11,0x19,0x15,0x13,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'O': { u8 g[7] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case 'P': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
-        case 'Q': { u8 g[7] = {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}; memcpy(glyph,g,7); break; }
-        case 'R': { u8 g[7] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; memcpy(glyph,g,7); break; }
-        case 'S': { u8 g[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; memcpy(glyph,g,7); break; }
-        case 'T': { u8 g[7] = {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
-        case 'U': { u8 g[7] = {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case 'V': { u8 g[7] = {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}; memcpy(glyph,g,7); break; }
-        case 'W': { u8 g[7] = {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}; memcpy(glyph,g,7); break; }
-        case 'X': { u8 g[7] = {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'Y': { u8 g[7] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
-        case 'Z': { u8 g[7] = {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}; memcpy(glyph,g,7); break; }
-        case '-': { u8 g[7] = {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case ':': { u8 g[7] = {0x00,0x04,0x00,0x00,0x04,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case '.': { u8 g[7] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}; memcpy(glyph,g,7); break; }
-        case '/': { u8 g[7] = {0x01,0x01,0x02,0x04,0x08,0x10,0x10}; memcpy(glyph,g,7); break; }
-        case '<': { u8 g[7] = {0x02,0x04,0x08,0x10,0x08,0x04,0x02}; memcpy(glyph,g,7); break; }
-        case '>': { u8 g[7] = {0x08,0x04,0x02,0x01,0x02,0x04,0x08}; memcpy(glyph,g,7); break; }
-        case '[': { u8 g[7] = {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}; memcpy(glyph,g,7); break; }
-        case ']': { u8 g[7] = {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E}; memcpy(glyph,g,7); break; }
-        case '_': { u8 g[7] = {0x00,0x00,0x00,0x00,0x00,0x00,0x1F}; memcpy(glyph,g,7); break; }
-        case '!': { u8 g[7] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04}; memcpy(glyph,g,7); break; }
-        case '?': { u8 g[7] = {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}; memcpy(glyph,g,7); break; }
-        case ',': { u8 g[7] = {0x00,0x00,0x00,0x00,0x00,0x04,0x08}; memcpy(glyph,g,7); break; }
-        case '\'': { u8 g[7] = {0x04,0x04,0x08,0x00,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case '"': { u8 g[7] = {0x0A,0x0A,0x14,0x00,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case '#': { u8 g[7] = {0x0A,0x1F,0x0A,0x0A,0x1F,0x0A,0x00}; memcpy(glyph,g,7); break; }
-        case '$': { u8 g[7] = {0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04}; memcpy(glyph,g,7); break; }
-        case '%': { u8 g[7] = {0x19,0x19,0x02,0x04,0x08,0x13,0x13}; memcpy(glyph,g,7); break; }
-        case '&': { u8 g[7] = {0x0C,0x12,0x14,0x08,0x15,0x12,0x0D}; memcpy(glyph,g,7); break; }
-        case '(': { u8 g[7] = {0x02,0x04,0x08,0x08,0x08,0x04,0x02}; memcpy(glyph,g,7); break; }
-        case ')': { u8 g[7] = {0x08,0x04,0x02,0x02,0x02,0x04,0x08}; memcpy(glyph,g,7); break; }
-        case '*': { u8 g[7] = {0x00,0x15,0x0E,0x1F,0x0E,0x15,0x00}; memcpy(glyph,g,7); break; }
-        case '+': { u8 g[7] = {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}; memcpy(glyph,g,7); break; }
-        case ';': { u8 g[7] = {0x00,0x04,0x00,0x00,0x04,0x04,0x08}; memcpy(glyph,g,7); break; }
-        case '=': { u8 g[7] = {0x00,0x1F,0x00,0x1F,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case '@': { u8 g[7] = {0x0E,0x11,0x17,0x15,0x17,0x10,0x0E}; memcpy(glyph,g,7); break; }
-        case '\\': { u8 g[7] = {0x10,0x10,0x08,0x04,0x02,0x01,0x01}; memcpy(glyph,g,7); break; }
-        case '^': { u8 g[7] = {0x04,0x0A,0x11,0x00,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case '`': { u8 g[7] = {0x08,0x04,0x02,0x00,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case '{': { u8 g[7] = {0x02,0x04,0x04,0x08,0x04,0x04,0x02}; memcpy(glyph,g,7); break; }
-        case '|': { u8 g[7] = {0x04,0x04,0x04,0x04,0x04,0x04,0x04}; memcpy(glyph,g,7); break; }
-        case '}': { u8 g[7] = {0x08,0x04,0x04,0x02,0x04,0x04,0x08}; memcpy(glyph,g,7); break; }
-        case '~': { u8 g[7] = {0x00,0x00,0x09,0x16,0x00,0x00,0x00}; memcpy(glyph,g,7); break; }
-        case 'a': { u8 g[7] = {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F}; memcpy(glyph,g,7); break; }
-        case 'b': { u8 g[7] = {0x10,0x10,0x16,0x19,0x11,0x11,0x1E}; memcpy(glyph,g,7); break; }
-        case 'c': { u8 g[7] = {0x00,0x00,0x0E,0x10,0x10,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case 'd': { u8 g[7] = {0x01,0x01,0x0D,0x13,0x11,0x11,0x0F}; memcpy(glyph,g,7); break; }
-        case 'e': { u8 g[7] = {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E}; memcpy(glyph,g,7); break; }
-        case 'f': { u8 g[7] = {0x06,0x08,0x08,0x1C,0x08,0x08,0x08}; memcpy(glyph,g,7); break; }
-        case 'g': { u8 g[7] = {0x00,0x00,0x0F,0x11,0x0F,0x01,0x0E}; memcpy(glyph,g,7); break; }
-        case 'h': { u8 g[7] = {0x10,0x10,0x16,0x19,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'i': { u8 g[7] = {0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
-        case 'j': { u8 g[7] = {0x02,0x00,0x06,0x02,0x02,0x12,0x0C}; memcpy(glyph,g,7); break; }
-        case 'k': { u8 g[7] = {0x10,0x10,0x12,0x14,0x18,0x14,0x12}; memcpy(glyph,g,7); break; }
-        case 'l': { u8 g[7] = {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E}; memcpy(glyph,g,7); break; }
-        case 'm': { u8 g[7] = {0x00,0x00,0x1A,0x15,0x15,0x15,0x15}; memcpy(glyph,g,7); break; }
-        case 'n': { u8 g[7] = {0x00,0x00,0x16,0x19,0x11,0x11,0x11}; memcpy(glyph,g,7); break; }
-        case 'o': { u8 g[7] = {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E}; memcpy(glyph,g,7); break; }
-        case 'p': { u8 g[7] = {0x00,0x00,0x1E,0x11,0x1E,0x10,0x10}; memcpy(glyph,g,7); break; }
-        case 'q': { u8 g[7] = {0x00,0x00,0x0D,0x13,0x0F,0x01,0x01}; memcpy(glyph,g,7); break; }
-        case 'r': { u8 g[7] = {0x00,0x00,0x16,0x19,0x10,0x10,0x10}; memcpy(glyph,g,7); break; }
-        case 's': { u8 g[7] = {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E}; memcpy(glyph,g,7); break; }
-        case 't': { u8 g[7] = {0x08,0x08,0x1C,0x08,0x08,0x09,0x06}; memcpy(glyph,g,7); break; }
-        case 'u': { u8 g[7] = {0x00,0x00,0x11,0x11,0x11,0x13,0x0D}; memcpy(glyph,g,7); break; }
-        case 'v': { u8 g[7] = {0x00,0x00,0x11,0x11,0x11,0x0A,0x04}; memcpy(glyph,g,7); break; }
-        case 'w': { u8 g[7] = {0x00,0x00,0x11,0x15,0x15,0x15,0x0A}; memcpy(glyph,g,7); break; }
-        case 'x': { u8 g[7] = {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11}; memcpy(glyph,g,7); break; }
-        case 'y': { u8 g[7] = {0x00,0x00,0x11,0x11,0x0F,0x01,0x0E}; memcpy(glyph,g,7); break; }
-        case 'z': { u8 g[7] = {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F}; memcpy(glyph,g,7); break; }
-        default: { u8 g[7] = {0x1F,0x11,0x15,0x15,0x11,0x11,0x1F}; memcpy(glyph,g,7); break; }
-    }
-
-    for (int gy = 0; gy < 7; gy++)
-        for (int gx = 0; gx < 5; gx++)
-            if (glyph[gy] & (1 << (4 - gx)))
-                setTopPixel(target, width, height, x + gx, y + gy, r, g, b);
-}
 
 static void drawText(u8 *target, int width, int height, int x, int y, const char *text, u8 r, u8 g, u8 b)
 {
-    int cursor = x;
-    while (*text)
-    {
-        if (*text != ' ')
-            drawGlyph(target, width, height, cursor, y, *text, r, g, b);
-        cursor += 6;
-        text++;
-    }
+    UiCanvas canvas(target, width, height, UI_BUFFER_RGB);
+    canvas.textClipped(x, y, text ? text : "", UiColor(r, g, b), std::max(0, width - x));
 }
 
 static int drawWrappedText(u8 *target, int width, int height, int x, int y, int maxChars, int maxLines, const char *text, u8 r, u8 g, u8 b)
 {
-    int line = 0;
-    int lastSpaceCol = -1;
-    const char *start = text ? text : "";
-    char buffer[80];
-    while (*start && line < maxLines)
-    {
-        lastSpaceCol = -1;
-        int len = 0;
-        const char *ptr = start;
-        while (*ptr && len < maxChars)
-        {
-            buffer[len] = *ptr;
-            if (*ptr == ' ')
-                lastSpaceCol = len;
-            len++;
-            ptr++;
-        }
-        if (*ptr && lastSpaceCol > 8)
-            len = lastSpaceCol;
-        buffer[len] = '\0';
-        drawText(target, width, height, x, y + line * 10, buffer, r, g, b);
-        start += len;
-        while (*start == ' ')
-            start++;
-        line++;
-    }
-    return line;
+    UiCanvas canvas(target, width, height, UI_BUFFER_RGB);
+    return canvas.wrappedText(x, y, text ? text : "", UiColor(r, g, b), maxChars * 6, maxLines);
 }
 
 static int wrappedLineCount(int maxChars, int maxLines, const char *text)
@@ -287,10 +149,13 @@ static void formatTitleLabel(const char *source, char *target, size_t targetSize
 static void drawFooterHint(const char *left, const char *right)
 {
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 212, TOP_SCREEN_W, 1, 206, 214, 220);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    const int rightWidth = right && right[0] ? UiCanvas::textWidth(right) : 0;
+    const int rightX = rightWidth > 0 ? std::max(206, 388 - rightWidth) : 388;
     if (left && left[0])
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 18, 224, left, 73, 82, 92);
+        ui.textClipped(12, 224, left, UiTheme::Secondary, std::max(0, rightX - 24));
     if (right && right[0])
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 224, right, 73, 82, 92);
+        ui.textClipped(rightX, 224, right, UiTheme::Secondary, 388 - rightX);
 }
 
 static void drawMenuRow(int y, const char *label, bool selected, bool current = false)
@@ -363,15 +228,14 @@ static void drawTopChrome(bool connected, bool updateAvailable)
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, TOP_SCREEN_H, 232, 236, 239);
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 0, 0, TOP_SCREEN_W, 30, 24, 33, 38);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 10, "Collab Doodle", 245, 248, 250);
-    drawTopSystemStatus();
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 320, 10, connected ? "On" : "Off", connected ? 94 : 255, connected ? 234 : 115, connected ? 212 : 115);
-    if (updateAvailable)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 370, 10, "New", 255, 214, 102);
-
     char version[40];
     snprintf(version, sizeof(version), "v%s", APP_BUILD_LABEL);
-    int versionX = TOP_SCREEN_W - 12 - (int)strlen(version) * 6;
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, versionX, 224, version, 104, 114, 124);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 104, 10, version, 160, 176, 184);
+    drawTopSystemStatus();
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 316, 10, connected ? "ONLINE" : "OFFLINE",
+             connected ? 94 : 255, connected ? 234 : 115, connected ? 212 : 115);
+    if (updateAvailable)
+        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 370, 10, "New", 255, 214, 102);
 }
 
 void Renderer::invalidateMinimap()
@@ -402,8 +266,9 @@ static void updateMinimapCache(CanvasState &canvas)
 }
 
 static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
-                                  int brushSize, int brushShape, int ticketNeedsReply, int staffChatUnread,
-                                  PresenceUser *users, int userCount)
+                                   int brushSize, int brushShape, int ticketNeedsReply, int staffChatUnread,
+                                   PresenceUser *users, int userCount,
+                                   ChannelInfo *channelInfo, int channelInfoCount)
 {
     drawTopChrome(connected, updateAvailable);
 
@@ -438,21 +303,35 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, viewX, viewY, viewW, viewH, 214, 40, 40);
     strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, viewX + 1, viewY + 1, std::max(1, viewW - 2), std::max(1, viewH - 2), 255, 255, 255);
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 282, 44, "Online", 73, 82, 92);
-    char onlineCount[8];
-    snprintf(onlineCount, sizeof(onlineCount), "%d", std::max(0, std::min(userCount, 99)));
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 370, 44, onlineCount, 73, 82, 92);
-
     int order[24];
     int ordered = 0;
     for (int pass = 0; pass < 2 && ordered < 24; pass++)
     {
         for (int i = 0; users && i < userCount && ordered < 24; i++)
         {
+            const char *currentChannel = canvas.channel[0] ? canvas.channel : "main";
+            if (users[i].channel[0] && strcmp(users[i].channel, currentChannel) != 0)
+                continue;
             bool staff = strcmp(users[i].role, "admin") == 0 || strcmp(users[i].role, "mod") == 0;
             if ((pass == 0 && staff) || (pass == 1 && !staff)) order[ordered++] = i;
         }
     }
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 282, 44, "In channel", 73, 82, 92);
+    char onlineCount[16];
+    int authoritativeChannelCount = -1;
+    const char *currentChannel = canvas.channel[0] ? canvas.channel : "main";
+    for (int i = 0; channelInfo && i < channelInfoCount; ++i)
+    {
+        if (channelInfo[i].name[0] &&
+            strcmp(channelInfo[i].name, currentChannel) == 0)
+        {
+            authoritativeChannelCount = channelInfo[i].userCount;
+            break;
+        }
+    }
+    snprintf(onlineCount, sizeof(onlineCount), "%d",
+             authoritativeChannelCount >= 0 ? authoritativeChannelCount : ordered);
+    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 370, 44, onlineCount, 73, 82, 92);
     int visibleUsers = std::min(ordered, 8);
     for (int row = 0; row < visibleUsers; row++)
     {
@@ -493,46 +372,84 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
     topFrameValid = true;
 }
 
+static ChannelInfo *findChannelInfo(ChannelInfo *items, int count, const char *name)
+{
+    for (int i = 0; items && i < count; ++i)
+        if (strcmp(items[i].name, name ? name : "") == 0)
+            return &items[i];
+    return NULL;
+}
+
 static void composeChannelTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
-                                   char channels[][25], int channelCount, int selectedChannel)
+                                   char channels[][25], int channelCount, int selectedChannel,
+                                   ChannelInfo *channelInfo, int channelInfoCount)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Channels", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 46, "Current", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 250, 60, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 39, "Channels", UiTheme::Ink);
+    const char *currentName = canvas.channel[0] ? canvas.channel : "main";
+    char currentLabel[48];
+    snprintf(currentLabel, sizeof(currentLabel), "Current: %.24s", currentName);
+    ui.textClipped(224, 39, currentLabel, UiTheme::Accent, 164);
 
-    int rows = std::min(channelCount, 8);
-    for (int i = 0; i < rows; i++)
+    const int selected = channelCount > 0 ? std::max(0, std::min(selectedChannel, channelCount - 1)) : 0;
+    const int visibleRows = 7;
+    int start = std::max(0, selected - visibleRows + 1);
+    if (channelCount - start < visibleRows)
+        start = std::max(0, channelCount - visibleRows);
+    int rows = std::min(visibleRows, std::max(0, channelCount - start));
+    for (int row = 0; row < rows; row++)
     {
-        int y = 76 + i * 18;
-        bool selected = i == selectedChannel;
-        bool current = strcmp(canvas.channel, channels[i]) == 0;
-        drawMenuRow(y, channels[i], selected, current);
+        const int index = start + row;
+        ChannelInfo *info = findChannelInfo(channelInfo, channelInfoCount, channels[index]);
+        char meta[48] = "";
+        if (info)
+        {
+            const char *access = info->adminOnly ? "ADMIN" : info->staffOnly ? "STAFF" : "";
+            const char *readOnly = info->readOnly ? "READ ONLY" : "";
+            if (access[0] && readOnly[0])
+                snprintf(meta, sizeof(meta), "%d  %s / %s", info->userCount, access, readOnly);
+            else if (access[0] || readOnly[0])
+                snprintf(meta, sizeof(meta), "%d  %s", info->userCount, access[0] ? access : readOnly);
+            else
+                snprintf(meta, sizeof(meta), "%d online", info->userCount);
+        }
+        UiComponents::listRow(ui, UiRect(12, 56 + row * 22, 376, 20),
+                              channels[index], meta, index == selected,
+                              strcmp(currentName, channels[index]) == 0);
     }
 
     if (rows == 0)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "No channels", 214, 40, 40);
+    {
+        UiComponents::panel(ui, UiRect(12, 56, 376, 50), true);
+        ui.text(28, 77, "No channels are available.", UiTheme::Secondary);
+    }
 
-    drawFooterHint("A SWITCH", "B BACK");
+    if (channelCount > visibleRows)
+    {
+        char page[48];
+        snprintf(page, sizeof(page), "%d-%d of %d", start + 1, start + rows, channelCount);
+        ui.text(12, 205, page, UiTheme::Secondary);
+    }
+
+    drawFooterHint("A SWITCH", "B BACK  SELECT MENU");
     topFrameValid = true;
 }
 
 static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool updateAvailable)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Controls", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 74, "Touch: Draw", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 92, "C-PAD or LEFT/A + drag: Pan", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 110, "SELECT: Menu", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 128, "B: Color picker", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 146, "UP/X + touch: Sample", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 164, "Hold L/R: Eraser", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 182, "START: Refresh", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 200, "RIGHT/Y + touch: Zoom", 32, 36, 42);
-    drawFooterHint("SELECT MENU", "B BACK");
-
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 74, "Channel", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 260, 88, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 39, "Controls moved", UiTheme::Ink);
+    UiComponents::panel(ui, UiRect(12, 58, 376, 108), true);
+    ui.text(28, 74, "Controls & Presets now lives in Options.", UiTheme::Ink);
+    ui.wrappedText(28, 94,
+                   "Bindings shown in Help are read from your active preset, so hints always match input.",
+                   UiTheme::Secondary, 340, 3);
+    char channel[48];
+    snprintf(channel, sizeof(channel), "Current channel: %.24s", canvas.channel[0] ? canvas.channel : "main");
+    ui.textClipped(28, 140, channel, UiTheme::Accent, 340);
+    drawFooterHint("A OPEN OPTIONS", "B BACK");
 
     topFrameValid = true;
 }
@@ -540,60 +457,87 @@ static void composeControlsTopFrame(CanvasState &canvas, bool connected, bool up
 static void composeMenuTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, int selectedMenuItem,
                                 int ticketNeedsReplyCount, int staffChatUnreadCount, bool showAdminTools)
 {
-    (void)showAdminTools;
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Main menu", 32, 36, 42);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, "Menu", UiTheme::Ink);
 
     const char *regularItems[] = {
-        "Channels",
-        "Connected users",
-        "Tickets",
-        "Controls",
-        "Rules / help",
-        "Status",
-        "Identity",
-        "Exit app",
+        "Channels", "People", "Support", "Profile",
+        "Options", "Help & Rules", "Exit"
     };
-    const char **items = regularItems;
-    const int itemCount = (int)(sizeof(regularItems) / sizeof(regularItems[0]));
+    const char *staffItems[] = {
+        "Channels", "People", "Support", "Staff Center",
+        "Profile", "Options", "Help & Rules", "Exit"
+    };
+    const char **items = showAdminTools ? staffItems : regularItems;
+    const int itemCount = showAdminTools ? 8 : 7;
+    const int selected = std::max(0, std::min(selectedMenuItem, itemCount - 1));
     for (int i = 0; i < itemCount; i++)
-    {
-        int y = 70 + i * 18;
-        drawMenuRow(y, items[i], i == selectedMenuItem);
-    }
+        UiComponents::listRow(ui, UiRect(12, 52 + i * 19, 174, 17),
+                              items[i], "", i == selected);
+
+    UiComponents::panel(ui, UiRect(196, 52, 192, 144), true);
+    ui.textClipped(208, 64, items[selected], UiTheme::Accent, 168);
+    static const char *regularDescriptions[] = {
+        "Browse rooms and switch after the new canvas is ready.",
+        "See who is drawing here, or browse every channel.",
+        "Create a request and follow replies from staff.",
+        "Display name, account state, and recovery tools.",
+        "Controls, palette, connection, and app details.",
+        "Community rules plus live control hints.",
+        "Close Collab Doodle."
+    };
+    static const char *staffDescriptions[] = {
+        "Browse rooms and switch after the new canvas is ready.",
+        "See people and open moderation actions.",
+        "Create a request and follow your ticket replies.",
+        "Ticket queue, staff chat, and canvas tools.",
+        "Display name, account state, and recovery tools.",
+        "Controls, palette, connection, and app details.",
+        "Community rules plus live control hints.",
+        "Close Collab Doodle."
+    };
+    ui.wrappedText(208, 82, showAdminTools ? staffDescriptions[selected] : regularDescriptions[selected],
+                   UiTheme::Secondary, 168, 4);
 
     if (ticketNeedsReplyCount > 0)
     {
         char ticketText[24];
-        snprintf(ticketText, sizeof(ticketText), "%d new ticket", std::min(ticketNeedsReplyCount, 99));
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 82, ticketText, 196, 92, 40);
+        snprintf(ticketText, sizeof(ticketText), "%d ticket%s need you", std::min(ticketNeedsReplyCount, 99),
+                 ticketNeedsReplyCount == 1 ? "" : "s");
+        ui.textClipped(208, 134, ticketText, UiTheme::Warning, 168);
     }
     if (staffChatUnreadCount > 0)
     {
         char chatText[24];
-        snprintf(chatText, sizeof(chatText), "%d new chat", std::min(staffChatUnreadCount, 99));
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 96, chatText, 13, 122, 117);
+        snprintf(chatText, sizeof(chatText), "%d staff chat new", std::min(staffChatUnreadCount, 99));
+        ui.textClipped(208, 148, chatText, UiTheme::Accent, 168);
     }
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 104, "Channel", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 118, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 146, connected ? "Online" : "Offline", connected ? 13 : 196, connected ? 122 : 61, connected ? 117 : 61);
+    char connection[64];
+    snprintf(connection, sizeof(connection), "%s / %.24s", connected ? "Online" : "Offline",
+             canvas.channel[0] ? canvas.channel : "main");
+    ui.textClipped(208, 178, connection, connected ? UiTheme::Accent : UiTheme::Danger, 168);
     drawFooterHint("A OPEN", "B CLOSE");
     topFrameValid = true;
 }
 
 static void composeRulesTopFrame(bool connected, bool updateAvailable, const char *requiredVersion,
-                                 bool needsAgreement, const char *notice)
+                                 bool needsAgreement, const char *notice,
+                                 const RendererTopState *topState)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 38, "Rules + quick start", 32, 36, 42);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, "Help & Rules", UiTheme::Ink);
     if (requiredVersion && requiredVersion[0])
     {
         char versionText[32];
         snprintf(versionText, sizeof(versionText), "v%s", requiredVersion);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 344, 38, versionText, 73, 82, 92);
+        ui.textClipped(350, 38, versionText, UiTheme::Secondary, 38);
     }
 
+    UiComponents::panel(ui, UiRect(12, 52, 238, 152), true);
+    ui.text(22, 62, "Community rules", UiTheme::Accent);
     const char *rules[] = {
         "No sexual content.",
         "No heavy profanity or slurs.",
@@ -601,151 +545,194 @@ static void composeRulesTopFrame(bool connected, bool updateAvailable, const cha
         "No intentional griefing, spam, or vandalism.",
         "Mods may clear, kick, mute, ban, or save evidence.",
     };
-    int y = 64;
+    int y = 78;
     for (int i = 0; i < 5; i++)
     {
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 26, y, "-", 13, 122, 117);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 42, y, rules[i], 32, 36, 42);
-        y += 18;
+        ui.text(22, y, "-", UiTheme::Accent);
+        ui.wrappedText(34, y, rules[i], UiTheme::Ink, 204, 2, 9);
+        y += i >= 2 ? 25 : 18;
     }
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "Draw on the bottom screen.", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, "C-PAD or LEFT/A pans. RIGHT/Y shows zoom.", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 202, "Hold L/R for eraser. UP/X samples color.", 73, 82, 92);
+    UiComponents::panel(ui, UiRect(258, 52, 130, 152), true);
+    ui.text(268, 62, "Live controls", UiTheme::Accent);
+    static const char *actions[] = { "Tools", "Pan", "Sample", "Zoom", "Quick Eraser", "Refresh" };
+    for (int i = 0; i < 6; ++i)
+    {
+        const char *binding = topState && topState->controlBindings[i] && topState->controlBindings[i][0]
+                                ? topState->controlBindings[i] : "See Options";
+        const int rowY = 78 + i * 20;
+        ui.textClipped(268, rowY, actions[i], UiTheme::Ink, 110);
+        ui.textClipped(268, rowY + 9, binding, UiTheme::Secondary, 110);
+    }
+
     if (notice && notice[0])
     {
-        char compactNotice[61];
-        snprintf(compactNotice, sizeof(compactNotice), "%.60s", notice);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 220, compactNotice, 196, 92, 40);
+        fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 202, 376, 10, 232, 236, 239);
+        ui.textClipped(12, 203, notice, UiTheme::Warning, 376);
     }
-    else if (needsAgreement)
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 220, "PRESS A TO AGREE AND CONTINUE", 196, 92, 40);
-    drawFooterHint(needsAgreement ? "A AGREE" : "", needsAgreement ? "B EXIT" : "B BACK");
+    drawFooterHint(needsAgreement ? "A AGREE & CONTINUE" : "", needsAgreement ? "B EXIT" : "B BACK");
     topFrameValid = true;
 }
 
-static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, PresenceUser *users, int userCount)
+static bool isStaffRole(const char *role)
 {
-    (void)canvas;
-    drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Connected users", 32, 36, 42);
-    char countText[20];
-    snprintf(countText, sizeof(countText), "%d online", userCount);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 276, 46, countText, 73, 82, 92);
+    return role && (strcmp(role, "admin") == 0 || strcmp(role, "mod") == 0);
+}
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 64, "Name", 104, 114, 124);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 190, 64, "Role", 104, 114, 124);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 238, 64, "Device", 104, 114, 124);
+static bool isAnonymousUser(const PresenceUser &user)
+{
+    return !user.identityId[0] && !user.username[0];
+}
+
+static int asciiCaseCompare(const char *left, const char *right)
+{
+    const unsigned char *a = (const unsigned char *)(left ? left : "");
+    const unsigned char *b = (const unsigned char *)(right ? right : "");
+    while (*a && *b)
+    {
+        unsigned char ca = (*a >= 'A' && *a <= 'Z') ? *a + ('a' - 'A') : *a;
+        unsigned char cb = (*b >= 'A' && *b <= 'Z') ? *b + ('a' - 'A') : *b;
+        if (ca != cb)
+            return ca < cb ? -1 : 1;
+        ++a;
+        ++b;
+    }
+    return *a == *b ? 0 : (*a ? 1 : -1);
+}
+
+static const char *presenceName(const PresenceUser &user)
+{
+    if (user.displayName[0])
+        return user.displayName;
+    if (user.username[0])
+        return user.username;
+    return "Anonymous viewer";
+}
+
+static bool isCurrentAccount(const PresenceUser &user, const char *displayName, const char *username)
+{
+    if (username && username[0] && user.username[0])
+        return strcmp(user.username, username) == 0;
+    return displayName && displayName[0] && user.displayName[0] &&
+           strcmp(user.displayName, displayName) == 0;
+}
+
+static void composeUsersTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
+                                 PresenceUser *users, int userCount,
+                                 const char *displayName, const char *username, const char *viewerRole,
+                                 int selectedUser, bool allChannels,
+                                 int presenceTotal, bool presenceTruncated)
+{
+    drawTopChrome(connected, updateAvailable);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, "People", UiTheme::Ink);
 
     int order[24];
     int ordered = 0;
-    for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; users && i < userCount && i < 24; ++i)
     {
-        for (int i = 0; i < userCount && ordered < 24; i++)
+        if (!allChannels && users[i].channel[0] && strcmp(users[i].channel, canvas.channel) != 0)
+            continue;
+        order[ordered++] = i;
+    }
+    for (int i = 1; i < ordered; ++i)
+    {
+        int candidate = order[i];
+        int j = i - 1;
+        while (j >= 0)
         {
-            bool staff = strcmp(users[i].role, "admin") == 0 || strcmp(users[i].role, "mod") == 0;
-            if ((pass == 0 && staff) || (pass == 1 && !staff))
-                order[ordered++] = i;
+            const PresenceUser &a = users[candidate];
+            const PresenceUser &b = users[order[j]];
+            int aTier = isCurrentAccount(a, displayName, username) ? 0 :
+                        isStaffRole(a.role) ? 1 : isAnonymousUser(a) ? 3 : 2;
+            int bTier = isCurrentAccount(b, displayName, username) ? 0 :
+                        isStaffRole(b.role) ? 1 : isAnonymousUser(b) ? 3 : 2;
+            if (aTier > bTier || (aTier == bTier &&
+                asciiCaseCompare(presenceName(a), presenceName(b)) >= 0))
+                break;
+            order[j + 1] = order[j];
+            --j;
         }
+        order[j + 1] = candidate;
     }
 
-    int rows = std::min(ordered, 8);
-    for (int i = 0; i < rows; i++)
+    char scope[64];
+    if (allChannels && presenceTruncated && presenceTotal > ordered)
+        snprintf(scope, sizeof(scope), "All / %d of %d", ordered, presenceTotal);
+    else
+        snprintf(scope, sizeof(scope), "%s / %d", allChannels ? "All channels" :
+                 (canvas.channel[0] ? canvas.channel : "main"), ordered);
+    ui.textClipped(244, 38, scope, UiTheme::Secondary, 144);
+
+    const int selected = ordered > 0 ? std::max(0, std::min(selectedUser, ordered - 1)) : 0;
+    const int visibleRows = 7;
+    int start = std::max(0, selected - visibleRows + 1);
+    if (ordered - start < visibleRows)
+        start = std::max(0, ordered - visibleRows);
+    const int rows = std::min(visibleRows, ordered - start);
+    for (int row = 0; row < rows; ++row)
     {
-        PresenceUser &user = users[order[i]];
-        int y = 80 + i * 17;
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 34, y, "-", 73, 82, 92);
-        char name[23];
-        snprintf(name, sizeof(name), "%.22s", user.displayName[0] ? user.displayName : user.username);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, y, name, 32, 36, 42);
-        char roleLabel[12];
-        formatTitleLabel(user.role, roleLabel, sizeof(roleLabel));
-        bool staff = strcmp(user.role, "admin") == 0 || strcmp(user.role, "mod") == 0;
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 190, y, roleLabel,
-                 staff ? 13 : 73, staff ? 122 : 82, staff ? 117 : 92);
-        char device[26];
-        snprintf(device, sizeof(device), "%.25s", user.deviceModelLabel[0] ? user.deviceModelLabel : "Unknown");
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 238, y, device, 73, 82, 92);
+        const int rank = start + row;
+        PresenceUser &user = users[order[rank]];
+        char meta[16] = "";
+        if (user.sessionCount > 1)
+            snprintf(meta, sizeof(meta), "%dx", user.sessionCount);
+        else if (isStaffRole(user.role))
+            snprintf(meta, sizeof(meta), "%s", strcmp(user.role, "admin") == 0 ? "A" : "M");
+        UiComponents::listRow(ui, UiRect(12, 56 + row * 22, 154, 20),
+                              presenceName(user), meta, rank == selected,
+                              isCurrentAccount(user, displayName, username));
     }
-    if (rows == 0)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 52, 92, "No users yet", 104, 114, 124);
-    drawFooterHint("", "B BACK");
+
+    UiComponents::panel(ui, UiRect(174, 56, 214, 146), true);
+    if (ordered == 0)
+    {
+        ui.wrappedText(186, 78, allChannels ? "Nobody is online." : "Nobody is in this channel.",
+                       UiTheme::Secondary, 190, 2);
+    }
+    else
+    {
+        PresenceUser &user = users[order[selected]];
+        const bool self = isCurrentAccount(user, displayName, username);
+        char roleLabel[16], statusLabel[18];
+        formatTitleLabel(user.role[0] ? user.role : (isAnonymousUser(user) ? "viewer" : "user"),
+                         roleLabel, sizeof(roleLabel));
+        formatTitleLabel(user.status[0] ? user.status : "active", statusLabel, sizeof(statusLabel));
+        ui.textClipped(186, 68, presenceName(user), UiTheme::Ink, 190);
+        UiComponents::badge(ui, UiRect(186, 82, 64, 16), roleLabel,
+                            isStaffRole(user.role) ? UiTheme::Accent : UiTheme::Secondary);
+        UiComponents::badge(ui, UiRect(256, 82, 72, 16), statusLabel,
+                            strcmp(user.status, "active") == 0 ? UiTheme::Accent :
+                            strcmp(user.status, "banned") == 0 ? UiTheme::Danger : UiTheme::Warning);
+        if (self)
+            ui.text(340, 86, "YOU", UiTheme::Accent);
+
+        const char *device = user.deviceModelLabel[0] ? user.deviceModelLabel :
+                             user.deviceModel[0] ? user.deviceModel :
+                             user.clientType[0] ? user.clientType : "Unknown";
+        char sessions[20];
+        snprintf(sessions, sizeof(sessions), "%d", std::max(1, user.sessionCount));
+        const char *labels[] = { "Channel", "Device", "Sessions" };
+        const char *values[] = { user.channel[0] ? user.channel :
+                                (canvas.channel[0] ? canvas.channel : "main"), device, sessions };
+        for (int i = 0; i < 3; ++i)
+        {
+            int y = 108 + i * 22;
+            ui.text(186, y, labels[i], UiTheme::Secondary);
+            ui.textClipped(252, y, values[i], UiTheme::Ink, 122);
+        }
+        if (self)
+            ui.text(186, 178, "Your current account", UiTheme::Secondary);
+        else if (isStaffRole(viewerRole) && !isAnonymousUser(user))
+            ui.text(186, 178, "Staff actions are below", UiTheme::Accent);
+        else if (isAnonymousUser(user))
+            ui.text(186, 178, "Anonymous session", UiTheme::Secondary);
+    }
+
+    drawFooterHint(isStaffRole(viewerRole) ? "A ACTIONS  X SCOPE" : "X CHANGE SCOPE", "B BACK");
     topFrameValid = true;
 }
 
-static void composeChatTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
-                                ChatLine *chatLines, int chatCount,
-                                int chatScroll, int chatSelected, int chatUnread, const char *chatNotice)
-{
-    drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 10, 34, "Public chat", 32, 36, 42);
-    if (chatUnread > 0)
-    {
-        char unreadText[24];
-        snprintf(unreadText, sizeof(unreadText), "%d new", std::min(chatUnread, 99));
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 88, 34, unreadText, 196, 92, 40);
-    }
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 346, 34, "global", 73, 82, 92);
-
-    int maxStart = chatCount > 0 ? chatCount - 1 : 0;
-    int start = std::max(0, std::min(chatScroll, maxStart));
-    fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 8, 48, 384, 158, 248, 250, 251);
-    strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 8, 48, 384, 158, 196, 204, 212);
-    int y = 54;
-    int lastRendered = start - 1;
-    for (int i = start; chatLines && i < chatCount && y < 204; i++)
-    {
-        ChatLine &line = chatLines[i];
-        char timeText[6] = "--:--";
-        if (line.timestamp[11] && line.timestamp[12] && line.timestamp[14] && line.timestamp[15])
-            snprintf(timeText, sizeof(timeText), "%.2s:%.2s", line.timestamp + 11, line.timestamp + 14);
-        char prefix[72];
-        const char *name = line.displayName[0] ? line.displayName : line.username[0] ? line.username : "user";
-        if (strcmp(line.role, "admin") == 0 || strcmp(line.role, "mod") == 0)
-        {
-            char roleLabel[12];
-            formatTitleLabel(line.role, roleLabel, sizeof(roleLabel));
-            snprintf(prefix, sizeof(prefix), "<%s>[%s]%s:", timeText, roleLabel, name);
-        }
-        else
-            snprintf(prefix, sizeof(prefix), "<%s>%s:", timeText, name);
-        int used = (int)strlen(prefix) * 6 + 6;
-        int messageX = std::min(214, 18 + used);
-        int maxChars = std::max(8, (388 - messageX) / 6);
-        int lineCount = wrappedLineCount(maxChars, 3, line.message);
-        int rowHeight = std::max(15, lineCount * 10 + 5);
-        if (y + rowHeight > 206)
-            break;
-
-        if (i == chatSelected)
-        {
-            fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, y - 3, 376, rowHeight, 224, 242, 238);
-            strokeTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, y - 3, 376, rowHeight, 13, 122, 117);
-        }
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 14, y, prefix,
-                 line.deleted ? 104 : 13, line.deleted ? 114 : 122, line.deleted ? 124 : 117);
-        drawWrappedText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, messageX, y, maxChars, 3,
-                        line.message, line.deleted ? 104 : 32, line.deleted ? 114 : 36, line.deleted ? 124 : 42);
-        y += rowHeight + 1;
-        lastRendered = i;
-    }
-    if (chatCount == 0)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 40, 96, "No public chat messages yet", 104, 114, 124);
-    else if (lastRendered >= start)
-    {
-        char pageText[24];
-        int total = std::max(0, std::min(chatCount, 99));
-        int first = std::max(1, std::min(start + 1, 99));
-        int last = std::max(first, std::min(lastRendered + 1, 99));
-        snprintf(pageText, sizeof(pageText), "%02d-%02d/%02d", first, last, total);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 316, 203, pageText, 104, 114, 124);
-    }
-
-    if (chatNotice && chatNotice[0])
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 12, 203, chatNotice, 196, 92, 40);
-    drawFooterHint("A SEND  UP/DOWN SELECT", "B MENU");
-    topFrameValid = true;
-}
 
 static void composeTicketsTopFrame(bool connected, bool updateAvailable,
                                    SupportTicketSummary *tickets, int ticketCount, int ticketSelected,
@@ -757,37 +744,70 @@ static void composeTicketsTopFrame(bool connected, bool updateAvailable,
                                    int restrictionSecondsRemaining, bool restrictionHasDuration)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 20, 36, supportOnly ? "Support access" : "Tickets", 32, 36, 42);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, supportOnly ? "Support Access" : "Support", UiTheme::Ink);
     if (needsReplyCount > 0)
     {
         char countText[24];
         snprintf(countText, sizeof(countText), "%d need reply", std::min(needsReplyCount, 99));
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 320, 36, countText, 196, 92, 40);
+        ui.textClipped(292, 38, countText, UiTheme::Warning, 96);
     }
 
     if (ticketView == 0)
     {
-        const char *regularItems[] = { "New unban request", "Report a bug", "Request a feature", "My tickets" };
-        const char *staffItems[] = { "New unban request", "Report a bug", "Request a feature", "My tickets", "Staff queue", "Staff chat" };
-        const char *supportItems[] = { "New unban request", "My unban tickets" };
-        const char **items = supportOnly ? supportItems : (staffScope ? staffItems : regularItems);
-        int count = supportOnly ? 2 : (staffScope ? 6 : 4);
+        const char *regularItems[] = {
+            "New Bug Request",
+            "New Feature Request",
+            "Report a User",
+            "My Tickets"
+        };
+        const char *supportItems[] = {
+            "New Appeal",
+            "My Appeals",
+            "Profile",
+            "Exit"
+        };
+        const char **items = supportOnly ? supportItems : regularItems;
+        const int count = 4;
+        const int selected = std::max(0, std::min(homeSelected, count - 1));
         for (int i = 0; i < count; i++)
-            drawMenuRow(70 + i * 24, items[i], i == homeSelected);
+            UiComponents::listRow(ui, UiRect(12, 56 + i * 30, 182, 26),
+                                  items[i], "", i == selected);
+
+        UiComponents::panel(ui, UiRect(202, 56, 186, 140), true);
+        ui.textClipped(214, 70, items[selected], UiTheme::Accent, 162);
         if (supportOnly)
         {
-            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 150, "Canvas access is disabled.", 196, 92, 40);
-            drawWrappedText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, 54, 2,
-                            supportReason && supportReason[0] ? supportReason : "Use an unban ticket to contact staff.",
-                            73, 82, 92);
+            const char *descriptions[] = {
+                "Ask staff to review the restriction on this account.",
+                "Read staff replies and continue an existing appeal.",
+                "View your display name, account state, and recovery tools.",
+                "Close Collab Doodle."
+            };
+            ui.wrappedText(214, 90, descriptions[selected], UiTheme::Secondary, 162, 3);
+            ui.text(214, 126, "Restriction", UiTheme::Warning);
+            ui.wrappedText(214, 138,
+                           supportReason && supportReason[0] ? supportReason :
+                           "Canvas access is restricted.",
+                           UiTheme::Danger, 162, 2);
             char remaining[40];
             if (restrictionHasDuration)
                 snprintf(remaining, sizeof(remaining), "Access returns in %02dh %02dm", restrictionSecondsRemaining / 3600, (restrictionSecondsRemaining / 60) % 60);
             else
                 snprintf(remaining, sizeof(remaining), "No automatic expiration");
-            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, remaining, 196, 92, 40);
+            ui.textClipped(214, 174, remaining, UiTheme::Warning, 162);
         }
-        drawFooterHint("A OPEN", supportOnly ? "" : "B MENU");
+        else
+        {
+            const char *descriptions[] = {
+                "Report broken behavior with steps staff can reproduce.",
+                "Suggest an improvement or a new quality-of-life feature.",
+                "Report harmful behavior with the user and incident details.",
+                "Read replies and continue your existing requests."
+            };
+            ui.wrappedText(214, 90, descriptions[selected], UiTheme::Secondary, 162, 5);
+        }
+        drawFooterHint("A OPEN", supportOnly ? "SELECT MENU" : "B MENU");
     }
     else if (ticketView == 1)
     {
@@ -929,40 +949,169 @@ static void composeTicketsTopFrame(bool connected, bool updateAvailable,
     topFrameValid = true;
 }
 
+static void composeOptionsTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
+                                   Color currentColor, int brushSize, int brushShape,
+                                   const RendererTopState *topState)
+{
+    drawTopChrome(connected, updateAvailable);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, "Options", UiTheme::Ink);
+
+    const char *sections[] = {
+        "Controls & Presets",
+        "Drawing & Palette",
+        "Connection & About"
+    };
+    const int selected = topState ? std::max(0, std::min(topState->pageSelected, 2)) : 0;
+    for (int i = 0; i < 3; ++i)
+        UiComponents::listRow(ui, UiRect(12, 56 + i * 28, 164, 24),
+                              sections[i], "", i == selected);
+
+    UiComponents::panel(ui, UiRect(184, 56, 204, 146), true);
+    ui.textClipped(196, 68, sections[selected], UiTheme::Accent, 180);
+    if (selected == 0)
+    {
+        const char *preset = topState && topState->controlPreset && topState->controlPreset[0]
+                                ? topState->controlPreset : "Balanced";
+        char presetLabel[48];
+        snprintf(presetLabel, sizeof(presetLabel), "Preset: %.24s", preset);
+        ui.textClipped(196, 84, presetLabel, UiTheme::Ink, 180);
+        static const char *actions[] = { "Tools", "Pan", "Sample", "Zoom", "Eraser", "Refresh" };
+        for (int i = 0; i < 6; ++i)
+        {
+            const char *binding = topState && topState->controlBindings[i] &&
+                                  topState->controlBindings[i][0]
+                                    ? topState->controlBindings[i] : "Default";
+            const int y = 104 + i * 15;
+            ui.textClipped(196, y, actions[i], UiTheme::Secondary, 68);
+            ui.textClipped(268, y, binding, UiTheme::Ink, 108);
+        }
+    }
+    else if (selected == 1)
+    {
+        const char *shape = brushShape == 1 ? "Square" : brushShape == 2 ? "Dither" :
+                            brushShape == 3 ? "Eraser" : "Circle";
+        char brush[48];
+        snprintf(brush, sizeof(brush), "%s / size %d", shape, brushSize);
+        ui.textClipped(196, 88, brush, UiTheme::Ink, 150);
+        ui.fill(UiRect(352, 84, 24, 16), UiColor(currentColor.r, currentColor.g, currentColor.b));
+        ui.stroke(UiRect(352, 84, 24, 16), UiTheme::Ink);
+        ui.wrappedText(196, 112,
+                       "Eight favorite colors, solid color, brush, and zoom-side settings persist on this system.",
+                       UiTheme::Secondary, 180, 5);
+    }
+    else
+    {
+        char state[64], version[48];
+        snprintf(state, sizeof(state), "%s / %.24s", connected ? "Online" : "Offline",
+                 canvas.channel[0] ? canvas.channel : "main");
+        snprintf(version, sizeof(version), "Client %s", APP_BUILD_LABEL);
+        ui.textClipped(196, 88, state, connected ? UiTheme::Accent : UiTheme::Danger, 180);
+        ui.textClipped(196, 108, version, UiTheme::Ink, 180);
+        ui.wrappedText(196, 132,
+                       "Connection recovery and updates appear automatically when attention is needed.",
+                       UiTheme::Secondary, 180, 4);
+    }
+    drawFooterHint("A OPEN", "B BACK");
+    topFrameValid = true;
+}
+
+static void composeStaffCenterTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
+                                       const char *role, int selectedItem,
+                                       int ticketNeedsReply, int staffChatUnread)
+{
+    drawTopChrome(connected, updateAvailable);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, "Staff Center", UiTheme::Ink);
+
+    if (!isStaffRole(role))
+    {
+        UiComponents::panel(ui, UiRect(12, 56, 376, 88), true);
+        ui.text(28, 76, "Staff access is required.", UiTheme::Danger);
+        ui.wrappedText(28, 96, "Your account does not have moderator or administrator access.",
+                       UiTheme::Secondary, 340, 3);
+        drawFooterHint("", "B BACK");
+        topFrameValid = true;
+        return;
+    }
+
+    const char *items[] = { "Ticket Queue", "Staff Chat", "Canvas Tools" };
+    const int selected = std::max(0, std::min(selectedItem, 2));
+    for (int i = 0; i < 3; ++i)
+    {
+        char meta[20] = "";
+        if (i == 0 && ticketNeedsReply > 0)
+            snprintf(meta, sizeof(meta), "%d need you", std::min(ticketNeedsReply, 99));
+        else if (i == 1 && staffChatUnread > 0)
+            snprintf(meta, sizeof(meta), "%d new", std::min(staffChatUnread, 99));
+        UiComponents::listRow(ui, UiRect(12, 56 + i * 30, 176, 26),
+                              items[i], meta, i == selected);
+    }
+
+    UiComponents::panel(ui, UiRect(196, 56, 192, 146), true);
+    ui.textClipped(208, 70, items[selected], UiTheme::Accent, 168);
+    const char *descriptions[] = {
+        "Filter requests, reply, resolve, reject, approve appeals, or reopen a ticket.",
+        "Coordinate privately with other moderators and administrators.",
+        "Snapshot or change the current canvas with preview and confirmation."
+    };
+    ui.wrappedText(208, 90, descriptions[selected], UiTheme::Secondary, 168, 5);
+    if (selected == 2)
+    {
+        char current[48];
+        snprintf(current, sizeof(current), "Channel: %.24s", canvas.channel[0] ? canvas.channel : "main");
+        ui.textClipped(208, 166, current, UiTheme::Ink, 168);
+    }
+    char roleLabel[20];
+    formatTitleLabel(role, roleLabel, sizeof(roleLabel));
+    ui.textClipped(208, 184, roleLabel, UiTheme::Secondary, 168);
+    drawFooterHint("A OPEN", "B BACK");
+    topFrameValid = true;
+}
+
 static void composeAdminTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
                                  const char *role, int selectedAdminItem, const char *adminNotice)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Staff tools", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 264, 46, "Role", 73, 82, 92);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, "Canvas Tools", UiTheme::Ink);
+    ui.text(292, 38, "Role", UiTheme::Secondary);
     char roleLabel[12];
     formatTitleLabel(role, roleLabel, sizeof(roleLabel));
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 264, 60, roleLabel, 32, 36, 42);
+    ui.textClipped(330, 38, roleLabel, UiTheme::Ink, 58);
 
-    bool allowed = role && (strcmp(role, "mod") == 0 || strcmp(role, "admin") == 0);
+    bool allowed = isStaffRole(role);
     if (!allowed)
     {
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 84, "Mod or admin required", 196, 92, 40);
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 108, "Set your role in web admin", 104, 114, 124);
+        UiComponents::panel(ui, UiRect(12, 56, 376, 72), true);
+        ui.text(28, 76, "Moderator or admin access is required.", UiTheme::Danger);
         drawFooterHint("", "B BACK");
         topFrameValid = true;
         return;
     }
 
     const char *items[] = {
-        "Save snapshot",
-        "Clear canvas",
-        "Fill rectangle",
+        "Snapshot",
+        "Fill Selection",
+        "Erase Selection",
+        "Clear Channel",
     };
-    for (int i = 0; i < 3; i++)
-        drawMenuRow(78 + i * 22, items[i], i == selectedAdminItem);
+    const int selected = std::max(0, std::min(selectedAdminItem, 3));
+    for (int i = 0; i < 4; i++)
+        UiComponents::listRow(ui, UiRect(12, 56 + i * 28, 190, 24),
+                              items[i], "", i == selected);
 
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 132, "Channel", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 146, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
+    UiComponents::panel(ui, UiRect(210, 56, 178, 136), true);
+    ui.text(222, 70, "Current channel", UiTheme::Secondary);
+    ui.textClipped(222, 86, canvas.channel[0] ? canvas.channel : "main", UiTheme::Ink, 154);
+    ui.wrappedText(222, 112,
+                   selected == 0 ? "Save the current canvas for staff records." :
+                   selected == 1 ? "Drag a rectangle, preview it, then press A to fill." :
+                   selected == 2 ? "Drag a rectangle, preview it, then press A to erase." :
+                                   "Clear the whole channel after a confirmation.",
+                   selected == 3 ? UiTheme::Danger : UiTheme::Secondary, 154, 5);
     if (adminNotice && adminNotice[0])
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, adminNotice, 196, 92, 40);
-    else
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, "Fill rectangle: Drag below", 104, 114, 124);
+        ui.textClipped(12, 202, adminNotice, UiTheme::Warning, 376);
     drawFooterHint("A USE", "B BACK");
     topFrameValid = true;
 }
@@ -970,7 +1119,10 @@ static void composeAdminTopFrame(CanvasState &canvas, bool connected, bool updat
 static void composeStatusTopFrame(CanvasState &canvas, bool connected, bool updateAvailable)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Status", 32, 36, 42);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, connected ? "Connection restored" : "Reconnecting", UiTheme::Ink);
+    ui.text(246, 38, "Automatic recovery", UiTheme::Secondary);
+    UiComponents::panel(ui, UiRect(12, 56, 376, 124), true);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 78, "Connection", 73, 82, 92);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 78, connected ? "Online" : "Offline", connected ? 13 : 196, connected ? 122 : 61, connected ? 117 : 61);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 100, "Update", 73, 82, 92);
@@ -981,7 +1133,7 @@ static void composeStatusTopFrame(CanvasState &canvas, bool connected, bool upda
     drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 144, canvas.channel[0] ? canvas.channel : "main", 32, 36, 42);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "Zoom", 73, 82, 92);
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, canvas.zoomLabel(), 32, 36, 42);
-    drawFooterHint("START REFRESH", "B BACK");
+    drawFooterHint("A RETRY", "B / SELECT MENU");
     topFrameValid = true;
 }
 
@@ -990,22 +1142,42 @@ static void composeIdentityTopFrame(bool connected, bool updateAvailable,
                                     const char *role, const char *status,
                                     const char *backupCode,
                                     const char *identityNotice,
-                                    const char *identityStorage, int restrictionSecondsRemaining,
-                                    bool restrictionHasDuration, const char *restrictionReason)
+                                     const char *identityStorage, int restrictionSecondsRemaining,
+                                     bool restrictionHasDuration, const char *restrictionReason,
+                                     bool backupCodeRevealed, bool needsDisplayName)
 {
     drawTopChrome(connected, updateAvailable);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 46, "Identity", 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 78, "Name", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 78, displayName, 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 100, "Account", 73, 82, 92);
-    drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 100, username, 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 122, "Role", 73, 82, 92);
+    UiCanvas ui(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, UI_BUFFER_RGB);
+    ui.text(12, 38, needsDisplayName ? "Welcome" : "Profile", UiTheme::Ink);
+
+    UiComponents::panel(ui, UiRect(12, 54, 184, 106), true);
+    ui.text(24, 66, "Display Name", UiTheme::Secondary);
+    ui.textClipped(24, 80, displayName && displayName[0] ? displayName : "Not set", UiTheme::Ink, 160);
+    ui.text(24, 100, "Account ID", UiTheme::Secondary);
+    ui.textClipped(24, 114, username && username[0] ? username : "Pending", UiTheme::Ink, 160);
+
     char roleLabel[12], statusLabel[16];
     formatTitleLabel(role, roleLabel, sizeof(roleLabel));
     formatTitleLabel(status, statusLabel, sizeof(statusLabel));
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 122, roleLabel, 32, 36, 42);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 144, "State", 73, 82, 92);
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 144, statusLabel, 32, 36, 42);
+    UiComponents::badge(ui, UiRect(24, 134, 66, 16), roleLabel,
+                        isStaffRole(role) ? UiTheme::Accent : UiTheme::Secondary);
+    UiComponents::badge(ui, UiRect(96, 134, 76, 16), statusLabel,
+                        strcmp(status, "active") == 0 ? UiTheme::Accent :
+                        strcmp(status, "banned") == 0 ? UiTheme::Danger : UiTheme::Warning);
+
+    UiComponents::panel(ui, UiRect(204, 54, 184, 106), true);
+    ui.text(216, 66, "Recovery Code", UiTheme::Secondary);
+    if (backupCode && backupCode[0])
+        ui.textClipped(216, 82, backupCodeRevealed ? backupCode : "****-****-****",
+                       backupCodeRevealed ? UiTheme::Ink : UiTheme::Secondary, 160);
+    else
+        ui.text(216, 82, "No code loaded", UiTheme::Warning);
+    if (identityStorage && identityStorage[0])
+        ui.textClipped(216, 100, identityStorage, UiTheme::Secondary, 160);
+    ui.wrappedText(216, 118,
+                   "Keep it private. Rotate invalidates the previous code.",
+                   UiTheme::Secondary, 160, 3);
+
     bool restricted = strcmp(status, "muted") == 0 || strcmp(status, "banned") == 0;
     if (restricted)
     {
@@ -1014,30 +1186,23 @@ static void composeIdentityTopFrame(bool connected, bool updateAvailable,
             snprintf(remaining, sizeof(remaining), "%02dh %02dm %02ds left", restrictionSecondsRemaining / 3600, (restrictionSecondsRemaining / 60) % 60, restrictionSecondsRemaining % 60);
         else
             snprintf(remaining, sizeof(remaining), "No automatic expiration");
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 214, 144, remaining, 196, 92, 40);
+        ui.textClipped(12, 170, remaining, UiTheme::Warning, 376);
         if (restrictionReason && restrictionReason[0])
-        {
-            char compactReason[61];
-            snprintf(compactReason, sizeof(compactReason), "%.60s", restrictionReason);
-            drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 184, compactReason, 196, 92, 40);
-        }
+            ui.textClipped(12, 184, restrictionReason, UiTheme::Danger, 376);
     }
-    drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 166, "Backup", 73, 82, 92);
-    if (backupCode && backupCode[0])
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, backupCode, 32, 36, 42);
-    else
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 128, 166, "PRESS Y", 196, 92, 40);
-    if (identityStorage && identityStorage[0])
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 256, 166, identityStorage, 104, 114, 124);
     if (identityNotice && identityNotice[0])
-    {
-        char compactNotice[61];
-        snprintf(compactNotice, sizeof(compactNotice), "%.60s", identityNotice);
-        drawUpperText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, restricted ? 202 : 190, compactNotice, 196, 92, 40);
-    }
+        ui.textClipped(12, restricted ? 198 : 178, identityNotice, UiTheme::Warning, 376);
     else if (!restricted)
-        drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 24, 190, "X RECOVER  Y GET CODE", 104, 114, 124);
-    drawFooterHint("A EDIT NAME", "B BACK");
+        ui.text(12, 178, "Recovery changes require confirmation.", UiTheme::Secondary);
+    if (needsDisplayName)
+        drawFooterHint("A CREATE / NAME", "X RECOVER  B EXIT");
+    else if (strcmp(status, "banned") == 0)
+        drawFooterHint(backupCodeRevealed ? "Y HIDE CODE" : "Y REVEAL CODE",
+                       "B BACK - READ ONLY");
+    else
+        drawFooterHint("A NAME  X RECOVER",
+                       backupCodeRevealed ? "Y HIDE R ROTATE B BACK" :
+                                            "Y REVEAL R ROTATE B BACK");
     topFrameValid = true;
 }
 
@@ -1084,7 +1249,8 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
                          bool supportOnly, const char *supportReason,
                          const char *ticketNotice, int ticketNeedsReplyCount,
                          int staffChatUnreadCount, int restrictionSecondsRemaining,
-                         bool restrictionHasDuration, const char *restrictionReason)
+                         bool restrictionHasDuration, const char *restrictionReason,
+                         const RendererTopState *topState)
 {
     minimapFrameCounter++;
     if (mode == TOP_MODE_CANVAS && (!minimapCacheValid || minimapFrameCounter >= 15))
@@ -1094,16 +1260,24 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
     }
 
     if (mode == TOP_MODE_CHANNELS)
-        composeChannelTopFrame(canvas, connected, updateAvailable, channels, channelCount, selectedChannel);
+        composeChannelTopFrame(canvas, connected, updateAvailable, channels, channelCount, selectedChannel,
+                               topState ? topState->channelInfo : NULL,
+                               topState ? topState->channelInfoCount : 0);
     else if (mode == TOP_MODE_CONTROLS)
         composeControlsTopFrame(canvas, connected, updateAvailable);
     else if (mode == TOP_MODE_MENU)
         composeMenuTopFrame(canvas, connected, updateAvailable, selectedMenuItem, ticketNeedsReplyCount, staffChatUnreadCount,
                             role && (strcmp(role, "mod") == 0 || strcmp(role, "admin") == 0));
     else if (mode == TOP_MODE_USERS)
-        composeUsersTopFrame(canvas, connected, updateAvailable, users, userCount);
+        composeUsersTopFrame(canvas, connected, updateAvailable, users, userCount,
+                             displayName, username, role,
+                             topState ? topState->peopleSelected : 0,
+                             topState ? topState->peopleAllChannels : false,
+                             topState ? topState->presenceTotal : userCount,
+                             topState ? topState->presenceTruncated : false);
     else if (mode == TOP_MODE_RULES)
-        composeRulesTopFrame(connected, updateAvailable, rulesVersion, needsRulesAgreement, identityNotice);
+        composeRulesTopFrame(connected, updateAvailable, rulesVersion, needsRulesAgreement, identityNotice,
+                             topState);
     else if (mode == TOP_MODE_TICKETS)
         composeTicketsTopFrame(connected, updateAvailable, tickets, ticketCount, ticketSelected,
                                ticketView, ticketStaffScope, activeTicket, ticketMessages, ticketMessageCount,
@@ -1112,14 +1286,25 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
                                staffChatUnreadCount, restrictionSecondsRemaining, restrictionHasDuration);
     else if (mode == TOP_MODE_ADMIN)
         composeAdminTopFrame(canvas, connected, updateAvailable, role, selectedAdminItem, adminNotice);
+    else if (mode == TOP_MODE_OPTIONS)
+        composeOptionsTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape, topState);
+    else if (mode == TOP_MODE_STAFF_CENTER)
+        composeStaffCenterTopFrame(canvas, connected, updateAvailable, role,
+                                   topState ? topState->pageSelected : selectedAdminItem,
+                                   ticketNeedsReplyCount, staffChatUnreadCount);
     else if (mode == TOP_MODE_STATUS)
         composeStatusTopFrame(canvas, connected, updateAvailable);
     else if (mode == TOP_MODE_IDENTITY)
         composeIdentityTopFrame(connected, updateAvailable, displayName, username, role, status, backupCode,
-                                identityNotice, identityStorage, restrictionSecondsRemaining, restrictionHasDuration, restrictionReason);
+                                 identityNotice, identityStorage, restrictionSecondsRemaining, restrictionHasDuration,
+                                 restrictionReason,
+                                 topState ? topState->backupCodeRevealed : false,
+                                 topState ? topState->needsDisplayName : false);
     else
         composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape,
-                              ticketNeedsReplyCount, staffChatUnreadCount, users, userCount);
+                               ticketNeedsReplyCount, staffChatUnreadCount, users, userCount,
+                               topState ? topState->channelInfo : NULL,
+                               topState ? topState->channelInfoCount : 0);
 }
 
 void Renderer::presentTopFrame()

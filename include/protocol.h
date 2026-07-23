@@ -12,6 +12,7 @@ struct CanvasMeta {
 };
 
 struct IdentityInfo {
+    char identityId[40];
     char username[25];
     char displayName[25];
     char role[12];
@@ -69,23 +70,59 @@ struct StaffChatMessage {
     char message[241];
 };
 
+struct ChannelInfo {
+    char name[25];
+    int userCount;
+    bool staffOnly;
+    bool adminOnly;
+    bool readOnly;
+};
+
 struct PresenceUser {
+    char id[48];
     char identityId[40];
     char username[25];
     char displayName[25];
     char role[12];
     char status[12];
+    char channel[25];
+    char clientType[24];
     char deviceModel[24];
     char deviceModelLabel[32];
+    int sessionCount;
     int muteSecondsRemaining;
     int banSecondsRemaining;
+    bool readOnly;
+};
+
+struct PresenceInfo {
+    char channel[25];
+    int total;
+    bool truncated;
+};
+
+struct TicketCursor {
+    char updatedAt[25];
+    int id;
+};
+
+struct ModerationResult {
+    bool ok;
+    bool hasIdentity;
+    char action[24];
+    char error[48];
+    IdentityInfo identity;
 };
 
 class Protocol {
 public:
     static bool parseCanvasMeta(const char *line, CanvasMeta &meta);
     static bool parseChannels(const char *line, char channels[][25], int maxChannels, int &count, char *currentChannel);
+    static bool parseChannels(const char *line, char channels[][25], ChannelInfo *channelInfo,
+                              int maxChannels, int &count, char *currentChannel);
     static bool parsePresence(const char *line, PresenceUser *users, int maxUsers, int &count);
+    static bool parsePresence(const char *line, PresenceUser *users, int maxUsers, int &count,
+                              PresenceInfo &presence);
     static bool parseIdentityAccepted(const char *line, IdentityInfo &identity);
     static bool parseIdentityBackupCode(const char *line, IdentityInfo &identity);
     static bool parseRecoveryFailed(const char *line, char *reason, size_t reasonSize);
@@ -104,17 +141,22 @@ public:
                                   char *error, size_t errorSize, int &ticketId);
     static bool parseTicketListStart(const char *line, char *scope, size_t scopeSize, int &count);
     static bool parseTicketListEnd(const char *line, int &nextBeforeId);
+    static bool parseTicketListEnd(const char *line, TicketCursor &nextCursor);
     static bool parseTicketThreadEnd(const char *line, int &ticketId, int &nextBeforeMessageId);
     static bool parseTicketCounts(const char *line, int &mineOpen, int &staffNeedsReply, int &staffChatUnread);
     static bool parseStaffChatMessage(const char *line, StaffChatMessage &message);
     static bool parseStaffChatStart(const char *line, int &count);
     static bool parseStaffChatEnd(const char *line, int &nextBeforeId);
     static bool parseStaffChatResult(const char *line, bool &ok, char *error, size_t errorSize);
+    static bool parseModerationResult(const char *line, ModerationResult &result);
     static bool parseUpdateRequired(const char *line, char *latestVersion, size_t latestVersionSize,
                                     char *reason, size_t reasonSize);
     static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
                            const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
                            const char *displayName, const char *packageType);
+    static void buildHello(char *buffer, size_t size, const char *appId, const char *version, bool updaterSupported,
+                           const char *deviceId, const char *deviceSecret, const char *hardwareId, const char *deviceModel,
+                           const char *displayName, const char *packageType, const char *preferredChannel);
     static void buildSwitchChannel(char *buffer, size_t size, const char *channel);
     static void buildGetCanvas(char *buffer, size_t size);
     static void buildSetDisplayName(char *buffer, size_t size, const char *displayName);
@@ -129,6 +171,8 @@ public:
                                         int x, int y, int width, int height, int r, int g, int b);
     static void buildTicketCreate(char *buffer, size_t size, const char *category, const char *subject, const char *message);
     static void buildTicketList(char *buffer, size_t size, bool staff, const char *status, const char *category, int beforeId);
+    static void buildTicketList(char *buffer, size_t size, bool staff, const char *status, const char *category,
+                                const TicketCursor &before);
     static void buildTicketGet(char *buffer, size_t size, int ticketId, int beforeMessageId = 0);
     static void buildTicketReply(char *buffer, size_t size, int ticketId, const char *message, bool staff = false);
     static void buildTicketStatus(char *buffer, size_t size, int ticketId, const char *status, const char *message = "");

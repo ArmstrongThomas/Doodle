@@ -1,53 +1,85 @@
 # Collab Doodle 3DS Client
 
-Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared server-backed canvases. The bottom screen is the drawing surface, and the top screen shows a minimap, channel/status information, controls, and the current app version.
+Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared server-backed canvases. Version 1.6 uses a compact hybrid layout: the top screen presents the canvas dashboard or selected-item details, while the bottom screen provides drawing controls, touch navigation, and actions.
 
 ## Current Release
 
-- Version: `1.5.0`
+- Version: `1.6.0`
 
 ## Features
 
 - Real-time collaborative drawing with the 3DS touchscreen.
-- Top-screen minimap with viewport marker.
+- Compact top-screen minimap with viewport marker and current-channel presence.
 - Zoom levels: `0.5x`, `1x`, `2x`, and `4x`.
 - Named channels: `main`, `sketch`, and `test`.
-- Channel switch UI on the 3DS.
-- Color picker, color sampling, brush size/shape controls, and quick eraser.
-- Color-square picker with hue strip and circle/box/dither/eraser brush modes.
-- Device identity, display name, backup-code recovery, and connected-user list.
-- Mod/admin canvas tools with snapshot, clear, and selection-style fill rectangle.
+- Touch and button-complete channel, people, support, staff, profile, options, and help pages.
+- Circle, square, dither, and eraser shapes with independent numeric size selection and live preview.
+- Validated `#RRGGBB` entry, current/previous colors, and eight persistent favorite swatches.
+- Device identity, display name, masked backup-code recovery, and grouped connected-user sessions.
+- Staff canvas tools with snapshot, fill/erase selection previews, and confirmed clear.
+- Ticket drafts, preview-before-send, status/attention indicators, and cursor-based paging history.
+- Balanced, right-handed stylus, left-handed stylus, and custom control layouts.
+- Shared connection, syncing, restriction, update, and fatal-error overlays.
 - Compressed canvas snapshots using zlib.
 - Cloudflare-proxied WSS realtime transport with automatic sleep/Wi-Fi recovery, heartbeat detection, and reconnect backoff.
 - HTTPS update checks and downloads with certificate, size, and SHA-256 verification.
 - App metadata/icon via SMDH, including the visible app version/build label.
 - Optional `.cia` packaging when `makerom.exe` is installed.
 
-## Screenshots
-
-<img width="325" height="392" alt="image" src="https://github.com/user-attachments/assets/bf6f6af4-396c-473d-bd6e-8dc747d2e07c" />
-<img width="320" height="386" alt="image" src="https://github.com/user-attachments/assets/764a0ff5-6994-46f2-b583-b112c4a5ef61" />
-<img width="321" height="389" alt="image" src="https://github.com/user-attachments/assets/f45f9464-cb0e-4d4b-9f0c-d0374a1a65e2" />
-
-
-
 ## Controls
 
 - Touch bottom screen: Draw.
 - Circle Pad: Pan viewport.
-- Hold LEFT D-Pad or A + drag stylus: Pan viewport.
-- Hold L or R: Temporarily switch to eraser; release to return to the previous brush.
-- Hold RIGHT D-Pad: Show zoom buttons on the right side of the bottom screen.
-- Hold Y: Show zoom buttons on the left side of the bottom screen.
-- Hold RIGHT D-Pad or Y + tap `+`: Zoom in.
-- Hold RIGHT D-Pad or Y + tap `-`: Zoom out.
-- START: Refresh canvas from server.
-- SELECT: Open menu.
-- Menu includes channels, connected users, controls, status, identity, admin tools, and exit.
-- B or D-Pad DOWN: Toggle color picker.
-- Color picker tabs: `COLOR` and `MOD`.
-- MOD tab: Snapshot, clear canvas, and fill rectangle. Fill rectangle arms a selection; release stylus to fill using the selected color.
-- Hold D-Pad UP or X + tap canvas: Sample color.
+- SELECT: Open the root menu from the canvas, or escape back to it from any page.
+- Lists: Touch or D-Pad/Circle Pad to select, A to confirm, and B to go back.
+- The default Balanced canvas layout is:
+  - D-Pad DOWN or B: Open/close tools.
+  - Hold D-Pad LEFT or A + drag stylus: Pan viewport.
+  - Hold D-Pad UP or X + tap canvas: Sample color.
+  - Hold D-Pad RIGHT or Y: Show the zoom overlay; tap `+` or `-`.
+  - Hold L or R: Temporarily use Quick Eraser.
+  - START: Refresh the current canvas.
+
+Canvas bindings are read from the active preset. `Help & Rules` therefore always shows the live bindings instead of a second hard-coded controls list. SELECT, touch, Circle Pad, and menu navigation are intentionally not rebindable.
+
+## UI and Navigation
+
+The root menu contains:
+
+- Channels
+- People
+- Support
+- Staff Center (staff and administrators only)
+- Profile
+- Options
+- Help & Rules
+- Exit
+
+The old standalone Status and Controls pages are gone. Connection status still appears automatically when the client is connecting, syncing, recovering, updating, restricted, or unable to continue. Controls now live in `Options > Controls & Presets`. Every intentional Exit action asks for confirmation before disconnecting; fatal-error and completed-update shutdowns remain immediate.
+
+The drawing sheet has `Draw` and role-gated `Staff` tabs. Draw separates shape from size, keeps Rainbow available to every user, and provides current/previous colors, validated hex entry, and eight favorite swatches. Tap a swatch (or focus it and press A) to apply it. Choose `Save`, then a slot, to replace that favorite explicitly. Reset asks for confirmation before restoring black, white, red, yellow, green, cyan, blue, and magenta. Action toasts dismiss automatically after about 1.5 seconds or immediately when tapped. Rainbow always starts disabled.
+
+Staff actions report pending, success, denied, or error results. Fill Selection and Erase Selection show the chosen rectangle before A applies it or B cancels. Clear always requires confirmation.
+
+Support offers bug reports, feature requests, user reports, and My Tickets. “Report a user” opens the People picker, records the selected account/session and channel in the draft, then presents the same editable final preview used by every other request. Restricted accounts continue to see only appeal creation and their existing appeals.
+
+## Options and Device Settings
+
+Options is divided into:
+
+- Controls & Presets
+- Drawing & Palette
+- Connection & About
+
+Settings are device-local at `sdmc:/3ds/CollabDoodle/settings.ini`. Version 1 stores the active preset, two button slots for each of the six canvas actions, zoom-overlay side, last successfully loaded channel, brush shape/size, solid color, and eight palette colors. Changes are staged through `settings.ini.tmp`; the last valid file is kept as `settings.ini.bak`. Unknown keys and individually invalid values do not block startup, and a valid backup is used when the primary is corrupt.
+
+The identity credential file is separate and is never modified or merged by settings recovery.
+
+Editing a named preset changes its label to Custom. If a newly selected button is already assigned, the UI offers Swap or Cancel. The presets are:
+
+- Balanced: paired D-Pad/face-button actions, L/R Quick Eraser, START Refresh.
+- Right-handed stylus: D-Pad modifiers, L Quick Eraser, START Refresh.
+- Left-handed stylus: face-button modifiers, R Quick Eraser, START Refresh.
 
 ## Server Links
 
@@ -80,7 +112,7 @@ make
 The Makefile exposes these primary release/server variables:
 
 ```make
-APP_VERSION ?= 1.5.0
+APP_VERSION ?= 1.6.0
 CHAT_ENABLED ?= 0
 TEST_MODE ?= 0
 LOCAL_SERVER_HOST ?= 192.168.1.46
@@ -154,7 +186,30 @@ make cia TEST_MODE=2 DISABLE_UPDATER=0
 
 The updater always uses TLS. If it is intentionally enabled for `TEST_MODE=1`, point `SERVER_HTTPS_HOST` and `SERVER_HTTPS_PORT` at a real HTTPS endpoint whose certificate matches the host; the default local port `3000` is intended for the plain local WebSocket server, not an insecure updater fallback.
 
-Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. Test modes disable update prompts/downloads by default so they can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` only when intentionally testing against HTTPS. Test builds display labels such as `1.5.0-test1` or `1.5.0-test2`.
+Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. Test modes disable update prompts/downloads by default so they can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` only when intentionally testing against HTTPS. Test builds display labels such as `1.6.0-test1` or `1.6.0-test2`.
+
+## Client Fixture Tests
+
+The host fixture harness exercises settings parsing and independent validation, primary/backup recovery, atomic-save history, palette defaults, preset mappings, binding conflicts and swaps, per-frame semantic action consumption, shared hitbox edges, clipped text, and rotated framebuffer addressing.
+
+On Windows with Visual Studio C++ Build Tools:
+
+```powershell
+make host-tests
+```
+
+On a POSIX host:
+
+```sh
+make host-tests HOST_CXX=c++
+```
+
+Before release, also run the client test build and production configuration verification:
+
+```powershell
+make TEST_MODE=1
+make verify-release-config TEST_MODE=0
+```
 
 ## CIA Packaging
 
@@ -209,9 +264,11 @@ When an update is available:
 
 Homebrew Launcher `.3dsx` apps do not currently support a reliable in-app relaunch of the freshly replaced file, so the final step is manual reopen.
 
-### 1.4.4 migration compatibility
+### Protocol compatibility
 
-Version `1.4.4` clients still connect over direct raw TCP and cannot use Cloudflare's HTTP/WebSocket proxy for realtime traffic. Keep the server's temporary legacy TCP bridge enabled during the upgrade window. If in-app migration from 1.4.4 is required, its legacy update endpoint must also remain reachable long enough to publish the `1.5.0` update. Version `1.5.0` uses WSS and HTTPS; after adoption is sufficient, the legacy TCP listener can be disabled and the origin can be restricted to Cloudflare/tunnel traffic.
+Version 1.6 keeps native protocol version `6`. Its hello advertises the additive `ui2-channel-info`, `ui2-presence-compact`, and `ui2-ticket-cursor` capabilities and may include the last successfully loaded channel as `preferredChannel`. Capable servers can return compact channel metadata, bounded/grouped presence with channel totals, and compound ticket cursors (`updatedAt + id`). Legacy channel-name arrays and `beforeId` ticket requests remain supported, so 1.5 clients continue to connect and the server minimum supported version does not change.
+
+Version `1.4.4` clients still connect over direct raw TCP and cannot use Cloudflare's HTTP/WebSocket proxy for realtime traffic. Keep the server's temporary legacy TCP bridge enabled only while that migration path is still required. Versions `1.5.0` and newer use WSS and HTTPS.
 
 ## Repository Notes
 

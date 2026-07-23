@@ -16,7 +16,26 @@ enum TopScreenMode {
     TOP_MODE_STATUS = 6,
     TOP_MODE_IDENTITY = 7,
     TOP_MODE_RULES = 8,
-    TOP_MODE_TICKETS = 9
+    TOP_MODE_TICKETS = 9,
+    TOP_MODE_OPTIONS = 10,
+    TOP_MODE_STAFF_CENTER = 11
+};
+
+// Optional route-specific state for the 1.6 top-screen views. Keeping this
+// behind a single pointer lets older call sites continue to render unchanged
+// while the route/input layer is migrated.
+struct RendererTopState {
+    int peopleSelected;
+    bool peopleAllChannels;
+    int presenceTotal;
+    bool presenceTruncated;
+    ChannelInfo *channelInfo;
+    int channelInfoCount;
+    bool backupCodeRevealed;
+    bool needsDisplayName;
+    int pageSelected;
+    const char *controlPreset;
+    const char *controlBindings[6];
 };
 
 class Renderer {
@@ -41,7 +60,8 @@ public:
                           bool supportOnly = false, const char *supportReason = "",
                           const char *ticketNotice = "", int ticketNeedsReplyCount = 0,
                           int staffChatUnreadCount = 0, int restrictionSecondsRemaining = 0,
-                          bool restrictionHasDuration = false, const char *restrictionReason = "");
+                          bool restrictionHasDuration = false, const char *restrictionReason = "",
+                          const RendererTopState *topState = NULL);
     static void presentTopFrame();
     static void invalidateMinimap();
 };

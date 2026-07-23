@@ -19,6 +19,10 @@
 #include "renderer.h"
 #include "protocol.h"
 #include "updater.h"
+#include "ui_canvas.h"
+#include "ui_route.h"
+#include "client_settings.h"
+#include "input_bindings.h"
 
 // TLS certificate verification can exceed libctru's 32 KiB default main
 // thread stack. The updater deliberately runs HTTPS on the main thread so it
@@ -58,6 +62,20 @@ static const int BRUSH_ERASER = 3;
 static bool gRainbowEnabled = false;
 static bool gRainbowStrokeColorValid = false;
 static Color gRainbowStrokeColor = {255, 0, 0};
+static Color gPreviousColor = {255, 255, 255};
+static Color gCustomPalette[8] = {
+    {0, 0, 0},
+    {255, 255, 255},
+    {229, 57, 53},
+    {246, 201, 69},
+    {63, 185, 80},
+    {37, 194, 199},
+    {57, 119, 232},
+    {198, 75, 201},
+};
+static bool gPaletteAssignMode = false;
+static Doodle::ClientSettings gClientSettings;
+static char gPreferredChannel[Doodle::CLIENT_CHANNEL_CAPACITY] = "";
 
 struct DeviceIdentity {
     char deviceId[48];
@@ -93,7 +111,10 @@ enum OnboardingStage
 static char gDisconnectReason[80] = "";
 static volatile bool gAptResumeRequested = false;
 static volatile bool gAptWentToSleep = false;
-static const size_t CONTROL_LINE_CAPACITY = 2048;
+// A compact protocol-6 presence envelope can contain 24 grouped sessions.
+// Keep this bounded, but large enough that the negotiated response is not
+// silently discarded before Protocol gets a chance to validate it.
+static const size_t CONTROL_LINE_CAPACITY = 12 * 1024;
 static const uint64_t MAX_CANVAS_BYTES = 12ULL * 1024ULL * 1024ULL;
 
 static bool isValidCanvasMeta(const CanvasMeta &meta)
@@ -184,20 +205,6 @@ static void randomHex(char *out, size_t outSize)
     for (size_t i = 0; i + 1 < outSize; i++)
         out[i] = hex[rand() & 15];
     out[outSize - 1] = '\0';
-}
-
-static void chooseRandomDrawingColor()
-{
-    seedRandom();
-    float h = (float)(rand() % 360) / 360.0f;
-    float s = 0.72f + ((float)(rand() % 24) / 100.0f);
-    float v = 0.78f + ((float)(rand() % 20) / 100.0f);
-    float r, g, b;
-    UIState::HSVtoRGB(h, s, v, r, g, b);
-    currentColor.r = (u8)(r * 255.0f);
-    currentColor.g = (u8)(g * 255.0f);
-    currentColor.b = (u8)(b * 255.0f);
-    UIState::updateHSV(h, s, v);
 }
 
 static void trimLine(char *text)
@@ -414,11 +421,36 @@ static const char *updateTargetPathForPackage(const char *packageType, const cha
 
 static bool sendClientHello(const char *packageType)
 {
-    char hello[512];
+    char hello[768];
     Protocol::buildHello(hello, sizeof(hello), APP_ID, APP_VERSION, UPDATER_ENABLED != 0,
                          gIdentity.deviceId, gIdentity.deviceSecret, gHardwareId, gDeviceModel,
-                         gIdentity.displayName, packageType);
+                         gIdentity.displayName, packageType,
+                         gPreferredChannel[0] ? gPreferredChannel : NULL);
     return NetworkManager::sendSessionHello(hello, strlen(hello));
+}
+
+static void rememberSuccessfulChannel(const char *channel)
+{
+    if (!channel || !channel[0] ||
+        !Doodle::setLastSuccessfulChannel(gClientSettings, channel))
+        return;
+    gClientSettings.brushShape = (Doodle::ClientBrushShape)std::max(
+        0, std::min(currentBrushShape, (int)Doodle::CLIENT_BRUSH_SHAPE_COUNT - 1));
+    gClientSettings.brushSize = std::max(1, std::min(currentBrushSize, 12));
+    gClientSettings.solidColor.r = currentColor.r;
+    gClientSettings.solidColor.g = currentColor.g;
+    gClientSettings.solidColor.b = currentColor.b;
+    for (int slot = 0; slot < Doodle::CLIENT_PALETTE_COLOR_COUNT; ++slot)
+    {
+        gClientSettings.palette[slot].r = gCustomPalette[slot].r;
+        gClientSettings.palette[slot].g = gCustomPalette[slot].g;
+        gClientSettings.palette[slot].b = gCustomPalette[slot].b;
+    }
+    snprintf(gPreferredChannel, sizeof(gPreferredChannel), "%s", channel);
+    Doodle::SettingsSaveResult result = Doodle::saveClientSettings(gClientSettings);
+    if (result != Doodle::SETTINGS_SAVE_OK)
+        printf("Could not remember channel: %s\n",
+               Doodle::settingsSaveResultLabel(result));
 }
 
 static void putPixel(u8 *fb, int width, int height, int x, int y, u8 r, u8 g, u8 b)
@@ -905,6 +937,13 @@ static bool sameColor(const Color &a, const Color &b)
     return a.r == b.r && a.g == b.g && a.b == b.b;
 }
 
+static void syncPickerToColor(const Color &color)
+{
+    float h, s, v;
+    UIState::RGBtoHSV(color.r / 255.0f, color.g / 255.0f, color.b / 255.0f, h, s, v);
+    UIState::updateHSV(h, s, v);
+}
+
 static int effectiveBrushShape()
 {
     return currentBrushShape == BRUSH_ERASER ? BRUSH_CIRCLE : currentBrushShape;
@@ -1281,48 +1320,6 @@ static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Col
     }
 }
 
-static void drawPaletteButton(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h,
-                              const char *label, bool active, bool danger)
-{
-    u8 r = active ? 24 : (danger ? 196 : 230);
-    u8 g = active ? 33 : (danger ? 61 : 235);
-    u8 b = active ? 38 : (danger ? 61 : 240);
-    fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, r, g, b);
-    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, 104, 114, 124);
-    drawMiniText(framebuffer, fbWidth, fbHeight, x + 14, y + (h / 2) - 3, label,
-                 active || danger ? 245 : 32, active || danger ? 248 : 36, active || danger ? 250 : 42);
-}
-
-static void drawPaletteBrushChoice(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int size, int shape, bool selected)
-{
-    if (selected)
-    {
-        fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x - 13, y - 13, 26, 26, 94, 234, 212);
-        fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x - 10, y - 10, 20, 20, 220, 226, 232);
-    }
-    int radius = std::max(2, size + 2);
-    for (int py = -radius; py <= radius; py++)
-    {
-        for (int px = -radius; px <= radius; px++)
-        {
-            bool draw = shape == BRUSH_SQUARE || (px * px + py * py <= radius * radius);
-            if (shape == 2 && (abs(px) + abs(py)) % 2 == 1)
-                draw = false;
-            if (draw)
-                putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + px, y + py,
-                                     shape == BRUSH_ERASER ? 255 : 24,
-                                     shape == BRUSH_ERASER ? 255 : 33,
-                                     shape == BRUSH_ERASER ? 255 : 38);
-        }
-    }
-    if (shape == BRUSH_ERASER)
-    {
-        strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x - radius, y - radius, radius * 2 + 1, radius * 2 + 1, 196, 61, 61);
-        for (int i = -radius; i <= radius; i++)
-            putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + i, y - i, 196, 61, 61);
-    }
-}
-
 static void drawColorSquare(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h,
                             float hue, float saturation, float value)
 {
@@ -1361,65 +1358,150 @@ static void drawHueStrip(u8 *framebuffer, int fbWidth, int fbHeight, int x, int 
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 2, y - 3, 5, h + 6, 24, 33, 38);
 }
 
-static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int activeTab, bool modAllowed,
-                            Color color, const char *notice)
-{
-    fillBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 220, 226, 232);
-    strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, 8, 8, 304, 224, 104, 114, 124);
+static const int PICKER_COLOR_FIELD_X = 8;
+static const int PICKER_COLOR_FIELD_Y = 108;
+static const int PICKER_COLOR_FIELD_SIZE = 92;
+static const int PICKER_HUE_STRIP_Y = 214;
+static const int PICKER_HUE_STRIP_HEIGHT = 12;
 
-    drawPaletteButton(framebuffer, fbWidth, fbHeight, 14, 14, 88, 28, "Color", activeTab == 0, false);
+static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int activeTab,
+                            int focus, bool modAllowed, Color color, const char *notice)
+{
+    UiCanvas ui(framebuffer, fbWidth, fbHeight, UI_BUFFER_3DS_ROTATED_BGR);
+    ui.fill(UiRect(0, 0, 320, 240), UiTheme::Ink);
+    UiComponents::panel(ui, UiRect(4, 4, 312, 232), false);
+    UiComponents::tab(ui, UiRect(8, 8, 92, 28), "Draw", activeTab == 0);
     if (modAllowed)
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 106, 14, 88, 28, "Staff", activeTab == 1, false);
+        UiComponents::tab(ui, UiRect(104, 8, 92, 28), "Staff", activeTab == 1);
 
     if (activeTab == 0)
     {
-        drawMiniText(framebuffer, fbWidth, fbHeight, 26, 52, "Brush", 73, 82, 92);
-        const int shapeXs[] = {30, 60, 90, 120};
-        const int sizeYs[] = {70, 92, 114, 136, 158};
-        drawMiniText(framebuffer, fbWidth, fbHeight, 16, 184, "Cir", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 48, 184, "Box", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 78, 184, "Dit", 73, 82, 92);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 108, 184, "Erase", 196, 61, 61);
-        for (int row = 0; row < 5; row++)
-            for (int shape = 0; shape < 4; shape++)
-                drawPaletteBrushChoice(framebuffer, fbWidth, fbHeight, shapeXs[shape], sizeYs[row],
-                                       brushSizeForShapeRow(shape, row), shape,
-                                       currentBrushSize == brushSizeForShapeRow(shape, row) && currentBrushShape == shape);
+        static const char *shapeLabels[] = {"Circle", "Square", "Dither", "Eraser"};
+        for (int shape = 0; shape < 4; ++shape)
+        {
+            UiComponents::button(ui, UiRect(8 + shape * 76, 42, 72, 28), shapeLabels[shape],
+                                 currentBrushShape == shape, shape == BRUSH_ERASER);
+            if (focus == shape)
+                ui.stroke(UiRect(8 + shape * 76, 42, 72, 28), UiTheme::AccentBright, 2);
+        }
+
+        ui.text(10, 82, "Size", UiTheme::Secondary);
+        for (int row = 0; row < 5; ++row)
+        {
+            const int size = brushSizeForShapeRow(currentBrushShape, row);
+            char sizeLabel[5];
+            snprintf(sizeLabel, sizeof(sizeLabel), "%d", size);
+            UiComponents::button(ui, UiRect(48 + row * 52, 74, 48, 28), sizeLabel,
+                                 currentBrushSize == size);
+            if (focus == 4 + row)
+                ui.stroke(UiRect(48 + row * 52, 74, 48, 28), UiTheme::AccentBright, 2);
+        }
 
         float h, s, v;
         UIState::getHSV(h, s, v);
-        drawColorSquare(framebuffer, fbWidth, fbHeight, 162, 54, 132, 132, h, s, v);
-        drawHueStrip(framebuffer, fbWidth, fbHeight, 162, 198, 132, 14, h);
+        drawColorSquare(framebuffer, fbWidth, fbHeight,
+                        PICKER_COLOR_FIELD_X, PICKER_COLOR_FIELD_Y,
+                        PICKER_COLOR_FIELD_SIZE, PICKER_COLOR_FIELD_SIZE,
+                        h, s, v);
+        drawHueStrip(framebuffer, fbWidth, fbHeight,
+                     PICKER_COLOR_FIELD_X, PICKER_HUE_STRIP_Y,
+                     PICKER_COLOR_FIELD_SIZE, PICKER_HUE_STRIP_HEIGHT, h);
+
+        ui.text(110, 108, "Now", UiTheme::Secondary);
+        ui.fill(UiRect(110, 120, 30, 28), UiColor(color.r, color.g, color.b));
+        ui.stroke(UiRect(110, 120, 30, 28), UiTheme::Ink);
+        ui.text(110, 154, "Prev", UiTheme::Secondary);
+        ui.fill(UiRect(110, 166, 30, 28), UiColor(gPreviousColor.r, gPreviousColor.g, gPreviousColor.b));
+        ui.stroke(UiRect(110, 166, 30, 28), UiTheme::Ink);
+        if (focus == 9)
+            ui.stroke(UiRect(108, 164, 34, 32), UiTheme::AccentBright, 2);
+
+        for (int slot = 0; slot < 8; ++slot)
+        {
+            const int column = slot % 4;
+            const int row = slot / 4;
+            UiRect swatch(150 + column * 39, 108 + row * 39, 34, 34);
+            ui.fill(swatch, UiColor(gCustomPalette[slot].r, gCustomPalette[slot].g, gCustomPalette[slot].b));
+            const bool selected = sameColor(color, gCustomPalette[slot]);
+            ui.stroke(swatch, focus == 10 + slot ? UiTheme::AccentBright :
+                              gPaletteAssignMode ? UiTheme::Warning :
+                              (selected ? UiTheme::Accent : UiTheme::Ink),
+                      selected || gPaletteAssignMode || focus == 10 + slot ? 2 : 1);
+            char slotLabel[3];
+            snprintf(slotLabel, sizeof(slotLabel), "%d", slot + 1);
+            const int brightness = (int)gCustomPalette[slot].r + gCustomPalette[slot].g + gCustomPalette[slot].b;
+            ui.text(swatch.x + 4, swatch.y + 4, slotLabel,
+                    brightness > 420 ? UiTheme::Ink : UiTheme::White);
+        }
+
+        UiComponents::button(ui, UiRect(110, 204, 46, 28), gPaletteAssignMode ? "Pick" : "Save",
+                             gPaletteAssignMode);
+        if (focus == 18)
+            ui.stroke(UiRect(110, 204, 46, 28), UiTheme::AccentBright, 2);
+        UiComponents::button(ui, UiRect(158, 204, 48, 28), "Reset", false);
+        if (focus == 19)
+            ui.stroke(UiRect(158, 204, 48, 28), UiTheme::AccentBright, 2);
+        UiComponents::button(ui, UiRect(208, 204, 46, 28), "Hex", false);
+        if (focus == 20)
+            ui.stroke(UiRect(208, 204, 46, 28), UiTheme::AccentBright, 2);
+        UiComponents::button(ui, UiRect(256, 204, 52, 28),
+                             gRainbowEnabled ? "Rainbow*" : "Rainbow", gRainbowEnabled);
+        if (focus == 21)
+            ui.stroke(UiRect(256, 204, 52, 28), UiTheme::AccentBright, 2);
+        if (notice && notice[0])
+            UiComponents::toast(ui, notice, UiTheme::Accent);
     }
-    else
+    else if (modAllowed)
     {
-        if (!modAllowed)
-            return;
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 54, 132, 36, "SNAPSHOT", true, false);
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 166, 54, 132, 36, "CLEAR", false, true);
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 102, 276, 36, "FILL RECT", true, false);
-        drawPaletteButton(framebuffer, fbWidth, fbHeight, 22, 150, 276, 34,
-                          gRainbowEnabled ? "RAINBOW ON" : "RAINBOW OFF", gRainbowEnabled, false);
-        drawMiniText(framebuffer, fbWidth, fbHeight, 24, 204, notice && notice[0] ? notice : "STAFF DRAWING TOOLS", 32, 36, 42);
+        UiComponents::button(ui, UiRect(8, 48, 148, 38), "Snapshot", false);
+        if (focus == 0)
+            ui.stroke(UiRect(8, 48, 148, 38), UiTheme::AccentBright, 2);
+        UiComponents::button(ui, UiRect(164, 48, 148, 38), "Clear", false, true);
+        if (focus == 1)
+            ui.stroke(UiRect(164, 48, 148, 38), UiTheme::AccentBright, 2);
+        UiComponents::button(ui, UiRect(8, 94, 148, 38), "Fill select", false);
+        if (focus == 2)
+            ui.stroke(UiRect(8, 94, 148, 38), UiTheme::AccentBright, 2);
+        UiComponents::button(ui, UiRect(164, 94, 148, 38), "Erase select", false, true);
+        if (focus == 3)
+            ui.stroke(UiRect(164, 94, 148, 38), UiTheme::AccentBright, 2);
+        UiComponents::panel(ui, UiRect(8, 142, 304, 62), true);
+        ui.text(20, 154, "Canvas changes apply to", UiTheme::Secondary);
+        ui.text(20, 168, "the current channel.", UiTheme::Secondary);
+        ui.textClipped(20, 186, notice && notice[0] ? notice : "Choose a staff action.",
+                       notice && notice[0] ? UiTheme::Warning : UiTheme::Ink, 280);
+        UiComponents::actionBar(ui, "A/Touch Use", "", "B Close");
     }
 }
 
-void handleHexColorInput()
+static bool handleHexColorInput(Color &result)
 {
     SwkbdState swkbd;
-    char inputText[8];
-    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, -1);
-    swkbdSetHintText(&swkbd, "Enter Hex Color (e.g., FF00FF)");
+    char inputText[9] = "";
+    char initial[8];
+    snprintf(initial, sizeof(initial), "%02X%02X%02X", result.r, result.g, result.b);
+    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, 7);
+    swkbdSetHintText(&swkbd, "RRGGBB or #RRGGBB");
+    swkbdSetInitialText(&swkbd, initial);
+    if (swkbdInputText(&swkbd, inputText, sizeof(inputText)) != SWKBD_BUTTON_CONFIRM)
+        return false;
 
-    if (swkbdInputText(&swkbd, inputText, sizeof(inputText)) == SWKBD_BUTTON_CONFIRM)
-    {
-        unsigned int hexValue;
-        sscanf(inputText, "%x", &hexValue);
+    const char *hex = inputText[0] == '#' ? inputText + 1 : inputText;
+    if (strlen(hex) != 6)
+        return false;
+    for (int i = 0; i < 6; ++i)
+        if (!((hex[i] >= '0' && hex[i] <= '9') ||
+              (hex[i] >= 'a' && hex[i] <= 'f') ||
+              (hex[i] >= 'A' && hex[i] <= 'F')))
+            return false;
 
-        currentColor.r = (hexValue >> 16) & 0xFF;
-        currentColor.g = (hexValue >> 8) & 0xFF;
-        currentColor.b = hexValue & 0xFF;
-    }
+    unsigned int value = 0;
+    if (sscanf(hex, "%x", &value) != 1)
+        return false;
+    result.r = (value >> 16) & 0xFF;
+    result.g = (value >> 8) & 0xFF;
+    result.b = value & 0xFF;
+    return true;
 }
 
 static bool promptDisplayName(IdentityInfo &identityInfo, char *displayName, size_t displayNameSize)
@@ -1505,6 +1587,447 @@ static void applyBackupCode(const IdentityInfo &identityInfo)
     saveDeviceIdentity();
 }
 
+static int rootMenuItemCount(bool staff)
+{
+    return staff ? 8 : 7;
+}
+
+static const char *rootMenuItemLabel(int index, bool staff)
+{
+    static const char *USER_ITEMS[] = {
+        "Channels", "People", "Support", "Profile",
+        "Options", "Help & Rules", "Exit"};
+    static const char *STAFF_ITEMS[] = {
+        "Channels", "People", "Support", "Staff Center",
+        "Profile", "Options", "Help & Rules", "Exit"};
+    const int count = rootMenuItemCount(staff);
+    if (index < 0 || index >= count)
+        return "";
+    return staff ? STAFF_ITEMS[index] : USER_ITEMS[index];
+}
+
+static bool firstBindableButton(u32 keys, Doodle::ButtonToken &button)
+{
+    static const u32 ORDER[] = {
+        KEY_A, KEY_B, KEY_X, KEY_Y, KEY_L, KEY_R, KEY_START,
+        KEY_DUP, KEY_DDOWN, KEY_DLEFT, KEY_DRIGHT};
+    for (size_t index = 0; index < sizeof(ORDER) / sizeof(ORDER[0]); ++index)
+    {
+        if ((keys & ORDER[index]) && Doodle::buttonFromKeyMask(ORDER[index], button))
+            return true;
+    }
+    return false;
+}
+
+static const char *peopleName(const PresenceUser &person)
+{
+    return person.displayName[0] ? person.displayName :
+           person.username[0] ? person.username : "Anonymous viewer";
+}
+
+static int caseInsensitiveCompare(const char *left, const char *right)
+{
+    const unsigned char *a = (const unsigned char *)(left ? left : "");
+    const unsigned char *b = (const unsigned char *)(right ? right : "");
+    while (*a && *b)
+    {
+        unsigned char ca = (*a >= 'A' && *a <= 'Z') ? *a + ('a' - 'A') : *a;
+        unsigned char cb = (*b >= 'A' && *b <= 'Z') ? *b + ('a' - 'A') : *b;
+        if (ca != cb)
+            return ca < cb ? -1 : 1;
+        ++a;
+        ++b;
+    }
+    return *a == *b ? 0 : (*a ? 1 : -1);
+}
+
+static bool isCurrentPerson(const PresenceUser &person,
+                            const char *displayName, const char *username)
+{
+    if (username && username[0] && person.username[0])
+        return strcmp(person.username, username) == 0;
+    return displayName && displayName[0] && person.displayName[0] &&
+           strcmp(person.displayName, displayName) == 0;
+}
+
+static int buildPeopleIndex(const PresenceUser *users, int userCount,
+                            bool allChannels, const char *currentChannel,
+                            const char *displayName, const char *username,
+                            int *indices, int maxIndices)
+{
+    int count = 0;
+    for (int index = 0; index < userCount && count < maxIndices; ++index)
+    {
+        if (!allChannels && currentChannel && currentChannel[0] &&
+            strcmp(users[index].channel, currentChannel) != 0)
+            continue;
+        indices[count++] = index;
+    }
+    for (int index = 1; index < count; ++index)
+    {
+        const int candidate = indices[index];
+        int insert = index - 1;
+        while (insert >= 0)
+        {
+            const PresenceUser &left = users[candidate];
+            const PresenceUser &right = users[indices[insert]];
+            const bool leftAnonymous = !left.identityId[0] && !left.username[0];
+            const bool rightAnonymous = !right.identityId[0] && !right.username[0];
+            const bool leftStaff = strcmp(left.role, "admin") == 0 || strcmp(left.role, "mod") == 0;
+            const bool rightStaff = strcmp(right.role, "admin") == 0 || strcmp(right.role, "mod") == 0;
+            const int leftTier = isCurrentPerson(left, displayName, username) ? 0 :
+                                 leftStaff ? 1 : leftAnonymous ? 3 : 2;
+            const int rightTier = isCurrentPerson(right, displayName, username) ? 0 :
+                                  rightStaff ? 1 : rightAnonymous ? 3 : 2;
+            if (leftTier > rightTier ||
+                (leftTier == rightTier &&
+                 caseInsensitiveCompare(peopleName(left), peopleName(right)) >= 0))
+                break;
+            indices[insert + 1] = indices[insert];
+            --insert;
+        }
+        indices[insert + 1] = candidate;
+    }
+    return count;
+}
+
+struct BottomUiViewModel
+{
+    TopScreenMode mode;
+    bool staff;
+    bool admin;
+    int menuSelected;
+    const char (*channels)[25];
+    const ChannelInfo *channelInfo;
+    int channelCount;
+    int channelSelected;
+    const char *currentChannel;
+    const PresenceUser *users;
+    int userCount;
+    int personSelected;
+    int peopleScroll;
+    bool peopleAllChannels;
+    bool peopleActionMode;
+    bool reportUserSelectionMode;
+    int peopleActionSelected;
+    const char *viewerDisplayName;
+    const char *viewerUsername;
+    int staffSelected;
+    int optionsPage;
+    int optionsSelected;
+    int optionsBindingSlot;
+    bool optionsBindingCapture;
+    bool optionsBindingConflict;
+    const Doodle::ClientSettings *settings;
+    int ticketView;
+    int ticketHomeSelected;
+    bool ticketStaffScope;
+    bool supportOnly;
+    const SupportTicketSummary *tickets;
+    int ticketCount;
+    int ticketSelected;
+    int ticketActionSelected;
+    bool ticketHasNext;
+    bool ticketHasPrevious;
+    bool ticketActiveIsUnban;
+    bool backupCodeRevealed;
+    int profileSelected;
+    bool needsDisplayName;
+    bool needsRules;
+    const char *notice;
+};
+
+static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
+                            const BottomUiViewModel &view)
+{
+    UiCanvas ui(framebuffer, fbWidth, fbHeight, UI_BUFFER_3DS_ROTATED_BGR);
+    ui.fill(UiRect(0, 0, 320, 240), UiTheme::Background);
+
+    if (view.mode == TOP_MODE_MENU)
+    {
+        const int count = rootMenuItemCount(view.staff);
+        for (int item = 0; item < count; ++item)
+        {
+            const bool danger = item == count - 1;
+            if (danger)
+                UiComponents::button(ui, UiRect(4, 4 + item * 28, 312, 28),
+                                     rootMenuItemLabel(item, view.staff),
+                                     item == view.menuSelected, true);
+            else
+                UiComponents::listRow(ui, UiRect(4, 4 + item * 28, 312, 28),
+                                      rootMenuItemLabel(item, view.staff), "",
+                                      item == view.menuSelected);
+        }
+        return;
+    }
+
+    if (view.mode == TOP_MODE_CHANNELS)
+    {
+        for (int item = 0; item < view.channelCount && item < 8; ++item)
+        {
+            char meta[18];
+            const ChannelInfo *info = view.channelInfo ? &view.channelInfo[item] : NULL;
+            const bool hasInfo = info && info->name[0];
+            if (hasInfo && info->readOnly)
+                snprintf(meta, sizeof(meta), "%d  READ", info->userCount);
+            else if (hasInfo)
+                snprintf(meta, sizeof(meta), "%d", info->userCount);
+            else
+                meta[0] = '\0';
+            UiComponents::listRow(ui, UiRect(4, 4 + item * 28, 312, 28),
+                                  view.channels[item], meta,
+                                  item == view.channelSelected,
+                                   view.currentChannel &&
+                                       strcmp(view.channels[item], view.currentChannel) == 0,
+                                   hasInfo && (info->adminOnly || info->staffOnly) && !view.staff);
+        }
+        UiComponents::actionBar(ui, "A Switch", "", "B Back");
+        return;
+    }
+
+    if (view.mode == TOP_MODE_USERS)
+    {
+        if (view.peopleActionMode)
+        {
+            static const char *ACTIONS[] = {"Kick", "Mute 30m", "Unmute", "Ban"};
+            ui.text(10, 12, "Moderation action", UiTheme::Secondary);
+            for (int item = 0; item < 4; ++item)
+                UiComponents::button(ui, UiRect(8, 34 + item * 42, 304, 36),
+                                     ACTIONS[item], item == view.peopleActionSelected,
+                                     item == 3, item == 3 && !view.admin);
+            UiComponents::actionBar(ui, "A Continue", "", "B People");
+            return;
+        }
+        UiComponents::tab(ui, UiRect(8, 4, 148, 30), "Current", !view.peopleAllChannels);
+        UiComponents::tab(ui, UiRect(164, 4, 148, 30), "All Channels", view.peopleAllChannels);
+        int indices[24];
+        const int filteredCount = buildPeopleIndex(view.users, view.userCount,
+                                                   view.peopleAllChannels,
+                                                   view.currentChannel,
+                                                   view.viewerDisplayName,
+                                                   view.viewerUsername,
+                                                   indices, 24);
+        const int scroll = std::max(0, std::min(view.peopleScroll,
+                                                std::max(0, filteredCount - 5)));
+        for (int row = 0; row < 5; ++row)
+        {
+            const int filteredIndex = scroll + row;
+            if (filteredIndex >= filteredCount)
+                break;
+            const PresenceUser &person = view.users[indices[filteredIndex]];
+            char label[38];
+            snprintf(label, sizeof(label), "%s%s",
+                     person.identityId[0] ? "" : "Viewer: ",
+                     person.displayName[0] ? person.displayName :
+                     (person.username[0] ? person.username : "Anonymous"));
+            char meta[24];
+            if (person.sessionCount > 1)
+                snprintf(meta, sizeof(meta), "%s x%d", person.role, person.sessionCount);
+            else
+                snprintf(meta, sizeof(meta), "%s", person.role);
+            UiComponents::listRow(ui, UiRect(8, 40 + row * 32, 304, 30),
+                                  label, meta, filteredIndex == view.personSelected);
+        }
+        UiComponents::actionBar(ui, view.reportUserSelectionMode ? "A Report user" :
+                                (view.staff ? "A Actions" : ""),
+                                "X Scope", "B Back");
+        return;
+    }
+
+    if (view.mode == TOP_MODE_STAFF_CENTER)
+    {
+        static const char *ITEMS[] = {"Ticket Queue", "Staff Chat", "Canvas Tools"};
+        static const char *META[] = {"needs staff", "team only", "current channel"};
+        for (int item = 0; item < 3; ++item)
+            UiComponents::listRow(ui, UiRect(8, 44 + item * 48, 304, 40),
+                                  ITEMS[item], META[item],
+                                  item == view.staffSelected);
+        UiComponents::actionBar(ui, "A Open", "", "B Back");
+        return;
+    }
+
+    if (view.mode == TOP_MODE_OPTIONS)
+    {
+        if (view.optionsPage == 0)
+        {
+            static const char *ITEMS[] = {
+                "Controls & Presets", "Drawing & Palette", "Connection & About"};
+            static const char *META[] = {"bindings", "color + zoom", APP_VERSION};
+            for (int item = 0; item < 3; ++item)
+                UiComponents::listRow(ui, UiRect(8, 44 + item * 48, 304, 40),
+                                      ITEMS[item], META[item],
+                                      item == view.optionsSelected);
+            UiComponents::actionBar(ui, "A Open", "", "B Back");
+        }
+        else if (view.optionsPage == 1 && view.settings)
+        {
+            char preset[34];
+            snprintf(preset, sizeof(preset), "< %s >",
+                     Doodle::controlPresetLabel(view.settings->controlPreset));
+            UiComponents::listRow(ui, UiRect(8, 8, 304, 28), "Preset", preset,
+                                  view.optionsSelected == 0);
+            for (int action = 0; action < Doodle::INPUT_ACTION_COUNT; ++action)
+            {
+                const Doodle::ActionBinding &binding = view.settings->bindings.action[action];
+                char keys[32];
+                snprintf(keys, sizeof(keys), "%s%s%s",
+                         Doodle::buttonLabel(binding.button[0]),
+                         binding.button[1] == Doodle::BUTTON_NONE ? "" : " / ",
+                         binding.button[1] == Doodle::BUTTON_NONE ? "" :
+                         Doodle::buttonLabel(binding.button[1]));
+                UiComponents::listRow(ui, UiRect(8, 38 + action * 30, 304, 28),
+                                      Doodle::inputActionLabel((Doodle::InputAction)action),
+                                      keys, view.optionsSelected == action + 1);
+                if (view.optionsSelected == action + 1)
+                {
+                    const int markerX = view.optionsBindingSlot == 0 ? 214 : 272;
+                    ui.fill(UiRect(markerX, 62 + action * 30, 32, 2), UiTheme::Accent);
+                }
+            }
+            UiComponents::actionBar(
+                ui,
+                view.optionsBindingCapture ? "Press a button" : "A Rebind",
+                view.optionsBindingCapture ? "" : "X Slot / Y Clear",
+                view.optionsBindingCapture ? "SELECT Cancel" : "B Back");
+            if (view.optionsBindingCapture)
+                UiComponents::toast(ui, "Press any bindable button", UiTheme::Accent);
+        }
+        else if (view.optionsPage == 2 && view.settings)
+        {
+            char side[24];
+            snprintf(side, sizeof(side), "%s",
+                     Doodle::zoomOverlaySideLabel(view.settings->zoomOverlaySide));
+            UiComponents::listRow(ui, UiRect(8, 44, 304, 40),
+                                  "Zoom overlay side", side, view.optionsSelected == 0);
+            UiComponents::listRow(ui, UiRect(8, 92, 304, 40),
+                                  "Open palette", "8 favorites", view.optionsSelected == 1);
+            UiComponents::listRow(ui, UiRect(8, 140, 304, 40),
+                                  "Reset palette", "defaults", view.optionsSelected == 2);
+            UiComponents::actionBar(ui, "A Change", "", "B Back");
+        }
+        else
+        {
+            UiComponents::panel(ui, UiRect(8, 28, 304, 154), true);
+            ui.text(20, 42, "Collab Doodle " APP_VERSION, UiTheme::Ink, 2);
+            ui.text(20, 72, "Native protocol 6", UiTheme::Secondary);
+            ui.text(20, 90, "Settings are stored on this device.", UiTheme::Secondary);
+            ui.text(20, 108, "A reconnects and resyncs safely.", UiTheme::Secondary);
+            UiComponents::button(ui, UiRect(20, 136, 280, 34), "Reconnect", true);
+            UiComponents::actionBar(ui, "A Reconnect", "", "B Back");
+        }
+        return;
+    }
+
+    if (view.mode == TOP_MODE_TICKETS)
+    {
+        if (view.ticketView == 0)
+        {
+            static const char *USER_ITEMS[] = {
+                "New bug request", "New feature request",
+                "Report a user", "My tickets"};
+            static const char *RESTRICTED_ITEMS[] = {
+                "New appeal", "My appeals", "Profile", "Exit"};
+            const char **items = view.supportOnly ? RESTRICTED_ITEMS : USER_ITEMS;
+            const int count = 4;
+            for (int item = 0; item < count; ++item)
+                UiComponents::listRow(ui, UiRect(8, 8 + item * 34, 304, 32),
+                                      items[item], "", item == view.ticketHomeSelected);
+            UiComponents::actionBar(ui, "A Open", "", view.supportOnly ? "" : "B Back");
+        }
+        else if (view.ticketView == 1)
+        {
+            for (int row = 0; row < view.ticketCount && row < 6; ++row)
+            {
+                const SupportTicketSummary &ticket = view.tickets[row];
+                char status[24];
+                snprintf(status, sizeof(status), "#%d %s", ticket.id, ticket.status);
+                UiComponents::listRow(ui, UiRect(8, 4 + row * 27, 304, 25),
+                                      ticket.subject, status, row == view.ticketSelected);
+            }
+            UiComponents::button(ui, UiRect(8, 172, 94, 36), "Previous",
+                                 false, false, !view.ticketHasPrevious);
+            UiComponents::button(ui, UiRect(110, 172, 94, 36), "Refresh", false);
+            UiComponents::button(ui, UiRect(212, 172, 100, 36), "Next",
+                                 false, false, !view.ticketHasNext);
+            UiComponents::actionBar(ui, "A Open", "L/X/Y Page", "B Back");
+        }
+        else if (view.ticketView == 2)
+        {
+            UiComponents::button(ui, UiRect(8, 164, 148, 40), "Reply", true);
+            UiComponents::button(ui, UiRect(164, 164, 148, 40), "Staff actions",
+                                 false, false, !view.ticketStaffScope);
+            UiComponents::actionBar(ui, "A Reply", view.ticketStaffScope ? "X Staff" : "", "B Back");
+        }
+        else if (view.ticketView == 3)
+        {
+            static const char *ACTIONS[] = {
+                "Mark in progress", "Reply to user", "Resolve",
+                "Reject", "Approve unban", "Reopen"};
+            for (int item = 0; item < 6; ++item)
+                UiComponents::listRow(ui, UiRect(8, 4 + item * 31, 304, 29),
+                                      ACTIONS[item], "", item == view.ticketActionSelected,
+                                      false, item == 4 && !view.ticketActiveIsUnban);
+            UiComponents::actionBar(ui, "A Apply", "", "B Thread");
+        }
+        else if (view.ticketView == 4)
+        {
+            UiComponents::button(ui, UiRect(8, 44, 304, 40), "Send message", true);
+            UiComponents::button(ui, UiRect(8, 92, 304, 40), "Refresh chat",
+                                 false, false, false);
+            UiComponents::button(ui, UiRect(8, 140, 304, 40), "Load older",
+                                 false, false, !view.ticketHasNext);
+            UiComponents::actionBar(ui, "A Send", "X/Y Refresh/Older", "B Staff");
+        }
+        return;
+    }
+
+    if (view.mode == TOP_MODE_IDENTITY)
+    {
+        if (view.needsDisplayName)
+        {
+            UiComponents::panel(ui, UiRect(8, 34, 304, 138), true);
+            ui.text(20, 48, "Welcome to Collab Doodle", UiTheme::Ink, 2);
+            ui.wrappedText(20, 72,
+                           "Create this device profile with a display name, or recover an existing account.",
+                           UiTheme::Secondary, 280, 4, 11);
+            UiComponents::button(ui, UiRect(8, 180, 148, 36), "Create / name", true);
+            UiComponents::button(ui, UiRect(164, 180, 148, 36), "Recover",
+                                 false, false, false);
+            UiComponents::actionBar(ui, "A Create", "X Recover", "B Exit");
+            return;
+        }
+        UiComponents::button(ui, UiRect(8, 46, 304, 38), "Change display name",
+                             view.profileSelected == 0, false, view.supportOnly);
+        UiComponents::button(ui, UiRect(8, 92, 148, 38),
+                             view.backupCodeRevealed ? "Hide code" : "Reveal code",
+                             view.profileSelected == 1);
+        UiComponents::button(ui, UiRect(164, 92, 148, 38), "Rotate code",
+                             view.profileSelected == 2, true, view.supportOnly);
+        UiComponents::button(ui, UiRect(8, 138, 304, 38), "Recover account",
+                             view.profileSelected == 3, false, view.supportOnly);
+        UiComponents::actionBar(ui, view.supportOnly ? "A Reveal only" : "A Use",
+                                "", "B Back");
+        return;
+    }
+
+    if (view.mode == TOP_MODE_RULES)
+    {
+        UiComponents::button(ui, UiRect(24, 168, 272, 40),
+                             view.needsRules ? "Accept rules" : "Done", true);
+        UiComponents::actionBar(ui, view.needsRules ? "A Accept" : "A Done", "",
+                                view.needsRules ? "B Exit" : "B Back");
+        return;
+    }
+
+    if (view.mode == TOP_MODE_STATUS)
+    {
+        UiComponents::modal(ui, "Connection",
+                            view.notice && view.notice[0] ? view.notice :
+                            "The client is waiting for the server.",
+                            "A Reconnect", "B Menu");
+    }
+}
+
 // Function to decompress data
 int main(int argc, char **argv)
 {
@@ -1517,7 +2040,8 @@ int main(int argc, char **argv)
         atexit(mcuHwcExit);
     gfxSetDoubleBuffering(GFX_TOP, false);
     UIState::init();
-    chooseRandomDrawingColor();
+    hidSetRepeatParameters(18, 5);
+    Doodle::SettingsLoadResult settingsLoad = Doodle::SETTINGS_LOAD_DEFAULTS;
     const char *appPath = (argc > 0 && argv && argv[0] && argv[0][0]) ? argv[0] : "sdmc:/3ds/CollabDoodle-current.3dsx";
     u64 installedTitleId = currentInstalledTitleId();
     const char *packageType = (installedTitleId != 0 || isCiaLaunch(appPath)) ? "cia" : "3dsx";
@@ -1533,6 +2057,25 @@ int main(int argc, char **argv)
     initHardwareId();
     printf("Device model: %s\n", gDeviceModel);
     loadDeviceIdentity();
+    // Identity initialization mounts the SD filesystem shared by both files.
+    // Settings remain independent and never modify identity credentials.
+    settingsLoad = Doodle::loadClientSettings(gClientSettings);
+    currentBrushShape = (int)gClientSettings.brushShape;
+    currentBrushSize = gClientSettings.brushSize;
+    currentColor.r = gClientSettings.solidColor.r;
+    currentColor.g = gClientSettings.solidColor.g;
+    currentColor.b = gClientSettings.solidColor.b;
+    for (int paletteIndex = 0; paletteIndex < Doodle::CLIENT_PALETTE_COLOR_COUNT; ++paletteIndex)
+    {
+        gCustomPalette[paletteIndex].r = gClientSettings.palette[paletteIndex].r;
+        gCustomPalette[paletteIndex].g = gClientSettings.palette[paletteIndex].g;
+        gCustomPalette[paletteIndex].b = gClientSettings.palette[paletteIndex].b;
+    }
+    snprintf(gPreferredChannel, sizeof(gPreferredChannel), "%s",
+             gClientSettings.lastSuccessfulChannel);
+    syncPickerToColor(currentColor);
+    printf("Settings: %s (%s)\n", Doodle::clientSettingsPath(),
+           Doodle::settingsLoadResultLabel(settingsLoad));
     printf("Identity: %s\n", gIdentity.deviceId);
     printf("Hardware: %s\n", gHardwareId);
     printf("Identity boot: %s\n", gIdentityBootStatus);
@@ -1614,17 +2157,50 @@ int main(int argc, char **argv)
     bool updateAvailable = false;
     int topRenderFrame = 10;
     TopScreenMode topMode = TOP_MODE_CANVAS;
+    UiRouteStack routeStack;
     int selectedChannel = 0;
     int selectedMenuItem = 0;
     int selectedAdminItem = 0;
+    int optionsPage = 0;
+    int optionsSelected = 0;
+    int optionsBindingSlot = 0;
+    bool optionsBindingCapture = false;
+    bool optionsBindingConflict = false;
+    Doodle::InputAction pendingBindingAction = Doodle::INPUT_ACTION_TOOLS;
+    Doodle::ButtonToken pendingBindingButton = Doodle::BUTTON_NONE;
+    Doodle::BindingConflict pendingBindingConflict;
+    memset(&pendingBindingConflict, 0, sizeof(pendingBindingConflict));
+    int selectedPerson = 0;
+    int peopleScroll = 0;
+    bool peopleAllChannels = false;
+    bool peopleActionMode = false;
+    bool reportUserSelectionMode = false;
+    int peopleActionSelected = 0;
+    bool moderationConfirmation = false;
+    char pendingModerationAction[24] = "";
+    char pendingModerationIdentity[40] = "";
+    char pendingModerationTargetName[49] = "";
+    char pendingModerationReason[81] = "";
+    bool backupCodeRevealed = false;
+    bool recoveryCodeExplanation = false;
+    int profileSelected = 0;
+    bool rotateBackupConfirmation = false;
     int pickerTab = 0;
+    int pickerFocus = 0;
+    bool pickerReturnToRoute = false;
     bool shoulderEraserActive = false;
     int shoulderSavedBrushShape = currentBrushShape;
     int shoulderSavedBrushSize = currentBrushSize;
     char availableChannels[8][25];
+    ChannelInfo availableChannelInfo[8];
+    memset(availableChannelInfo, 0, sizeof(availableChannelInfo));
     int availableChannelCount = 0;
+    char pendingChannelSwitch[25] = "";
+    u64 pendingChannelSwitchDeadline = 0;
     PresenceUser connectedUsers[24];
     int connectedUserCount = 0;
+    PresenceInfo connectedPresenceInfo;
+    memset(&connectedPresenceInfo, 0, sizeof(connectedPresenceInfo));
     IdentityInfo identityInfo;
     memset(&identityInfo, 0, sizeof(identityInfo));
     snprintf(identityInfo.displayName, sizeof(identityInfo.displayName), "%.24s", gIdentity.displayName);
@@ -1636,6 +2212,15 @@ int main(int argc, char **argv)
     int identityNoticeFrames = 0;
     char adminNotice[40] = "";
     int adminNoticeFrames = 0;
+    u64 adminNoticeExpiresAt = 0;
+    bool suppressTouchUntilRelease = false;
+    char pendingAdminAction[20] = "";
+    bool pendingAdminLocalApply = false;
+    int pendingAdminApplyX = 0;
+    int pendingAdminApplyY = 0;
+    int pendingAdminApplyW = 0;
+    int pendingAdminApplyH = 0;
+    Color pendingAdminApplyColor = {255, 255, 255};
     bool supportOnlyMode = false;
     char supportOnlyReasonText[81] = "";
     char supportOnlyBlockTypes[24] = "";
@@ -1643,7 +2228,19 @@ int main(int argc, char **argv)
     memset(ticketList, 0, sizeof(ticketList));
     int ticketListCount = 0;
     int ticketSelected = 0;
-    int ticketNextBeforeId = 0;
+    TicketCursor ticketNextCursor;
+    memset(&ticketNextCursor, 0, sizeof(ticketNextCursor));
+    TicketCursor ticketCurrentCursor;
+    memset(&ticketCurrentCursor, 0, sizeof(ticketCurrentCursor));
+    TicketCursor ticketCursorHistory[8];
+    memset(ticketCursorHistory, 0, sizeof(ticketCursorHistory));
+    int ticketCursorHistoryCount = 0;
+    bool ticketListLoading = false;
+    TicketCursor pendingTicketCurrentCursor;
+    memset(&pendingTicketCurrentCursor, 0, sizeof(pendingTicketCurrentCursor));
+    TicketCursor pendingTicketCursorHistory[8];
+    memset(pendingTicketCursorHistory, 0, sizeof(pendingTicketCursorHistory));
+    int pendingTicketCursorHistoryCount = 0;
     bool ticketStaffScope = false;
     SupportTicketSummary activeTicket;
     memset(&activeTicket, 0, sizeof(activeTicket));
@@ -1669,12 +2266,27 @@ int main(int argc, char **argv)
     char restrictionReason[81] = "";
     char ticketNotice[64] = "";
     int ticketNoticeFrames = 0;
+    char ticketDraftCategory[12] = "";
+    char ticketDraftSubject[65] = "";
+    char ticketDraftDetails[241] = "";
+    bool ticketDraftPreview = false;
+    bool ticketDraftSendPending = false;
+    char ticketReplyDraft[241] = "";
+    int ticketReplyDraftTicketId = 0;
+    bool ticketReplyDraftStaff = false;
+    bool ticketReplyPreview = false;
+    bool ticketReplySendPending = false;
     enum AdminRectTool {
         ADMIN_RECT_NONE = 0,
         ADMIN_RECT_FILL = 1,
+        ADMIN_RECT_ERASE = 2,
     };
     AdminRectTool pendingAdminRectTool = ADMIN_RECT_NONE;
     bool adminRectDragging = false;
+    bool adminRectAwaitingConfirm = false;
+    bool confirmClearCanvas = false;
+    bool confirmPaletteReset = false;
+    bool confirmExit = false;
     int adminRectStartX = 0;
     int adminRectStartY = 0;
     int adminRectEndX = 0;
@@ -1690,6 +2302,8 @@ int main(int argc, char **argv)
     char pendingRulesVersion[32] = "";
     bool rulesRequireFreshAPress = false;
     bool rulesRenderedSinceKeyboard = false;
+    bool clientSettingsDirty = false;
+    u64 clientSettingsSaveAfter = 0;
 
     auto isModOrAdmin = [&]() -> bool
     {
@@ -1706,8 +2320,40 @@ int main(int argc, char **argv)
     auto setAdminNotice = [&](const char *notice)
     {
         snprintf(adminNotice, sizeof(adminNotice), "%.39s", notice ? notice : "");
-        adminNoticeFrames = adminNotice[0] ? 180 : 0;
+        adminNoticeFrames = adminNotice[0] ? 90 : 0;
+        adminNoticeExpiresAt = adminNotice[0] ? osGetTime() + 1500 : 0;
         topRenderFrame = 10;
+    };
+
+    auto clearAdminNotice = [&]()
+    {
+        adminNotice[0] = '\0';
+        adminNoticeFrames = 0;
+        adminNoticeExpiresAt = 0;
+        topRenderFrame = 10;
+    };
+
+    auto requestExitConfirmation = [&]()
+    {
+        confirmExit = true;
+        clearAdminNotice();
+    };
+
+    auto cancelTransientOverlaysForConnection = [&]()
+    {
+        ticketDraftPreview = false;
+        ticketReplyPreview = false;
+        moderationConfirmation = false;
+        rotateBackupConfirmation = false;
+        confirmClearCanvas = false;
+        confirmPaletteReset = false;
+        confirmExit = false;
+        optionsBindingConflict = false;
+        pendingAdminRectTool = ADMIN_RECT_NONE;
+        adminRectDragging = false;
+        adminRectAwaitingConfirm = false;
+        gPaletteAssignMode = false;
+        UIState::setColorPickerActive(false);
     };
 
     auto setTicketNotice = [&](const char *notice)
@@ -1715,6 +2361,56 @@ int main(int argc, char **argv)
         snprintf(ticketNotice, sizeof(ticketNotice), "%.63s", notice ? notice : "");
         ticketNoticeFrames = ticketNotice[0] ? 240 : 0;
         topRenderFrame = 10;
+    };
+
+    auto markClientSettingsDirty = [&]()
+    {
+        clientSettingsDirty = true;
+        clientSettingsSaveAfter = osGetTime() + 500;
+    };
+
+    auto resetPaletteToDefaults = [&]()
+    {
+        Doodle::resetClientPalette(gClientSettings);
+        for (int slot = 0; slot < Doodle::CLIENT_PALETTE_COLOR_COUNT; ++slot)
+        {
+            gCustomPalette[slot].r = gClientSettings.palette[slot].r;
+            gCustomPalette[slot].g = gClientSettings.palette[slot].g;
+            gCustomPalette[slot].b = gClientSettings.palette[slot].b;
+        }
+        gPaletteAssignMode = false;
+        markClientSettingsDirty();
+    };
+
+    auto flushClientSettings = [&]() -> bool
+    {
+        const int persistedBrushShape = shoulderEraserActive
+                                            ? shoulderSavedBrushShape
+                                            : currentBrushShape;
+        const int persistedBrushSize = shoulderEraserActive
+                                           ? shoulderSavedBrushSize
+                                           : currentBrushSize;
+        gClientSettings.brushShape = (Doodle::ClientBrushShape)std::max(
+            0, std::min(persistedBrushShape, (int)Doodle::CLIENT_BRUSH_SHAPE_COUNT - 1));
+        gClientSettings.brushSize = std::max(1, std::min(persistedBrushSize, 12));
+        gClientSettings.solidColor.r = currentColor.r;
+        gClientSettings.solidColor.g = currentColor.g;
+        gClientSettings.solidColor.b = currentColor.b;
+        for (int paletteIndex = 0; paletteIndex < Doodle::CLIENT_PALETTE_COLOR_COUNT; ++paletteIndex)
+        {
+            gClientSettings.palette[paletteIndex].r = gCustomPalette[paletteIndex].r;
+            gClientSettings.palette[paletteIndex].g = gCustomPalette[paletteIndex].g;
+            gClientSettings.palette[paletteIndex].b = gCustomPalette[paletteIndex].b;
+        }
+        Doodle::SettingsSaveResult result = Doodle::saveClientSettings(gClientSettings);
+        clientSettingsDirty = result != Doodle::SETTINGS_SAVE_OK;
+        if (!clientSettingsDirty)
+            clientSettingsSaveAfter = 0;
+        else
+            clientSettingsSaveAfter = osGetTime() + 5000;
+        if (result != Doodle::SETTINGS_SAVE_OK)
+            printf("Settings save failed: %s\n", Doodle::settingsSaveResultLabel(result));
+        return result == Doodle::SETTINGS_SAVE_OK;
     };
 
     auto clearOnboardingSubmission = [&]()
@@ -1789,6 +2485,34 @@ int main(int argc, char **argv)
             setTicketNotice("TICKET SEND FAILED");
             return false;
         }
+        return true;
+    };
+
+    auto requestTicketList = [&](bool staff, const char *status, const char *category,
+                                 const TicketCursor &cursor,
+                                 const TicketCursor *history, int historyCount,
+                                 const char *notice) -> bool
+    {
+        if (ticketListLoading)
+        {
+            setTicketNotice("WAIT FOR CURRENT PAGE");
+            return false;
+        }
+        char command[192];
+        Protocol::buildTicketList(command, sizeof(command), staff, status, category, cursor);
+        if (!sendTicketCommand(command))
+            return false;
+        pendingTicketCurrentCursor = cursor;
+        pendingTicketCursorHistoryCount = std::max(
+            0, std::min(historyCount,
+                        (int)(sizeof(pendingTicketCursorHistory) /
+                              sizeof(pendingTicketCursorHistory[0]))));
+        memset(pendingTicketCursorHistory, 0, sizeof(pendingTicketCursorHistory));
+        if (history && pendingTicketCursorHistoryCount > 0)
+            memcpy(pendingTicketCursorHistory, history,
+                   sizeof(TicketCursor) * pendingTicketCursorHistoryCount);
+        ticketListLoading = true;
+        setTicketNotice(notice);
         return true;
     };
 
@@ -1936,10 +2660,19 @@ int main(int argc, char **argv)
             topRenderFrame = 10;
             return true;
         }
-        int parsedNextBeforeId = 0;
-        if (Protocol::parseTicketListEnd(jsonLine, parsedNextBeforeId))
+        TicketCursor parsedNextCursor;
+        memset(&parsedNextCursor, 0, sizeof(parsedNextCursor));
+        if (Protocol::parseTicketListEnd(jsonLine, parsedNextCursor))
         {
-            ticketNextBeforeId = parsedNextBeforeId;
+            ticketNextCursor = parsedNextCursor;
+            if (ticketListLoading)
+            {
+                ticketCurrentCursor = pendingTicketCurrentCursor;
+                ticketCursorHistoryCount = pendingTicketCursorHistoryCount;
+                memcpy(ticketCursorHistory, pendingTicketCursorHistory,
+                       sizeof(ticketCursorHistory));
+                ticketListLoading = false;
+            }
             ticketSelected = std::max(0, std::min(ticketSelected, std::max(0, ticketListCount - 1)));
             ticketView = 1;
             topRenderFrame = 10;
@@ -1964,6 +2697,17 @@ int main(int argc, char **argv)
             if (ticketOk)
             {
                 setTicketNotice("TICKET ACTION OK");
+                if (strcmp(ticketAction, "create") == 0 && ticketDraftSendPending)
+                {
+                    ticketDraftSendPending = false;
+                    ticketDraftSubject[0] = '\0';
+                    ticketDraftDetails[0] = '\0';
+                }
+                if (strcmp(ticketAction, "reply") == 0 && ticketReplySendPending)
+                {
+                    ticketReplySendPending = false;
+                    ticketReplyDraft[0] = '\0';
+                }
                 char command[128];
                 if ((strcmp(ticketAction, "reply") == 0 || strcmp(ticketAction, "status") == 0 || strcmp(ticketAction, "approveUnban") == 0) && resultTicketId > 0)
                 {
@@ -1972,12 +2716,26 @@ int main(int argc, char **argv)
                 }
                 else if (strcmp(ticketAction, "create") == 0)
                 {
-                    Protocol::buildTicketList(command, sizeof(command), false, "", supportOnlyMode ? "unban" : "", 0);
-                    sendTicketCommand(command);
+                    TicketCursor firstPage;
+                    memset(&firstPage, 0, sizeof(firstPage));
+                    requestTicketList(false, "", supportOnlyMode ? "unban" : "",
+                                      firstPage, NULL, 0, "REFRESHING TICKETS");
                 }
             }
             else
             {
+                if (strcmp(ticketAction, "list") == 0)
+                    ticketListLoading = false;
+                if (ticketDraftSendPending)
+                {
+                    ticketDraftSendPending = false;
+                    ticketDraftPreview = true;
+                }
+                if (ticketReplySendPending)
+                {
+                    ticketReplySendPending = false;
+                    ticketReplyPreview = true;
+                }
                 char notice[64];
                 snprintf(notice, sizeof(notice), "FAILED: %.48s", ticketError[0] ? ticketError : "ticket-error");
                 setTicketNotice(notice);
@@ -1992,7 +2750,24 @@ int main(int argc, char **argv)
             setTicketNotice("ACCESS RESTORED");
             return true;
         }
-        if (Protocol::parseChannels(jsonLine, availableChannels, 8, availableChannelCount, currentChannel))
+        if (pendingChannelSwitch[0] && strstr(jsonLine, "\"type\":\"error\""))
+        {
+            pendingChannelSwitch[0] = '\0';
+            pendingChannelSwitchDeadline = 0;
+            setAdminNotice(strstr(jsonLine, "Unknown channel") ?
+                               "CHANNEL UNAVAILABLE" : "CHANNEL SWITCH FAILED");
+            topMode = TOP_MODE_CHANNELS;
+            topRenderFrame = 10;
+            return true;
+        }
+        if (ticketListLoading && strstr(jsonLine, "\"type\":\"error\""))
+        {
+            ticketListLoading = false;
+            setTicketNotice("TICKET PAGE LOAD FAILED");
+            return true;
+        }
+        if (Protocol::parseChannels(jsonLine, availableChannels, availableChannelInfo,
+                                    8, availableChannelCount, currentChannel))
         {
             if (currentChannel[0])
                 canvas.setChannel(currentChannel);
@@ -2000,7 +2775,8 @@ int main(int argc, char **argv)
             topRenderFrame = 10;
             return true;
         }
-        if (Protocol::parsePresence(jsonLine, connectedUsers, 24, connectedUserCount))
+        if (Protocol::parsePresence(jsonLine, connectedUsers, 24, connectedUserCount,
+                                    connectedPresenceInfo))
         {
             topRenderFrame = 10;
             return true;
@@ -2084,7 +2860,17 @@ int main(int argc, char **argv)
                 clearOnboardingSubmission();
                 rulesRequireFreshAPress = false;
                 if (topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_RULES)
-                    topMode = TOP_MODE_CANVAS;
+                {
+                    if (previousStage == ONBOARDING_SUBMITTING_RULES &&
+                        strncmp(gIdentityBootStatus, "NEW", 3) == 0)
+                    {
+                        recoveryCodeExplanation = true;
+                        backupCodeRevealed = true;
+                        topMode = TOP_MODE_IDENTITY;
+                    }
+                    else
+                        topMode = TOP_MODE_CANVAS;
+                }
             }
             topRenderFrame = 10;
             return true;
@@ -2225,26 +3011,59 @@ int main(int argc, char **argv)
         }
         if (Protocol::parseRecoveryFailed(jsonLine, recoveryReason, sizeof(recoveryReason)))
         {
-            setIdentityNotice("RECOVERY FAILED");
+            if (strcmp(recoveryReason, "recovery-device-in-use") == 0)
+                setIdentityNotice("DEVICE ALREADY HAS AN ACCOUNT");
+            else
+                setIdentityNotice("RECOVERY FAILED");
             printf("Recovery failed: %s\n", recoveryReason);
             return true;
         }
         if (strstr(jsonLine, "\"type\":\"adminCanvasResult\""))
         {
             if (strstr(jsonLine, "\"ok\":true"))
-                setAdminNotice("ADMIN ACTION OK");
-            else
-                setAdminNotice("ADMIN ACTION DENIED");
-            return true;
-        }
-        if (strstr(jsonLine, "\"type\":\"moderationResult\""))
-        {
-            if (strstr(jsonLine, "\"ok\":true"))
-                setAdminNotice("MOD ACTION OK");
+            {
+                if (pendingAdminLocalApply)
+                {
+                    applyCanvasRectLocal(canvas, pendingAdminApplyX, pendingAdminApplyY,
+                                         pendingAdminApplyW, pendingAdminApplyH,
+                                         pendingAdminApplyColor);
+                    Renderer::invalidateMinimap();
+                }
+                if (strcmp(pendingAdminAction, "snapshot") == 0)
+                    setAdminNotice("SNAPSHOT SAVED");
+                else if (strcmp(pendingAdminAction, "clear") == 0)
+                    setAdminNotice("CHANNEL CLEARED");
+                else if (strcmp(pendingAdminAction, "fillRect") == 0)
+                    setAdminNotice("SELECTION FILLED");
+                else if (strcmp(pendingAdminAction, "eraseRect") == 0)
+                    setAdminNotice("SELECTION ERASED");
+                else
+                    setAdminNotice("STAFF ACTION COMPLETE");
+            }
+            else if (strstr(jsonLine, "rate-limited"))
+                setAdminNotice("ACTION RATE LIMITED");
             else if (strstr(jsonLine, "admin-required"))
                 setAdminNotice("ADMIN REQUIRED");
             else
-                setAdminNotice("MOD ACTION DENIED");
+                setAdminNotice("STAFF ACTION DENIED");
+            pendingAdminAction[0] = '\0';
+            pendingAdminLocalApply = false;
+            return true;
+        }
+        ModerationResult moderationResult;
+        if (Protocol::parseModerationResult(jsonLine, moderationResult))
+        {
+            if (moderationResult.ok)
+            {
+                char notice[40];
+                snprintf(notice, sizeof(notice), "%s OK",
+                         moderationResult.action[0] ? moderationResult.action : "MODERATION");
+                setAdminNotice(notice);
+            }
+            else if (strcmp(moderationResult.error, "admin-required") == 0)
+                setAdminNotice("ADMIN REQUIRED");
+            else
+                setAdminNotice(moderationResult.error[0] ? moderationResult.error : "MOD ACTION DENIED");
             return true;
         }
         return false;
@@ -2356,6 +3175,7 @@ int main(int argc, char **argv)
                 {
                     fullCanvas = canvas.pixels;
                     Renderer::invalidateMinimap();
+                    rememberSuccessfulChannel(canvas.channel);
                     printf("Canvas decompressed successfully.\n");
                 }
                 else
@@ -2398,6 +3218,8 @@ int main(int argc, char **argv)
     bool realtimeCanvasPending = false;
     bool sessionAwaitingSnapshot = false;
     u64 sessionSnapshotDeadline = 0;
+    int circleNavRepeatFrames = 0;
+    u32 circleNavDirection = 0;
 
     auto clampOffsets = [&](int &ox, int &oy)
     {
@@ -2415,6 +3237,9 @@ int main(int argc, char **argv)
         realtimeCanvasPending = false;
         sessionAwaitingSnapshot = false;
         sessionSnapshotDeadline = 0;
+        ticketListLoading = false;
+        pendingAdminAction[0] = '\0';
+        pendingAdminLocalApply = false;
         UIState::clearPoints();
         if (!NetworkManager::reconnect())
         {
@@ -2432,6 +3257,11 @@ int main(int argc, char **argv)
 
     auto sendAdminCanvasCommand = [&](const char *action, int x, int y, int w, int h, Color color) -> bool
     {
+        if (pendingAdminAction[0])
+        {
+            setAdminNotice("WAIT FOR CURRENT ACTION");
+            return false;
+        }
         if (!isModOrAdmin())
         {
             setAdminNotice("MOD OR ADMIN REQUIRED");
@@ -2451,7 +3281,28 @@ int main(int argc, char **argv)
             setAdminNotice("SEND FAILED");
             return false;
         }
-        setAdminNotice("COMMAND SENT");
+        snprintf(pendingAdminAction, sizeof(pendingAdminAction), "%s", action);
+        pendingAdminLocalApply = strcmp(action, "clear") == 0 ||
+                                 strcmp(action, "fillRect") == 0 ||
+                                 strcmp(action, "eraseRect") == 0;
+        if (pendingAdminLocalApply)
+        {
+            pendingAdminApplyX = x;
+            pendingAdminApplyY = y;
+            pendingAdminApplyW = w;
+            pendingAdminApplyH = h;
+            pendingAdminApplyColor = color;
+        }
+        if (strcmp(action, "snapshot") == 0)
+            setAdminNotice("SNAPSHOT PENDING");
+        else if (strcmp(action, "clear") == 0)
+            setAdminNotice("CLEAR PENDING");
+        else if (strcmp(action, "fillRect") == 0)
+            setAdminNotice("FILL PENDING");
+        else if (strcmp(action, "eraseRect") == 0)
+            setAdminNotice("ERASE PENDING");
+        else
+            setAdminNotice("ACTION PENDING");
         return true;
     };
 
@@ -2462,7 +3313,11 @@ int main(int argc, char **argv)
 
         selectedChannel = std::max(0, std::min(selectedChannel, availableChannelCount - 1));
         if (strcmp(canvas.channel, availableChannels[selectedChannel]) == 0)
+        {
+            pendingChannelSwitch[0] = '\0';
+            pendingChannelSwitchDeadline = 0;
             return true;
+        }
 
         if (!NetworkManager::checkConnection() && !reconnectSession("channel-reconnect"))
         {
@@ -2479,6 +3334,10 @@ int main(int argc, char **argv)
         }
 
         printf("Switching to channel %s...\n", availableChannels[selectedChannel]);
+        snprintf(pendingChannelSwitch, sizeof(pendingChannelSwitch), "%s",
+                 availableChannels[selectedChannel]);
+        pendingChannelSwitchDeadline = osGetTime() + 15000;
+        setAdminNotice("WAITING FOR CHANNEL");
         // Protocol 6 delivers the metadata and snapshot as distinct WebSocket
         // messages; the realtime event loop consumes both asynchronously.
         return true;
@@ -2488,6 +3347,13 @@ int main(int argc, char **argv)
 
     while (aptMainLoop() && !exitRequested)
     {
+        if (adminNoticeFrames > 0 && adminNoticeExpiresAt > 0 &&
+            osGetTime() >= adminNoticeExpiresAt)
+            clearAdminNotice();
+        if (clientSettingsDirty && clientSettingsSaveAfter > 0 &&
+            osGetTime() >= clientSettingsSaveAfter)
+            flushClientSettings();
+
         bool resumedFromSleep = gAptResumeRequested;
         gAptResumeRequested = false;
         if (resumedFromSleep)
@@ -2537,10 +3403,47 @@ int main(int argc, char **argv)
         u32 kDown = hidKeysDown();
         u32 kHeld = hidKeysHeld();
         u32 kUp = hidKeysUp();
+        if (suppressTouchUntilRelease)
+        {
+            const bool touchStillHeld = (kHeld & KEY_TOUCH) != 0;
+            kDown &= ~KEY_TOUCH;
+            kHeld &= ~KEY_TOUCH;
+            kUp &= ~KEY_TOUCH;
+            if (!touchStillHeld)
+                suppressTouchUntilRelease = false;
+        }
+        Doodle::SemanticInputFrame semanticInput(kDown, kHeld, kUp);
         touchPosition touch;
         circlePosition circle;
         hidTouchRead(&touch);
         hidCircleRead(&circle);
+        u32 navDown = kDown | (hidKeysDownRepeat() &
+                               (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT));
+        u32 nextCircleDirection = 0;
+        if (abs(circle.dy) > abs(circle.dx) && abs(circle.dy) > 90)
+            nextCircleDirection = circle.dy > 0 ? KEY_DUP : KEY_DDOWN;
+        else if (abs(circle.dx) > 90)
+            nextCircleDirection = circle.dx < 0 ? KEY_DLEFT : KEY_DRIGHT;
+        if (nextCircleDirection == 0)
+        {
+            circleNavDirection = 0;
+            circleNavRepeatFrames = 0;
+        }
+        else if (nextCircleDirection != circleNavDirection)
+        {
+            circleNavDirection = nextCircleDirection;
+            circleNavRepeatFrames = 18;
+            navDown |= nextCircleDirection;
+        }
+        else if (circleNavRepeatFrames > 0)
+        {
+            --circleNavRepeatFrames;
+        }
+        else
+        {
+            navDown |= nextCircleDirection;
+            circleNavRepeatFrames = 5;
+        }
 
         if (rulesRequireFreshAPress && topMode == TOP_MODE_RULES &&
             rulesRenderedSinceKeyboard && !(kHeld & KEY_A))
@@ -2548,8 +3451,162 @@ int main(int argc, char **argv)
             rulesRequireFreshAPress = false;
         }
 
+        if (gDisconnectReason[0])
+        {
+            cancelTransientOverlaysForConnection();
+            const bool touchReconnect =
+                (kDown & KEY_TOUCH) &&
+                pointInRect(touch.px, touch.py, 30, 150, 126, 28);
+            const bool touchMenu =
+                (kDown & KEY_TOUCH) &&
+                pointInRect(touch.px, touch.py, 164, 150, 126, 28);
+            if ((kDown & KEY_A) || touchReconnect)
+            {
+                if (touchReconnect)
+                    suppressTouchUntilRelease = true;
+                setAdminNotice("RECONNECTING");
+                reconnectSession("reconnect");
+                topRenderFrame = 10;
+                continue;
+            }
+            if ((kDown & KEY_B) || touchMenu)
+            {
+                if (touchMenu)
+                    suppressTouchUntilRelease = true;
+                gDisconnectReason[0] = '\0';
+                topMode = TOP_MODE_MENU;
+                routeStack.reset(TOP_MODE_MENU);
+                topRenderFrame = 10;
+                continue;
+            }
+            kDown = 0;
+            kHeld = 0;
+            kUp = 0;
+            navDown = 0;
+        }
+
+        if (recoveryCodeExplanation)
+        {
+            const bool continueOnboarding =
+                (kDown & KEY_A) ||
+                ((kDown & KEY_TOUCH) &&
+                 pointInRect(touch.px, touch.py, 24, 186, 272, 40));
+            if (continueOnboarding)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                recoveryCodeExplanation = false;
+                backupCodeRevealed = false;
+                topMode = TOP_MODE_CANVAS;
+                routeStack.reset(TOP_MODE_CANVAS);
+                topRenderFrame = 10;
+                continue;
+            }
+            kDown = 0;
+            navDown = 0;
+        }
+
+        const bool higherPriorityConfirmation =
+            confirmClearCanvas || confirmPaletteReset || confirmExit ||
+            adminRectAwaitingConfirm || moderationConfirmation ||
+            rotateBackupConfirmation || optionsBindingConflict ||
+            ticketDraftPreview || ticketReplyPreview;
+        if (adminNoticeFrames > 0 && !higherPriorityConfirmation &&
+            (kDown & KEY_TOUCH) &&
+            pointInRect(touch.px, touch.py, 8, 194, 304, 22))
+        {
+            clearAdminNotice();
+            suppressTouchUntilRelease = true;
+            continue;
+        }
+
+        if (confirmExit)
+        {
+            const bool cancelExit =
+                (kDown & KEY_B) ||
+                ((kDown & KEY_TOUCH) &&
+                 pointInRect(touch.px, touch.py, 164, 150, 126, 28));
+            const bool applyExit =
+                (kDown & KEY_A) ||
+                ((kDown & KEY_TOUCH) &&
+                 pointInRect(touch.px, touch.py, 30, 150, 126, 28));
+            if (cancelExit)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                confirmExit = false;
+                continue;
+            }
+            if (applyExit)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                confirmExit = false;
+                UIState::clearPoints();
+                exitRequested = true;
+                continue;
+            }
+            kDown = 0;
+            kHeld = 0;
+            navDown = 0;
+        }
+
+        if (confirmPaletteReset)
+        {
+            const bool cancelReset =
+                (kDown & KEY_B) ||
+                ((kDown & KEY_TOUCH) &&
+                 pointInRect(touch.px, touch.py, 164, 150, 126, 28));
+            const bool applyReset =
+                (kDown & KEY_A) ||
+                ((kDown & KEY_TOUCH) &&
+                 pointInRect(touch.px, touch.py, 30, 150, 126, 28));
+            if (cancelReset)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                confirmPaletteReset = false;
+                clearAdminNotice();
+                continue;
+            }
+            else if (applyReset)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                confirmPaletteReset = false;
+                resetPaletteToDefaults();
+                setAdminNotice("PALETTE RESET");
+                continue;
+            }
+            kDown = 0;
+            kHeld = 0;
+            navDown = 0;
+        }
+
         if (kDown & KEY_SELECT)
         {
+            if (optionsBindingCapture)
+            {
+                optionsBindingCapture = false;
+                setAdminNotice("BINDING CAPTURE CANCELLED");
+                continue;
+            }
+            ticketDraftPreview = false;
+            ticketReplyPreview = false;
+            moderationConfirmation = false;
+            peopleActionMode = false;
+            reportUserSelectionMode = false;
+            rotateBackupConfirmation = false;
+            confirmClearCanvas = false;
+            confirmPaletteReset = false;
+            confirmExit = false;
+            pendingAdminRectTool = ADMIN_RECT_NONE;
+            adminRectDragging = false;
+            adminRectAwaitingConfirm = false;
+            optionsBindingCapture = false;
+            optionsBindingConflict = false;
+            UIState::setColorPickerActive(false);
+            clearAdminNotice();
             if (gNeedsDisplayName)
             {
                 topMode = TOP_MODE_IDENTITY;
@@ -2568,11 +3625,15 @@ int main(int argc, char **argv)
                 topMode = TOP_MODE_MENU;
                 selectedMenuItem = 0;
             }
+            routeStack.reset(topMode);
             topRenderFrame = 10;
             continue;
         }
 
-        if (!supportOnlyMode && (kDown & KEY_START))
+        if (!supportOnlyMode && topMode == TOP_MODE_CANVAS &&
+            !gDisconnectReason[0] && !higherPriorityConfirmation &&
+            !UIState::isColorPickerActive() &&
+            semanticInput.consumeDown(gClientSettings.bindings, Doodle::INPUT_ACTION_REFRESH))
         {
             printf("Refreshing canvas from server...\n");
             if (!NetworkManager::checkConnection() && !reconnectSession("refresh-reconnect")) {
@@ -2589,21 +3650,6 @@ int main(int argc, char **argv)
             setAdminNotice("REFRESH REQUESTED");
         }
 
-        if (gDisconnectReason[0])
-        {
-            if (kDown & KEY_A)
-            {
-                setAdminNotice("RECONNECTING");
-                reconnectSession("reconnect");
-                topRenderFrame = 10;
-            }
-            else if (kDown & KEY_B)
-            {
-                topMode = TOP_MODE_MENU;
-                topRenderFrame = 10;
-            }
-        }
-
         if (gNeedsDisplayName && topMode == TOP_MODE_CANVAS)
         {
             topMode = TOP_MODE_IDENTITY;
@@ -2618,14 +3664,15 @@ int main(int argc, char **argv)
 
         if (topMode == TOP_MODE_MENU)
         {
-            const int menuCount = 8;
+            const bool staffMenu = isModOrAdmin();
+            const int menuCount = rootMenuItemCount(staffMenu);
             selectedMenuItem = std::max(0, std::min(selectedMenuItem, menuCount - 1));
-            if (kDown & KEY_DUP)
+            if (navDown & KEY_DUP)
             {
                 selectedMenuItem = (selectedMenuItem + menuCount - 1) % menuCount;
                 topRenderFrame = 10;
             }
-            if (kDown & KEY_DDOWN)
+            if (navDown & KEY_DDOWN)
             {
                 selectedMenuItem = (selectedMenuItem + 1) % menuCount;
                 topRenderFrame = 10;
@@ -2633,10 +3680,24 @@ int main(int argc, char **argv)
             if (kDown & KEY_B)
             {
                 topMode = TOP_MODE_CANVAS;
+                routeStack.reset(TOP_MODE_CANVAS);
                 topRenderFrame = 10;
                 continue;
             }
-            if (kDown & KEY_A)
+            bool activateMenuItem = (kDown & KEY_A) != 0;
+            if (kDown & KEY_TOUCH)
+            {
+                for (int item = 0; item < menuCount; ++item)
+                {
+                    if (pointInRect(touch.px, touch.py, 4, 4 + item * 28, 312, 28))
+                    {
+                        selectedMenuItem = item;
+                        activateMenuItem = true;
+                        break;
+                    }
+                }
+            }
+            if (activateMenuItem)
             {
                 if (selectedMenuItem == 0)
                 {
@@ -2646,6 +3707,10 @@ int main(int argc, char **argv)
                 else if (selectedMenuItem == 1)
                 {
                     topMode = TOP_MODE_USERS;
+                    selectedPerson = 0;
+                    peopleScroll = 0;
+                    peopleActionMode = false;
+                    reportUserSelectionMode = false;
                 }
                 else if (selectedMenuItem == 2)
                 {
@@ -2656,45 +3721,72 @@ int main(int argc, char **argv)
                     Protocol::buildTicketCounts(command, sizeof(command));
                     sendTicketCommand(command);
                 }
-                else if (selectedMenuItem == 3)
-                    topMode = TOP_MODE_CONTROLS;
-                else if (selectedMenuItem == 4)
+                else if (staffMenu && selectedMenuItem == 3)
+                {
+                    selectedAdminItem = 0;
+                    topMode = TOP_MODE_STAFF_CENTER;
+                }
+                else if (selectedMenuItem == (staffMenu ? 4 : 3))
+                {
+                    backupCodeRevealed = false;
+                    topMode = TOP_MODE_IDENTITY;
+                }
+                else if (selectedMenuItem == (staffMenu ? 5 : 4))
+                {
+                    optionsPage = 0;
+                    optionsSelected = 0;
+                    optionsBindingCapture = false;
+                    topMode = TOP_MODE_OPTIONS;
+                }
+                else if (selectedMenuItem == (staffMenu ? 6 : 5))
                 {
                     topMode = TOP_MODE_RULES;
                 }
-                else if (selectedMenuItem == 5)
+                else if (selectedMenuItem == menuCount - 1)
                 {
-                    topMode = TOP_MODE_STATUS;
+                    requestExitConfirmation();
+                    continue;
                 }
-                else if (selectedMenuItem == 6)
-                {
-                    topMode = TOP_MODE_IDENTITY;
-                }
-                else if (selectedMenuItem == 7)
-                {
-                    UIState::clearPoints();
-                    NetworkManager::disconnect();
-                    for (int i = 0; i < 30; i++)
-                        gspWaitForVBlank();
-                    break;
-                }
+                routeStack.push(topMode);
                 topRenderFrame = 10;
                 continue;
             }
         }
-        else if (topMode == TOP_MODE_ADMIN)
+        else if (topMode == TOP_MODE_STAFF_CENTER)
         {
-            if (kDown & KEY_DUP)
+            if (kDown & KEY_B)
+            {
+                if (routeStack.pop())
+                    topMode = routeStack.current();
+                else
+                    topMode = TOP_MODE_MENU;
+                topRenderFrame = 10;
+                continue;
+            }
+            if (navDown & KEY_DUP)
             {
                 selectedAdminItem = (selectedAdminItem + 2) % 3;
                 topRenderFrame = 10;
             }
-            if (kDown & KEY_DDOWN)
+            if (navDown & KEY_DDOWN)
             {
                 selectedAdminItem = (selectedAdminItem + 1) % 3;
                 topRenderFrame = 10;
             }
-            if (kDown & KEY_A)
+            bool activateStaffItem = (kDown & KEY_A) != 0;
+            if (kDown & KEY_TOUCH)
+            {
+                for (int item = 0; item < 3; ++item)
+                {
+                    if (pointInRect(touch.px, touch.py, 8, 44 + item * 48, 304, 40))
+                    {
+                        selectedAdminItem = item;
+                        activateStaffItem = true;
+                        break;
+                    }
+                }
+            }
+            if (activateStaffItem)
             {
                 if (!isModOrAdmin())
                 {
@@ -2703,86 +3795,445 @@ int main(int argc, char **argv)
                 }
                 if (selectedAdminItem == 0)
                 {
-                    sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
+                    ticketStaffScope = true;
+                    TicketCursor firstPage;
+                    memset(&firstPage, 0, sizeof(firstPage));
+                    requestTicketList(true, "unresolved", "", firstPage, NULL, 0,
+                                      "LOADING STAFF QUEUE");
+                    topMode = TOP_MODE_TICKETS;
                 }
                 else if (selectedAdminItem == 1)
                 {
-                    Color white = {255, 255, 255};
-                    if (sendAdminCanvasCommand("clear", 0, 0, canvasWidth, canvasHeight, white))
-                    {
-                        applyCanvasRectLocal(canvas, 0, 0, canvasWidth, canvasHeight, white);
-                        Renderer::invalidateMinimap();
-                    }
+                    char command[96];
+                    Protocol::buildStaffChatList(command, sizeof(command));
+                    if (sendTicketCommand(command))
+                        setTicketNotice("LOADING STAFF CHAT");
+                    topMode = TOP_MODE_TICKETS;
                 }
                 else if (selectedAdminItem == 2)
                 {
-                    pendingAdminRectTool = ADMIN_RECT_FILL;
-                    adminRectDragging = false;
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
                     topMode = TOP_MODE_CANVAS;
-                    setAdminNotice("DRAG FILL RECT");
+                    pickerTab = 1;
+                    pickerReturnToRoute = true;
+                    UIState::setColorPickerActive(true);
                 }
+                routeStack.push(topMode);
                 topRenderFrame = 10;
                 continue;
+            }
+        }
+        else if (topMode == TOP_MODE_OPTIONS)
+        {
+            if (optionsBindingConflict)
+            {
+                const bool cancelConflict = (kDown & KEY_B) ||
+                                            ((kDown & KEY_TOUCH) &&
+                                             pointInRect(touch.px, touch.py, 164, 150, 126, 28));
+                const bool swapConflict = (kDown & KEY_A) ||
+                                          ((kDown & KEY_TOUCH) &&
+                                           pointInRect(touch.px, touch.py, 30, 150, 126, 28));
+                if (cancelConflict)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    optionsBindingConflict = false;
+                    setAdminNotice("BINDING CANCELLED");
+                }
+                else if (swapConflict)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    Doodle::BindingConflict conflict;
+                    Doodle::BindingEditResult result = Doodle::editClientBinding(
+                        gClientSettings, pendingBindingAction, optionsBindingSlot,
+                        pendingBindingButton, Doodle::BINDING_CONFLICT_SWAP, &conflict);
+                    optionsBindingConflict = false;
+                    if (result == Doodle::BINDING_EDIT_OK || result == Doodle::BINDING_EDIT_SWAPPED)
+                    {
+                        markClientSettingsDirty();
+                        setAdminNotice(result == Doodle::BINDING_EDIT_SWAPPED ? "BUTTONS SWAPPED" : "BINDING SAVED");
+                    }
+                    else
+                        setAdminNotice("BINDING FAILED");
+                }
+                continue;
+            }
+            if (optionsBindingCapture)
+            {
+                Doodle::ButtonToken captured = Doodle::BUTTON_NONE;
+                if (firstBindableButton(kDown, captured))
+                {
+                    Doodle::BindingConflict conflict;
+                    Doodle::BindingEditResult result = Doodle::editClientBinding(
+                        gClientSettings, pendingBindingAction, optionsBindingSlot,
+                        captured, Doodle::BINDING_CONFLICT_CANCEL, &conflict);
+                    optionsBindingCapture = false;
+                    if (result == Doodle::BINDING_EDIT_CONFLICT)
+                    {
+                        pendingBindingButton = captured;
+                        pendingBindingConflict = conflict;
+                        optionsBindingConflict = true;
+                        setAdminNotice("A SWAP  B CANCEL");
+                    }
+                    else if (result == Doodle::BINDING_EDIT_OK || result == Doodle::BINDING_EDIT_SWAPPED)
+                    {
+                        markClientSettingsDirty();
+                        setAdminNotice("BINDING SAVED");
+                    }
+                    else if (result == Doodle::BINDING_EDIT_UNCHANGED)
+                        setAdminNotice("BINDING UNCHANGED");
+                    else
+                        setAdminNotice("BUTTON NOT AVAILABLE");
+                }
+                continue;
+            }
+
+            if (optionsPage == 0)
+            {
+                const int sectionCount = 3;
+                if (navDown & KEY_DUP)
+                    optionsSelected = (optionsSelected + sectionCount - 1) % sectionCount;
+                if (navDown & KEY_DDOWN)
+                    optionsSelected = (optionsSelected + 1) % sectionCount;
+                if (kDown & KEY_B)
+                {
+                    if (routeStack.pop())
+                        topMode = routeStack.current();
+                    else
+                        topMode = TOP_MODE_MENU;
+                    topRenderFrame = 10;
+                    continue;
+                }
+                bool activate = (kDown & KEY_A) != 0;
+                if (kDown & KEY_TOUCH)
+                {
+                    for (int item = 0; item < sectionCount; ++item)
+                    {
+                        if (pointInRect(touch.px, touch.py, 8, 44 + item * 48, 304, 40))
+                        {
+                            optionsSelected = item;
+                            activate = true;
+                            break;
+                        }
+                    }
+                }
+                if (activate)
+                {
+                    optionsPage = optionsSelected + 1;
+                    optionsSelected = 0;
+                    topRenderFrame = 10;
+                    continue;
+                }
+            }
+            else if (optionsPage == 1)
+            {
+                const int itemCount = 1 + Doodle::INPUT_ACTION_COUNT;
+                optionsSelected = std::max(0, std::min(optionsSelected, itemCount - 1));
+                if (navDown & KEY_DUP)
+                    optionsSelected = (optionsSelected + itemCount - 1) % itemCount;
+                if (navDown & KEY_DDOWN)
+                    optionsSelected = (optionsSelected + 1) % itemCount;
+                if (kDown & KEY_X)
+                    optionsBindingSlot = 1 - optionsBindingSlot;
+                if ((kDown & KEY_Y) && optionsSelected > 0)
+                {
+                    Doodle::BindingConflict ignoredConflict;
+                    Doodle::BindingEditResult result = Doodle::editClientBinding(
+                        gClientSettings,
+                        (Doodle::InputAction)(optionsSelected - 1),
+                        optionsBindingSlot, Doodle::BUTTON_NONE,
+                        Doodle::BINDING_CONFLICT_CANCEL, &ignoredConflict);
+                    if (result == Doodle::BINDING_EDIT_OK)
+                    {
+                        markClientSettingsDirty();
+                        setAdminNotice("BINDING SLOT CLEARED");
+                    }
+                    else
+                        setAdminNotice("BINDING SLOT ALREADY EMPTY");
+                }
+                if (kDown & KEY_B)
+                {
+                    optionsPage = 0;
+                    optionsSelected = 0;
+                    continue;
+                }
+                if ((navDown & (KEY_DLEFT | KEY_DRIGHT)) && optionsSelected == 0)
+                {
+                    int direction = (navDown & KEY_DRIGHT) ? 1 : -1;
+                    int preset = (int)gClientSettings.controlPreset;
+                    if (preset >= (int)Doodle::CONTROL_PRESET_CUSTOM)
+                        preset = direction > 0 ? -1 : 0;
+                    preset = (preset + direction + 3) % 3;
+                    Doodle::applyClientControlPreset(gClientSettings, (Doodle::ControlPreset)preset);
+                    markClientSettingsDirty();
+                }
+                bool activate = (kDown & KEY_A) != 0;
+                if (kDown & KEY_TOUCH)
+                {
+                    for (int item = 0; item < itemCount; ++item)
+                    {
+                        if (pointInRect(touch.px, touch.py, 8, 8 + item * 30, 304, 28))
+                        {
+                            optionsSelected = item;
+                            if (item > 0)
+                                optionsBindingSlot = touch.px >= 246 ? 1 : 0;
+                            activate = true;
+                            break;
+                        }
+                    }
+                }
+                if (activate)
+                {
+                    if (optionsSelected == 0)
+                    {
+                        int preset = (int)gClientSettings.controlPreset;
+                        if (preset >= (int)Doodle::CONTROL_PRESET_CUSTOM)
+                            preset = -1;
+                        preset = (preset + 1) % 3;
+                        Doodle::applyClientControlPreset(gClientSettings, (Doodle::ControlPreset)preset);
+                        markClientSettingsDirty();
+                    }
+                    else
+                    {
+                        pendingBindingAction = (Doodle::InputAction)(optionsSelected - 1);
+                        optionsBindingCapture = true;
+                        setAdminNotice("PRESS A BUTTON");
+                    }
+                    continue;
+                }
+            }
+            else if (optionsPage == 2)
+            {
+                const int itemCount = 3;
+                if (navDown & KEY_DUP)
+                    optionsSelected = (optionsSelected + itemCount - 1) % itemCount;
+                if (navDown & KEY_DDOWN)
+                    optionsSelected = (optionsSelected + 1) % itemCount;
+                if (kDown & KEY_B)
+                {
+                    optionsPage = 0;
+                    optionsSelected = 1;
+                    continue;
+                }
+                bool activate = (kDown & KEY_A) != 0;
+                if (kDown & KEY_TOUCH)
+                {
+                    for (int item = 0; item < itemCount; ++item)
+                    {
+                        if (pointInRect(touch.px, touch.py, 8, 44 + item * 48, 304, 40))
+                        {
+                            optionsSelected = item;
+                            activate = true;
+                            break;
+                        }
+                    }
+                }
+                if (activate)
+                {
+                    if (optionsSelected == 0)
+                    {
+                        gClientSettings.zoomOverlaySide = (Doodle::ZoomOverlaySide)(
+                            ((int)gClientSettings.zoomOverlaySide + 1) %
+                            (int)Doodle::ZOOM_OVERLAY_SIDE_COUNT);
+                        markClientSettingsDirty();
+                        setAdminNotice(Doodle::zoomOverlaySideLabel(gClientSettings.zoomOverlaySide));
+                    }
+                    else if (optionsSelected == 1)
+                    {
+                        if (kDown & KEY_TOUCH)
+                            suppressTouchUntilRelease = true;
+                        topMode = TOP_MODE_CANVAS;
+                        pickerTab = 0;
+                        pickerReturnToRoute = true;
+                        UIState::setColorPickerActive(true);
+                        routeStack.push(topMode);
+                    }
+                    else
+                    {
+                        confirmPaletteReset = true;
+                        clearAdminNotice();
+                    }
+                    continue;
+                }
+            }
+            else
+            {
+                if (kDown & KEY_B)
+                {
+                    optionsPage = 0;
+                    optionsSelected = 2;
+                    continue;
+                }
+                if ((kDown & KEY_A) ||
+                    ((kDown & KEY_TOUCH) &&
+                     pointInRect(touch.px, touch.py, 20, 136, 280, 34)))
+                {
+                    setAdminNotice("RECONNECTING");
+                    reconnectSession("options-reconnect");
+                    continue;
+                }
             }
         }
         else if (topMode == TOP_MODE_TICKETS)
         {
             const bool staffAllowed = isModOrAdmin() && !supportOnlyMode;
+            if (ticketDraftPreview)
+            {
+                const bool sendPreview = (kDown & KEY_A) ||
+                                         ((kDown & KEY_TOUCH) &&
+                                          pointInRect(touch.px, touch.py, 8, 200, 148, 34));
+                if (sendPreview)
+                {
+                    char command[1024];
+                    Protocol::buildTicketCreate(command, sizeof(command),
+                                                ticketDraftCategory,
+                                                ticketDraftSubject,
+                                                ticketDraftDetails);
+                    if (sendTicketCommand(command))
+                    {
+                        ticketDraftPreview = false;
+                        ticketDraftSendPending = true;
+                        setTicketNotice("SENDING REQUEST");
+                    }
+                }
+                else if ((kDown & KEY_B) ||
+                         ((kDown & KEY_TOUCH) &&
+                          pointInRect(touch.px, touch.py, 164, 200, 148, 34)))
+                {
+                    readKeyboardText("Ticket subject", ticketDraftSubject,
+                                     sizeof(ticketDraftSubject), ticketDraftSubject);
+                    readKeyboardText("Ticket details", ticketDraftDetails,
+                                     sizeof(ticketDraftDetails), ticketDraftDetails);
+                }
+                continue;
+            }
+            if (ticketReplyPreview)
+            {
+                const bool sendPreview = (kDown & KEY_A) ||
+                                         ((kDown & KEY_TOUCH) &&
+                                          pointInRect(touch.px, touch.py, 8, 200, 148, 34));
+                if (sendPreview)
+                {
+                    char command[640];
+                    Protocol::buildTicketReply(command, sizeof(command),
+                                               ticketReplyDraftTicketId,
+                                               ticketReplyDraft,
+                                               ticketReplyDraftStaff);
+                    if (sendTicketCommand(command))
+                    {
+                        ticketReplyPreview = false;
+                        ticketReplySendPending = true;
+                        setTicketNotice("SENDING REPLY");
+                    }
+                }
+                else if ((kDown & KEY_B) ||
+                         ((kDown & KEY_TOUCH) &&
+                          pointInRect(touch.px, touch.py, 164, 200, 148, 34)))
+                {
+                    readKeyboardText("Ticket reply", ticketReplyDraft,
+                                     sizeof(ticketReplyDraft), ticketReplyDraft);
+                }
+                continue;
+            }
             if (ticketView == 0)
             {
-                int homeCount = supportOnlyMode ? 2 : (staffAllowed ? 6 : 4);
+                int homeCount = 4;
                 ticketHomeSelected = std::max(0, std::min(ticketHomeSelected, homeCount - 1));
-                if (kDown & KEY_DUP)
+                if (navDown & KEY_DUP)
                 {
                     ticketHomeSelected = (ticketHomeSelected + homeCount - 1) % homeCount;
                     topRenderFrame = 10;
                 }
-                if (kDown & KEY_DDOWN)
+                if (navDown & KEY_DDOWN)
                 {
                     ticketHomeSelected = (ticketHomeSelected + 1) % homeCount;
                     topRenderFrame = 10;
                 }
                 if ((kDown & KEY_B) && !supportOnlyMode)
                 {
-                    topMode = TOP_MODE_MENU;
+                    if (routeStack.pop())
+                        topMode = routeStack.current();
+                    else
+                        topMode = TOP_MODE_MENU;
                     topRenderFrame = 10;
                     continue;
                 }
-                if (kDown & KEY_A)
+                bool activateTicketHome = (kDown & KEY_A) != 0;
+                if (kDown & KEY_TOUCH)
                 {
-                    bool listMine = (supportOnlyMode && ticketHomeSelected == 1) || (!supportOnlyMode && ticketHomeSelected == 3);
-                    bool listStaff = !supportOnlyMode && staffAllowed && ticketHomeSelected == 4;
-                    bool openStaffChat = !supportOnlyMode && staffAllowed && ticketHomeSelected == 5;
-                    if (openStaffChat)
+                    for (int item = 0; item < homeCount; ++item)
                     {
-                        char command[96];
-                        Protocol::buildStaffChatList(command, sizeof(command));
-                        if (sendTicketCommand(command)) setTicketNotice("LOADING STAFF CHAT");
+                        if (pointInRect(touch.px, touch.py, 8, 8 + item * 34, 304, 32))
+                        {
+                            ticketHomeSelected = item;
+                            activateTicketHome = true;
+                            break;
+                        }
+                    }
+                }
+                if (activateTicketHome)
+                {
+                    const bool startsComposer =
+                        (!supportOnlyMode && ticketHomeSelected <= 2) ||
+                        (supportOnlyMode && ticketHomeSelected == 0);
+                    if (startsComposer &&
+                        (ticketDraftSendPending || ticketReplySendPending))
+                    {
+                        setTicketNotice("WAIT FOR CURRENT SEND");
                         continue;
                     }
+                    if (supportOnlyMode && ticketHomeSelected == 2)
+                    {
+                        profileSelected = 0;
+                        backupCodeRevealed = false;
+                        topMode = TOP_MODE_IDENTITY;
+                        routeStack.push(topMode);
+                        topRenderFrame = 10;
+                        continue;
+                    }
+                    if (supportOnlyMode && ticketHomeSelected == 3)
+                    {
+                        requestExitConfirmation();
+                        continue;
+                    }
+                    bool listMine = (supportOnlyMode && ticketHomeSelected == 1) ||
+                                    (!supportOnlyMode && ticketHomeSelected == 3);
+                    bool listStaff = false;
                     if (listMine || listStaff)
                     {
-                        char command[192];
                         ticketStaffScope = listStaff;
-                        Protocol::buildTicketList(command, sizeof(command), listStaff, listStaff ? "unresolved" : "",
-                                                  supportOnlyMode ? "unban" : "", 0);
-                        if (sendTicketCommand(command))
-                            setTicketNotice("LOADING TICKETS");
+                        TicketCursor firstPage;
+                        memset(&firstPage, 0, sizeof(firstPage));
+                        requestTicketList(listStaff, listStaff ? "unresolved" : "",
+                                          supportOnlyMode ? "unban" : "",
+                                          firstPage, NULL, 0, "LOADING TICKETS");
+                    }
+                    else if (!supportOnlyMode && ticketHomeSelected == 2)
+                    {
+                        reportUserSelectionMode = true;
+                        peopleActionMode = false;
+                        peopleAllChannels = false;
+                        selectedPerson = 0;
+                        peopleScroll = 0;
+                        topMode = TOP_MODE_USERS;
+                        routeStack.push(topMode);
+                        setTicketNotice("SELECT A USER TO REPORT");
                     }
                     else
                     {
-                        const char *category = supportOnlyMode || ticketHomeSelected == 0 ? "unban" :
-                                               ticketHomeSelected == 1 ? "bug" : "feature";
-                        char subject[65];
-                        char details[241];
-                        if (!readKeyboardText("Ticket subject", subject, sizeof(subject), ""))
+                        const char *category = supportOnlyMode ? "unban" :
+                                               (ticketHomeSelected == 0 ? "bug" : "feature");
+                        snprintf(ticketDraftCategory, sizeof(ticketDraftCategory), "%s", category);
+                        if (!readKeyboardText("Ticket subject", ticketDraftSubject,
+                                              sizeof(ticketDraftSubject), ticketDraftSubject))
                             continue;
-                        if (!readKeyboardText("Ticket details", details, sizeof(details), ""))
+                        if (!readKeyboardText("Ticket details", ticketDraftDetails,
+                                              sizeof(ticketDraftDetails), ticketDraftDetails))
                             continue;
-                        char command[512];
-                        Protocol::buildTicketCreate(command, sizeof(command), category, subject, details);
-                        if (sendTicketCommand(command))
-                            setTicketNotice("TICKET SENT");
+                        ticketDraftPreview = true;
+                        setTicketNotice("REVIEW BEFORE SENDING");
                     }
                     topRenderFrame = 10;
                     continue;
@@ -2790,24 +4241,53 @@ int main(int argc, char **argv)
             }
             else if (ticketView == 1)
             {
-                if (ticketListCount > 0 && (kDown & KEY_DUP))
+                if (ticketListCount > 0 && (navDown & KEY_DUP))
                 {
                     ticketSelected = (ticketSelected + ticketListCount - 1) % ticketListCount;
                     topRenderFrame = 10;
                 }
-                if (ticketListCount > 0 && (kDown & KEY_DDOWN))
+                if (ticketListCount > 0 && (navDown & KEY_DDOWN))
                 {
                     ticketSelected = (ticketSelected + 1) % ticketListCount;
                     topRenderFrame = 10;
                 }
                 if (kDown & KEY_B)
                 {
+                    if (ticketStaffScope && !supportOnlyMode)
+                    {
+                        if (routeStack.pop())
+                            topMode = routeStack.current();
+                        else
+                            topMode = TOP_MODE_STAFF_CENTER;
+                        selectedAdminItem = 0;
+                        topRenderFrame = 10;
+                        continue;
+                    }
                     ticketView = 0;
-                    ticketHomeSelected = supportOnlyMode ? 1 : (ticketStaffScope ? 4 : 3);
+                    ticketHomeSelected = supportOnlyMode ? 1 : 3;
                     topRenderFrame = 10;
                     continue;
                 }
-                if ((kDown & KEY_A) && ticketListCount > 0)
+                bool openTicket = (kDown & KEY_A) != 0;
+                bool touchRefresh = false;
+                bool touchNext = false;
+                bool touchPrevious = false;
+                if (kDown & KEY_TOUCH)
+                {
+                    for (int row = 0; row < ticketListCount && row < 6; ++row)
+                    {
+                        if (pointInRect(touch.px, touch.py, 8, 4 + row * 27, 304, 25))
+                        {
+                            ticketSelected = row;
+                            openTicket = true;
+                            break;
+                        }
+                    }
+                    touchPrevious = pointInRect(touch.px, touch.py, 8, 172, 94, 36);
+                    touchRefresh = pointInRect(touch.px, touch.py, 110, 172, 94, 36);
+                    touchNext = pointInRect(touch.px, touch.py, 212, 172, 100, 36);
+                }
+                if (openTicket && ticketListCount > 0)
                 {
                     char command[128];
                     Protocol::buildTicketGet(command, sizeof(command), ticketList[ticketSelected].id);
@@ -2815,14 +4295,46 @@ int main(int argc, char **argv)
                         setTicketNotice("LOADING THREAD");
                     continue;
                 }
-                if ((kDown & KEY_X) || ((kDown & KEY_Y) && ticketNextBeforeId > 0))
+                const bool refreshPage = (kDown & KEY_X) != 0 || touchRefresh;
+                const bool nextPage = ((kDown & KEY_Y) != 0 || touchNext) &&
+                                      ticketNextCursor.id > 0;
+                const bool previousPage = ((kDown & KEY_L) != 0 || touchPrevious) &&
+                                          ticketCursorHistoryCount > 0;
+                if (refreshPage || nextPage || previousPage)
                 {
-                    char command[192];
-                    int beforeId = (kDown & KEY_Y) ? ticketNextBeforeId : 0;
-                    Protocol::buildTicketList(command, sizeof(command), ticketStaffScope,
-                                              ticketStaffScope ? "unresolved" : "", supportOnlyMode ? "unban" : "", beforeId);
-                    if (sendTicketCommand(command))
-                        setTicketNotice(beforeId ? "LOADING NEXT PAGE" : "REFRESHING");
+                    TicketCursor requestedCursor = ticketCurrentCursor;
+                    TicketCursor requestedHistory[8];
+                    memcpy(requestedHistory, ticketCursorHistory, sizeof(requestedHistory));
+                    int requestedHistoryCount = ticketCursorHistoryCount;
+                    if (refreshPage)
+                    {
+                        memset(&requestedCursor, 0, sizeof(requestedCursor));
+                        requestedHistoryCount = 0;
+                    }
+                    else if (nextPage)
+                    {
+                        if (requestedHistoryCount < (int)(sizeof(requestedHistory) / sizeof(requestedHistory[0])))
+                            requestedHistory[requestedHistoryCount++] = ticketCurrentCursor;
+                        else
+                        {
+                            memmove(&requestedHistory[0], &requestedHistory[1],
+                                    sizeof(TicketCursor) * (requestedHistoryCount - 1));
+                            requestedHistory[requestedHistoryCount - 1] = ticketCurrentCursor;
+                        }
+                        requestedCursor = ticketNextCursor;
+                    }
+                    else
+                    {
+                        requestedCursor = requestedHistory[--requestedHistoryCount];
+                    }
+                    requestTicketList(ticketStaffScope,
+                                      ticketStaffScope ? "unresolved" : "",
+                                      supportOnlyMode ? "unban" : "",
+                                      requestedCursor, requestedHistory,
+                                      requestedHistoryCount,
+                                      nextPage ? "LOADING NEXT PAGE" :
+                                      (previousPage ? "LOADING PREVIOUS PAGE" :
+                                                      "REFRESHING"));
                     continue;
                 }
             }
@@ -2842,19 +4354,28 @@ int main(int argc, char **argv)
                     sendTicketCommand(command);
                     continue;
                 }
-                if ((kDown & KEY_A) && (!closed || ticketStaffScope))
+                const bool touchReply = (kDown & KEY_TOUCH) &&
+                                        pointInRect(touch.px, touch.py, 8, 164, 148, 40);
+                const bool touchStaffActions = (kDown & KEY_TOUCH) &&
+                                               pointInRect(touch.px, touch.py, 164, 164, 148, 40);
+                if (((kDown & KEY_A) || touchReply) && (!closed || ticketStaffScope))
                 {
-                    char reply[241];
-                    if (readKeyboardText("Ticket reply", reply, sizeof(reply), ""))
+                    if (ticketDraftSendPending || ticketReplySendPending)
                     {
-                        char command[384];
-                        Protocol::buildTicketReply(command, sizeof(command), activeTicket.id, reply, ticketStaffScope);
-                        if (sendTicketCommand(command))
-                            setTicketNotice("REPLY SENT");
+                        setTicketNotice("WAIT FOR CURRENT SEND");
+                        continue;
+                    }
+                    if (readKeyboardText("Ticket reply", ticketReplyDraft,
+                                         sizeof(ticketReplyDraft), ticketReplyDraft))
+                    {
+                        ticketReplyDraftTicketId = activeTicket.id;
+                        ticketReplyDraftStaff = ticketStaffScope;
+                        ticketReplyPreview = true;
+                        setTicketNotice("REVIEW BEFORE SENDING");
                     }
                     continue;
                 }
-                if ((kDown & KEY_X) && ticketStaffScope && staffAllowed)
+                if (((kDown & KEY_X) || touchStaffActions) && ticketStaffScope && staffAllowed)
                 {
                     ticketView = 3;
                     ticketActionSelected = 0;
@@ -2864,12 +4385,12 @@ int main(int argc, char **argv)
             }
             else if (ticketView == 3)
             {
-                if (kDown & KEY_DUP)
+                if (navDown & KEY_DUP)
                 {
                     ticketActionSelected = (ticketActionSelected + 5) % 6;
                     topRenderFrame = 10;
                 }
-                if (kDown & KEY_DDOWN)
+                if (navDown & KEY_DDOWN)
                 {
                     ticketActionSelected = (ticketActionSelected + 1) % 6;
                     topRenderFrame = 10;
@@ -2880,17 +4401,41 @@ int main(int argc, char **argv)
                     topRenderFrame = 10;
                     continue;
                 }
-                if ((kDown & KEY_A) && staffAllowed)
+                bool activateTicketAction = (kDown & KEY_A) != 0;
+                if (kDown & KEY_TOUCH)
                 {
-                    char command[512];
+                    for (int action = 0; action < 6; ++action)
+                    {
+                        if (pointInRect(touch.px, touch.py, 8, 4 + action * 31, 304, 29))
+                        {
+                            ticketActionSelected = action;
+                            activateTicketAction = true;
+                            break;
+                        }
+                    }
+                }
+                if (activateTicketAction && staffAllowed)
+                {
+                    char command[768];
                     command[0] = '\0';
                     if (ticketActionSelected == 0)
                         Protocol::buildTicketStatus(command, sizeof(command), activeTicket.id, "in_progress");
                     else if (ticketActionSelected == 1)
                     {
-                        char reply[241];
-                        if (readKeyboardText("Reply to requester", reply, sizeof(reply), ""))
-                            Protocol::buildTicketReply(command, sizeof(command), activeTicket.id, reply, true);
+                        if (ticketDraftSendPending || ticketReplySendPending)
+                        {
+                            setTicketNotice("WAIT FOR CURRENT SEND");
+                            continue;
+                        }
+                        if (readKeyboardText("Reply to requester", ticketReplyDraft,
+                                             sizeof(ticketReplyDraft), ticketReplyDraft))
+                        {
+                            ticketReplyDraftTicketId = activeTicket.id;
+                            ticketReplyDraftStaff = true;
+                            ticketReplyPreview = true;
+                            setTicketNotice("REVIEW BEFORE SENDING");
+                        }
+                        continue;
                     }
                     else if (ticketActionSelected == 2 || ticketActionSelected == 3)
                     {
@@ -2930,46 +4475,364 @@ int main(int argc, char **argv)
             {
                 if (kDown & KEY_B)
                 {
-                    ticketView = 0;
-                    ticketHomeSelected = 5;
-                    char counts[48];
-                    Protocol::buildTicketCounts(counts, sizeof(counts));
-                    sendTicketCommand(counts);
+                    if (routeStack.pop())
+                        topMode = routeStack.current();
+                    else
+                        topMode = TOP_MODE_STAFF_CENTER;
+                    selectedAdminItem = 1;
                     topRenderFrame = 10;
                     continue;
                 }
-                if (kDown & KEY_A)
+                const bool touchSend = (kDown & KEY_TOUCH) &&
+                                       pointInRect(touch.px, touch.py, 8, 44, 304, 40);
+                const bool touchRefresh = (kDown & KEY_TOUCH) &&
+                                          pointInRect(touch.px, touch.py, 8, 92, 304, 40);
+                const bool touchOlder = (kDown & KEY_TOUCH) &&
+                                        pointInRect(touch.px, touch.py, 8, 140, 304, 40);
+                if ((kDown & KEY_A) || touchSend)
                 {
                     char message[241];
                     if (!readKeyboardText("Staff message", message, sizeof(message), "")) continue;
-                    char command[360];
+                    char command[640];
                     Protocol::buildStaffChatSend(command, sizeof(command), message);
                     if (sendTicketCommand(command)) setTicketNotice("STAFF MESSAGE SENT");
                     continue;
                 }
-                if ((kDown & KEY_X) || ((kDown & KEY_Y) && staffChatNextBeforeId > 0))
+                if ((kDown & KEY_X) || touchRefresh ||
+                    (((kDown & KEY_Y) || touchOlder) && staffChatNextBeforeId > 0))
                 {
                     char command[96];
-                    Protocol::buildStaffChatList(command, sizeof(command), (kDown & KEY_Y) ? staffChatNextBeforeId : 0);
-                    if (sendTicketCommand(command)) setTicketNotice((kDown & KEY_Y) ? "LOADING OLDER CHAT" : "REFRESHING STAFF CHAT");
+                    const bool older = ((kDown & KEY_Y) || touchOlder) &&
+                                       staffChatNextBeforeId > 0;
+                    Protocol::buildStaffChatList(command, sizeof(command),
+                                                 older ? staffChatNextBeforeId : 0);
+                    if (sendTicketCommand(command))
+                        setTicketNotice(older ? "LOADING OLDER CHAT" :
+                                                  "REFRESHING STAFF CHAT");
                     continue;
                 }
             }
         }
+        else if (topMode == TOP_MODE_USERS)
+        {
+            int peopleIndices[24];
+            int filteredPeopleCount = buildPeopleIndex(
+                connectedUsers, connectedUserCount, peopleAllChannels,
+                canvas.channel, identityInfo.displayName, identityInfo.username,
+                peopleIndices, 24);
+            selectedPerson = filteredPeopleCount > 0
+                                 ? std::max(0, std::min(selectedPerson, filteredPeopleCount - 1))
+                                 : 0;
+            if (selectedPerson < peopleScroll)
+                peopleScroll = selectedPerson;
+            if (selectedPerson >= peopleScroll + 5)
+                peopleScroll = selectedPerson - 4;
+            peopleScroll = std::max(0, std::min(peopleScroll,
+                                                std::max(0, filteredPeopleCount - 5)));
+
+            if (moderationConfirmation)
+            {
+                const bool confirm = (kDown & KEY_A) ||
+                                     ((kDown & KEY_TOUCH) &&
+                                      pointInRect(touch.px, touch.py, 30, 150, 126, 28));
+                const bool cancel = (kDown & KEY_B) ||
+                                    ((kDown & KEY_TOUCH) &&
+                                     pointInRect(touch.px, touch.py, 164, 150, 126, 28));
+                if (cancel)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    moderationConfirmation = false;
+                    setAdminNotice("MODERATION CANCELLED");
+                }
+                else if (confirm)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    char command[256];
+                    Protocol::buildModerationCommand(
+                        command, sizeof(command), pendingModerationAction,
+                        pendingModerationIdentity, 0, pendingModerationReason);
+                    if (NetworkManager::checkConnection() &&
+                        NetworkManager::sendText(command))
+                        setAdminNotice("MODERATION PENDING");
+                    else
+                        setAdminNotice("MODERATION SEND FAILED");
+                    moderationConfirmation = false;
+                    peopleActionMode = false;
+                }
+                continue;
+            }
+
+            if (peopleActionMode)
+            {
+                if (navDown & KEY_DUP)
+                    peopleActionSelected = (peopleActionSelected + 3) % 4;
+                if (navDown & KEY_DDOWN)
+                    peopleActionSelected = (peopleActionSelected + 1) % 4;
+                if (kDown & KEY_B)
+                {
+                    peopleActionMode = false;
+                    continue;
+                }
+                bool activateAction = (kDown & KEY_A) != 0;
+                if (kDown & KEY_TOUCH)
+                {
+                    for (int action = 0; action < 4; ++action)
+                    {
+                        if (pointInRect(touch.px, touch.py, 8, 34 + action * 42, 304, 36))
+                        {
+                            peopleActionSelected = action;
+                            activateAction = true;
+                            break;
+                        }
+                    }
+                }
+                if (activateAction && filteredPeopleCount > 0)
+                {
+                    const PresenceUser &target = connectedUsers[peopleIndices[selectedPerson]];
+                    if (!target.identityId[0])
+                    {
+                        setAdminNotice("ACCOUNT ACTIONS REQUIRE SIGN-IN");
+                        continue;
+                    }
+                    if (isCurrentPerson(target, identityInfo.displayName, identityInfo.username))
+                    {
+                        setAdminNotice("CANNOT MODERATE YOURSELF");
+                        continue;
+                    }
+                    if (peopleActionSelected == 3 && strcmp(identityInfo.role, "admin") != 0)
+                    {
+                        setAdminNotice("ADMIN REQUIRED FOR BAN");
+                        continue;
+                    }
+                    static const char *ACTIONS[] = {"kick", "mute", "unmute", "ban"};
+                    snprintf(pendingModerationAction, sizeof(pendingModerationAction),
+                             "%s", ACTIONS[peopleActionSelected]);
+                    snprintf(pendingModerationIdentity, sizeof(pendingModerationIdentity),
+                             "%s", target.identityId);
+                    snprintf(pendingModerationTargetName, sizeof(pendingModerationTargetName),
+                             "%s", peopleName(target));
+                    pendingModerationReason[0] = '\0';
+                    if (peopleActionSelected != 2 &&
+                        !readKeyboardText("Moderation reason", pendingModerationReason,
+                                          sizeof(pendingModerationReason), ""))
+                        continue;
+                    moderationConfirmation = true;
+                    setAdminNotice("CONFIRM MODERATION");
+                    continue;
+                }
+            }
+            else
+            {
+                bool activatePerson = (kDown & KEY_A) != 0;
+                if (navDown & KEY_DUP && filteredPeopleCount > 0)
+                    selectedPerson = (selectedPerson + filteredPeopleCount - 1) % filteredPeopleCount;
+                if (navDown & KEY_DDOWN && filteredPeopleCount > 0)
+                    selectedPerson = (selectedPerson + 1) % filteredPeopleCount;
+                if (kDown & KEY_X)
+                {
+                    peopleAllChannels = !peopleAllChannels;
+                    selectedPerson = 0;
+                    peopleScroll = 0;
+                }
+                if (kDown & KEY_TOUCH)
+                {
+                    if (pointInRect(touch.px, touch.py, 8, 4, 148, 30))
+                    {
+                        peopleAllChannels = false;
+                        selectedPerson = peopleScroll = 0;
+                    }
+                    else if (pointInRect(touch.px, touch.py, 164, 4, 148, 30))
+                    {
+                        peopleAllChannels = true;
+                        selectedPerson = peopleScroll = 0;
+                    }
+                    else
+                    {
+                        for (int row = 0; row < 5; ++row)
+                        {
+                            if (pointInRect(touch.px, touch.py, 8, 40 + row * 32, 304, 30) &&
+                                peopleScroll + row < filteredPeopleCount)
+                            {
+                                selectedPerson = peopleScroll + row;
+                                activatePerson = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (activatePerson && reportUserSelectionMode && filteredPeopleCount > 0)
+                {
+                    if (ticketDraftSendPending || ticketReplySendPending)
+                    {
+                        setTicketNotice("WAIT FOR CURRENT SEND");
+                        continue;
+                    }
+                    const PresenceUser &target = connectedUsers[peopleIndices[selectedPerson]];
+                    const char *name = peopleName(target);
+                    snprintf(ticketDraftCategory, sizeof(ticketDraftCategory), "report");
+                    snprintf(ticketDraftSubject, sizeof(ticketDraftSubject),
+                             "Report: %.48s", name);
+                    snprintf(ticketDraftDetails, sizeof(ticketDraftDetails),
+                             "Reported user: %.48s\nAccount: %.24s\nIdentity/session: %.39s\nChannel: %.24s\nReason: ",
+                             name,
+                             target.username[0] ? target.username : "anonymous",
+                             target.identityId[0] ? target.identityId : target.id,
+                             target.channel[0] ? target.channel : canvas.channel);
+                    if (readKeyboardText("Report details", ticketDraftDetails,
+                                         sizeof(ticketDraftDetails), ticketDraftDetails))
+                    {
+                        reportUserSelectionMode = false;
+                        ticketDraftPreview = true;
+                        ticketView = 0;
+                        if (routeStack.pop())
+                            topMode = routeStack.current();
+                        else
+                            topMode = TOP_MODE_TICKETS;
+                        setTicketNotice("REVIEW USER REPORT");
+                    }
+                    continue;
+                }
+                if (activatePerson && isModOrAdmin() && filteredPeopleCount > 0)
+                {
+                    peopleActionMode = true;
+                    peopleActionSelected = 0;
+                }
+                if (kDown & KEY_B)
+                {
+                    reportUserSelectionMode = false;
+                    if (routeStack.pop())
+                        topMode = routeStack.current();
+                    else
+                        topMode = TOP_MODE_MENU;
+                    topRenderFrame = 10;
+                    continue;
+                }
+            }
+            topRenderFrame = 10;
+        }
+        else if (topMode == TOP_MODE_IDENTITY && !gNeedsDisplayName)
+        {
+            if (rotateBackupConfirmation)
+            {
+                const bool confirm = (kDown & KEY_A) ||
+                                     ((kDown & KEY_TOUCH) &&
+                                      pointInRect(touch.px, touch.py, 30, 150, 126, 28));
+                const bool cancel = (kDown & KEY_B) ||
+                                    ((kDown & KEY_TOUCH) &&
+                                     pointInRect(touch.px, touch.py, 164, 150, 126, 28));
+                if (cancel)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    rotateBackupConfirmation = false;
+                    setIdentityNotice("ROTATION CANCELLED");
+                }
+                else if (confirm)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    if (requestBackupCode())
+                        setIdentityNotice("ROTATION PENDING");
+                    else
+                        setIdentityNotice("ROTATION SEND FAILED");
+                    rotateBackupConfirmation = false;
+                }
+                continue;
+            }
+
+            if (navDown & KEY_DUP)
+                profileSelected = (profileSelected + 3) % 4;
+            if (navDown & KEY_DDOWN)
+                profileSelected = (profileSelected + 1) % 4;
+            if (kDown & KEY_B)
+            {
+                backupCodeRevealed = false;
+                if (routeStack.pop())
+                    topMode = routeStack.current();
+                else
+                    topMode = TOP_MODE_MENU;
+                topRenderFrame = 10;
+                continue;
+            }
+            bool activateProfile = (kDown & KEY_A) != 0;
+            if (kDown & KEY_X)
+                profileSelected = 3, activateProfile = true;
+            if (kDown & KEY_Y)
+                profileSelected = 1, activateProfile = true;
+            if (kDown & KEY_TOUCH)
+            {
+                if (pointInRect(touch.px, touch.py, 8, 46, 304, 38))
+                    profileSelected = 0, activateProfile = true;
+                else if (pointInRect(touch.px, touch.py, 8, 92, 148, 38))
+                    profileSelected = 1, activateProfile = true;
+                else if (pointInRect(touch.px, touch.py, 164, 92, 148, 38))
+                    profileSelected = 2, activateProfile = true;
+                else if (pointInRect(touch.px, touch.py, 8, 138, 304, 38))
+                    profileSelected = 3, activateProfile = true;
+            }
+            if (activateProfile)
+            {
+                if (supportOnlyMode && profileSelected != 1)
+                {
+                    setIdentityNotice("PROFILE IS READ-ONLY WHILE RESTRICTED");
+                    continue;
+                }
+                if (profileSelected == 0)
+                {
+                    char chosenDisplayName[25] = "";
+                    if (promptDisplayName(identityInfo, chosenDisplayName,
+                                          sizeof(chosenDisplayName)) &&
+                        sendDisplayNameValue(chosenDisplayName))
+                        setIdentityNotice("NAME CHANGE SENT");
+                }
+                else if (profileSelected == 1)
+                {
+                    backupCodeRevealed = !backupCodeRevealed;
+                    setIdentityNotice(backupCodeRevealed ? "CODE REVEALED" : "CODE HIDDEN");
+                }
+                else if (profileSelected == 2)
+                {
+                    rotateBackupConfirmation = true;
+                }
+                else if (recoverIdentity())
+                {
+                    setIdentityNotice("RECOVERING");
+                }
+                continue;
+            }
+            topRenderFrame = 10;
+        }
         else if (topMode == TOP_MODE_RULES && (kDown & KEY_B) && gNeedsRules)
         {
-            exitRequested = true;
+            requestExitConfirmation();
             continue;
         }
-        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_ADMIN || topMode == TOP_MODE_STATUS || topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS || topMode == TOP_MODE_RULES) && (kDown & KEY_B))
+        else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_B) && gNeedsDisplayName)
+        {
+            requestExitConfirmation();
+            continue;
+        }
+        else if ((topMode == TOP_MODE_USERS || topMode == TOP_MODE_ADMIN ||
+                  topMode == TOP_MODE_STAFF_CENTER || topMode == TOP_MODE_STATUS ||
+                  topMode == TOP_MODE_IDENTITY || topMode == TOP_MODE_CONTROLS ||
+                  topMode == TOP_MODE_OPTIONS || topMode == TOP_MODE_RULES) &&
+                 (kDown & KEY_B))
         {
             pendingAdminRectTool = ADMIN_RECT_NONE;
             adminRectDragging = false;
-            topMode = TOP_MODE_MENU;
+            if (routeStack.pop())
+                topMode = routeStack.current();
+            else
+                topMode = TOP_MODE_MENU;
             topRenderFrame = 10;
             continue;
         }
-        else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_A))
+        else if (topMode == TOP_MODE_IDENTITY &&
+                 ((kDown & KEY_A) ||
+                  ((kDown & KEY_TOUCH) &&
+                   pointInRect(touch.px, touch.py, 8, 180, 148, 36))))
         {
             if (onboardingStage == ONBOARDING_SUBMITTING_DISPLAY_NAME)
             {
@@ -2997,7 +4860,10 @@ int main(int argc, char **argv)
             }
             continue;
         }
-        else if (topMode == TOP_MODE_IDENTITY && (kDown & KEY_X))
+        else if (topMode == TOP_MODE_IDENTITY &&
+                 ((kDown & KEY_X) ||
+                  ((kDown & KEY_TOUCH) &&
+                   pointInRect(touch.px, touch.py, 164, 180, 148, 36))))
         {
             if (recoverIdentity())
             {
@@ -3013,9 +4879,22 @@ int main(int argc, char **argv)
             }
             continue;
         }
-        else if (topMode == TOP_MODE_RULES && (kDown & KEY_A) && !rulesRequireFreshAPress)
+        else if (topMode == TOP_MODE_RULES &&
+                 ((kDown & KEY_A) ||
+                  ((kDown & KEY_TOUCH) &&
+                   pointInRect(touch.px, touch.py, 24, 168, 272, 40))) &&
+                 (!gNeedsRules || !rulesRequireFreshAPress))
         {
-            if (onboardingStage == ONBOARDING_SUBMITTING_RULES)
+            if (kDown & KEY_TOUCH)
+                suppressTouchUntilRelease = true;
+            if (!gNeedsRules)
+            {
+                if (routeStack.pop())
+                    topMode = routeStack.current();
+                else
+                    topMode = TOP_MODE_MENU;
+            }
+            else if (onboardingStage == ONBOARDING_SUBMITTING_RULES)
             {
                 setIdentityNotice("WAITING FOR SERVER");
             }
@@ -3042,34 +4921,78 @@ int main(int argc, char **argv)
 
         if (topMode == TOP_MODE_CHANNELS)
         {
-            if ((kDown & KEY_DUP) && availableChannelCount > 0)
+            if ((navDown & KEY_DUP) && availableChannelCount > 0)
             {
                 selectedChannel = (selectedChannel + availableChannelCount - 1) % availableChannelCount;
                 topRenderFrame = 10;
             }
-            if ((kDown & KEY_DDOWN) && availableChannelCount > 0)
+            if ((navDown & KEY_DDOWN) && availableChannelCount > 0)
             {
                 selectedChannel = (selectedChannel + 1) % availableChannelCount;
                 topRenderFrame = 10;
             }
-            if (kDown & KEY_A)
+            bool activateChannel = (kDown & KEY_A) != 0;
+            if (kDown & KEY_TOUCH)
             {
-                if (switchToSelectedChannel())
-                    topMode = TOP_MODE_MENU;
+                for (int item = 0; item < availableChannelCount && item < 8; ++item)
+                {
+                    if (pointInRect(touch.px, touch.py, 4, 4 + item * 28, 312, 28))
+                    {
+                        selectedChannel = item;
+                        activateChannel = true;
+                        break;
+                    }
+                }
+            }
+            if (activateChannel)
+            {
+                if (switchToSelectedChannel() && !pendingChannelSwitch[0])
+                {
+                    if (routeStack.pop())
+                        topMode = routeStack.current();
+                    else
+                        topMode = TOP_MODE_MENU;
+                    setAdminNotice("CHANNEL READY");
+                }
                 topRenderFrame = 10;
             }
             if (kDown & KEY_B)
             {
-                topMode = TOP_MODE_MENU;
+                if (routeStack.pop())
+                    topMode = routeStack.current();
+                else
+                    topMode = TOP_MODE_MENU;
                 topRenderFrame = 10;
                 continue;
             }
         }
 
-        bool zoomOverlayLeft = (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT);
-        bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DRIGHT | KEY_Y));
-        bool blockNormalCanvasInput = gDisconnectReason[0] || gNeedsDisplayName || gNeedsRules || restrictionActive;
-        if (!shoulderEraserActive && !blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && (kDown & (KEY_L | KEY_R)))
+        const bool zoomActionHeld = topMode == TOP_MODE_CANVAS &&
+                                    !higherPriorityConfirmation &&
+                                    !UIState::isColorPickerActive() &&
+                                    semanticInput.consumeHeld(gClientSettings.bindings, Doodle::INPUT_ACTION_ZOOM);
+        bool zoomOverlayLeft = gClientSettings.zoomOverlaySide == Doodle::ZOOM_OVERLAY_LEFT ||
+                               (gClientSettings.zoomOverlaySide == Doodle::ZOOM_OVERLAY_AUTO &&
+                                (kHeld & KEY_Y) && !(kHeld & KEY_DRIGHT));
+        if (gClientSettings.zoomOverlaySide == Doodle::ZOOM_OVERLAY_RIGHT)
+            zoomOverlayLeft = false;
+        bool zoomOverlayActive = topMode == TOP_MODE_CANVAS && zoomActionHeld;
+        bool blockNormalCanvasInput = gDisconnectReason[0] || gNeedsDisplayName ||
+                                      gNeedsRules || restrictionActive ||
+                                      higherPriorityConfirmation ||
+                                      recoveryCodeExplanation;
+        if (UIState::isColorPickerActive() &&
+            (topMode != TOP_MODE_CANVAS || blockNormalCanvasInput))
+        {
+            UIState::setColorPickerActive(false);
+            gPaletteAssignMode = false;
+            pickerReturnToRoute = false;
+            pickerTab = 0;
+            pickerFocus = 0;
+        }
+        if (!shoulderEraserActive && !blockNormalCanvasInput &&
+            !UIState::isColorPickerActive() && topMode == TOP_MODE_CANVAS &&
+            semanticInput.consumeDown(gClientSettings.bindings, Doodle::INPUT_ACTION_QUICK_ERASER))
         {
             shoulderSavedBrushShape = currentBrushShape;
             shoulderSavedBrushSize = currentBrushSize;
@@ -3078,7 +5001,8 @@ int main(int argc, char **argv)
             shoulderEraserActive = true;
             topRenderFrame = 10;
         }
-        if (shoulderEraserActive && (!(kHeld & (KEY_L | KEY_R)) || (kUp & (KEY_L | KEY_R))))
+        if (shoulderEraserActive &&
+            !Doodle::actionIsHeld(gClientSettings.bindings, Doodle::INPUT_ACTION_QUICK_ERASER, kHeld))
         {
             currentBrushShape = shoulderSavedBrushShape;
             currentBrushSize = shoulderSavedBrushSize;
@@ -3103,13 +5027,93 @@ int main(int argc, char **argv)
                 hasLastStrokePoint = false;
             }
         }
+        if (topMode == TOP_MODE_CANVAS && confirmClearCanvas)
+        {
+            blockNormalCanvasInput = true;
+            const bool cancelClear = (kDown & KEY_B) ||
+                                     ((kDown & KEY_TOUCH) &&
+                                      pointInRect(touch.px, touch.py, 164, 150, 126, 28));
+            const bool applyClear = (kDown & KEY_A) ||
+                                    ((kDown & KEY_TOUCH) &&
+                                     pointInRect(touch.px, touch.py, 30, 150, 126, 28));
+            if (cancelClear)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                confirmClearCanvas = false;
+                setAdminNotice("CLEAR CANCELLED");
+                continue;
+            }
+            if (applyClear)
+            {
+                if (kDown & KEY_TOUCH)
+                    suppressTouchUntilRelease = true;
+                Color white = {255, 255, 255};
+                sendAdminCanvasCommand("clear", 0, 0, canvasWidth, canvasHeight, white);
+                confirmClearCanvas = false;
+                continue;
+            }
+        }
         if (topMode == TOP_MODE_CANVAS && pendingAdminRectTool != ADMIN_RECT_NONE)
         {
             blockNormalCanvasInput = true;
-            if (kDown & KEY_B)
+            if (adminRectAwaitingConfirm)
+            {
+                const bool cancelRect = (kDown & KEY_B) ||
+                                        ((kDown & KEY_TOUCH) &&
+                                         pointInRect(touch.px, touch.py, 164, 198, 148, 36));
+                const bool applyRect = (kDown & KEY_A) ||
+                                       ((kDown & KEY_TOUCH) &&
+                                        pointInRect(touch.px, touch.py, 8, 198, 148, 36));
+                if (cancelRect)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    pendingAdminRectTool = ADMIN_RECT_NONE;
+                    adminRectAwaitingConfirm = false;
+                    if (pickerReturnToRoute)
+                    {
+                        pickerTab = 1;
+                        pickerFocus = 2;
+                        UIState::setColorPickerActive(true);
+                    }
+                    setAdminNotice("RECT CANCELLED");
+                    continue;
+                }
+                if (applyRect)
+                {
+                    if (kDown & KEY_TOUCH)
+                        suppressTouchUntilRelease = true;
+                    const int minX = std::max(0, std::min(adminRectStartX, adminRectEndX));
+                    const int minY = std::max(0, std::min(adminRectStartY, adminRectEndY));
+                    const int maxX = std::min(canvasWidth - 1, std::max(adminRectStartX, adminRectEndX));
+                    const int maxY = std::min(canvasHeight - 1, std::max(adminRectStartY, adminRectEndY));
+                    const int rectW = std::max(1, maxX - minX + 1);
+                    const int rectH = std::max(1, maxY - minY + 1);
+                    Color sendColor = pendingAdminRectTool == ADMIN_RECT_ERASE
+                                          ? Color{255, 255, 255}
+                                          : currentColor;
+                    const char *action = pendingAdminRectTool == ADMIN_RECT_ERASE ? "eraseRect" : "fillRect";
+                    sendAdminCanvasCommand(action, minX, minY, rectW, rectH, sendColor);
+                    pendingAdminRectTool = ADMIN_RECT_NONE;
+                    adminRectAwaitingConfirm = false;
+                    if (pickerReturnToRoute)
+                    {
+                        pickerTab = 1;
+                        UIState::setColorPickerActive(true);
+                    }
+                    continue;
+                }
+            }
+            else if (kDown & KEY_B)
             {
                 pendingAdminRectTool = ADMIN_RECT_NONE;
                 adminRectDragging = false;
+                if (pickerReturnToRoute)
+                {
+                    pickerTab = 1;
+                    UIState::setColorPickerActive(true);
+                }
                 setAdminNotice("RECT CANCELLED");
                 continue;
             }
@@ -3122,7 +5126,7 @@ int main(int argc, char **argv)
                 adminRectEndX = adminRectStartX;
                 adminRectEndY = adminRectStartY;
                 adminRectDragging = true;
-                setAdminNotice("RELEASE TO FILL");
+                setAdminNotice(pendingAdminRectTool == ADMIN_RECT_ERASE ? "RELEASE TO PREVIEW ERASE" : "RELEASE TO PREVIEW FILL");
             }
             else if ((kHeld & KEY_TOUCH) && adminRectDragging)
             {
@@ -3135,23 +5139,9 @@ int main(int argc, char **argv)
             {
                 canvas.offsetX = offsetX;
                 canvas.offsetY = offsetY;
-                int endX = adminRectEndX;
-                int endY = adminRectEndY;
-                int minX = std::max(0, std::min(adminRectStartX, endX));
-                int minY = std::max(0, std::min(adminRectStartY, endY));
-                int maxX = std::min(canvasWidth - 1, std::max(adminRectStartX, endX));
-                int maxY = std::min(canvasHeight - 1, std::max(adminRectStartY, endY));
-                int rectW = std::max(1, maxX - minX + 1);
-                int rectH = std::max(1, maxY - minY + 1);
-                Color sendColor = currentColor;
-                bool sent = sendAdminCanvasCommand("fillRect", minX, minY, rectW, rectH, sendColor);
-                if (sent)
-                {
-                    applyCanvasRectLocal(canvas, minX, minY, rectW, rectH, sendColor);
-                    Renderer::invalidateMinimap();
-                }
-                pendingAdminRectTool = ADMIN_RECT_NONE;
                 adminRectDragging = false;
+                adminRectAwaitingConfirm = true;
+                setAdminNotice(pendingAdminRectTool == ADMIN_RECT_ERASE ? "A ERASE  B CANCEL" : "A FILL  B CANCEL");
             }
         }
         if (!blockNormalCanvasInput && zoomOverlayActive && (kDown & KEY_TOUCH))
@@ -3188,17 +5178,46 @@ int main(int argc, char **argv)
             }
         }
 
-        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && !(kHeld & (KEY_DRIGHT | KEY_Y)) && (kDown & (KEY_DDOWN | KEY_B)))
+        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS &&
+            UIState::isColorPickerActive() && (kDown & KEY_B))
         {
-            UIState::toggleColorPicker();
+            UIState::setColorPickerActive(false);
+            gPaletteAssignMode = false;
+            clearAdminNotice();
+            pickerTab = 0;
+            pickerFocus = 0;
+            if (pickerReturnToRoute)
+            {
+                pickerReturnToRoute = false;
+                if (routeStack.pop())
+                    topMode = routeStack.current();
+                else
+                    topMode = TOP_MODE_MENU;
+            }
+            topRenderFrame = 10;
+            continue;
+        }
+        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && !zoomActionHeld &&
+            !UIState::isColorPickerActive() &&
+            semanticInput.consumeDown(gClientSettings.bindings, Doodle::INPUT_ACTION_TOOLS))
+        {
+            pickerReturnToRoute = false;
+            UIState::setColorPickerActive(true);
             pendingAdminRectTool = ADMIN_RECT_NONE;
             adminRectDragging = false;
+            adminRectAwaitingConfirm = false;
+            gPaletteAssignMode = false;
+            pickerTab = 0;
+            pickerFocus = 0;
             topMode = TOP_MODE_CANVAS;
-            printf(UIState::isColorPickerActive() ? "Color picker activated\n" : "Color picker deactivated\n");
+            printf("Color picker activated\n");
         }
 
         // Eye Dropper functionality
-        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && ((kHeld & KEY_DUP) || (kHeld & KEY_X)))
+        const bool sampleActionHeld = !blockNormalCanvasInput && !zoomOverlayActive &&
+                                      topMode == TOP_MODE_CANVAS && !UIState::isColorPickerActive() &&
+                                      semanticInput.consumeHeld(gClientSettings.bindings, Doodle::INPUT_ACTION_SAMPLE);
+        if (sampleActionHeld)
         {
             if (kDown & KEY_TOUCH)
             {
@@ -3210,29 +5229,88 @@ int main(int argc, char **argv)
                 if (touchX >= 0 && touchX < canvasWidth && touchY >= 0 && touchY < canvasHeight)
                 {
                     int idx = 3 * (touchY * canvasWidth + touchX);
+                    gPreviousColor = currentColor;
                     currentColor.r = fullCanvas[idx];
                     currentColor.g = fullCanvas[idx + 1];
                     currentColor.b = fullCanvas[idx + 2];
-                    float h, s, v;
-                    UIState::RGBtoHSV(currentColor.r / 255.0f, currentColor.g / 255.0f, currentColor.b / 255.0f, h, s, v);
-                    UIState::updateHSV(h, s, v);
+                    syncPickerToColor(currentColor);
+                    markClientSettingsDirty();
 
                     printf("Color picked: R=%d, G=%d, B=%d\n", currentColor.r, currentColor.g, currentColor.b);
                 }
             }
         }
 
-        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && (kDown & KEY_TOUCH))
+        bool paletteActivate = (kDown & KEY_TOUCH) != 0;
+        if (!blockNormalCanvasInput && !zoomOverlayActive &&
+            topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive())
         {
-            if (pointInRect(touch.px, touch.py, 14, 14, 88, 28))
+            if (isModOrAdmin() && (kDown & (KEY_L | KEY_R)))
+            {
+                pickerTab = pickerTab == 0 ? 1 : 0;
+                pickerFocus = 0;
+                topRenderFrame = 10;
+            }
+            const int pickerItemCount = pickerTab == 0 ? 22 : 4;
+            if (navDown & (KEY_DLEFT | KEY_DUP))
+                pickerFocus = (pickerFocus + pickerItemCount - 1) % pickerItemCount;
+            if (navDown & (KEY_DRIGHT | KEY_DDOWN))
+                pickerFocus = (pickerFocus + 1) % pickerItemCount;
+            if (kDown & KEY_A)
+            {
+                paletteActivate = true;
+                if (pickerTab == 1)
+                {
+                    static const int staffX[] = {82, 238, 82, 238};
+                    static const int staffY[] = {67, 67, 113, 113};
+                    touch.px = staffX[pickerFocus];
+                    touch.py = staffY[pickerFocus];
+                }
+                else if (pickerFocus < 4)
+                {
+                    touch.px = 44 + pickerFocus * 76;
+                    touch.py = 56;
+                }
+                else if (pickerFocus < 9)
+                {
+                    touch.px = 72 + (pickerFocus - 4) * 52;
+                    touch.py = 88;
+                }
+                else if (pickerFocus == 9)
+                {
+                    touch.px = 125;
+                    touch.py = 180;
+                }
+                else if (pickerFocus < 18)
+                {
+                    const int slot = pickerFocus - 10;
+                    touch.px = 167 + (slot % 4) * 39;
+                    touch.py = 125 + (slot / 4) * 39;
+                }
+                else
+                {
+                    static const int footerX[] = {133, 182, 231, 282};
+                    touch.px = footerX[pickerFocus - 18];
+                    touch.py = 218;
+                }
+            }
+        }
+
+        if (!blockNormalCanvasInput && !zoomOverlayActive &&
+            topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() &&
+            paletteActivate)
+        {
+            if (pointInRect(touch.px, touch.py, 8, 8, 92, 28))
             {
                 pickerTab = 0;
+                pickerFocus = 0;
                 topRenderFrame = 10;
                 continue;
             }
-            if (isModOrAdmin() && pointInRect(touch.px, touch.py, 106, 14, 88, 28))
+            if (isModOrAdmin() && pointInRect(touch.px, touch.py, 104, 8, 92, 28))
             {
                 pickerTab = 1;
+                pickerFocus = 0;
                 topRenderFrame = 10;
                 continue;
             }
@@ -3244,91 +5322,192 @@ int main(int argc, char **argv)
                     setAdminNotice("MOD OR ADMIN REQUIRED");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 22, 54, 132, 36))
+                if (pointInRect(touch.px, touch.py, 8, 48, 148, 38))
                 {
+                    pickerFocus = 0;
                     sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 166, 54, 132, 36))
+                if (pointInRect(touch.px, touch.py, 164, 48, 148, 38))
                 {
-                    Color white = {255, 255, 255};
-                    if (sendAdminCanvasCommand("clear", 0, 0, canvasWidth, canvasHeight, white))
-                    {
-                        applyCanvasRectLocal(canvas, 0, 0, canvasWidth, canvasHeight, white);
-                        Renderer::invalidateMinimap();
-                    }
+                    pickerFocus = 1;
+                    confirmClearCanvas = true;
+                    setAdminNotice("CONFIRM CLEAR");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 22, 102, 276, 36))
+                if (pointInRect(touch.px, touch.py, 8, 94, 148, 38))
                 {
+                    pickerFocus = 2;
                     pendingAdminRectTool = ADMIN_RECT_FILL;
                     adminRectDragging = false;
+                    adminRectAwaitingConfirm = false;
                     UIState::setColorPickerActive(false);
                     setAdminNotice("DRAG SELECTION");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 22, 150, 276, 34))
+                if (pointInRect(touch.px, touch.py, 164, 94, 148, 38))
                 {
-                    gRainbowEnabled = !gRainbowEnabled;
-                    gRainbowStrokeColorValid = false;
-                    setAdminNotice(gRainbowEnabled ? "RAINBOW ENABLED" : "RAINBOW DISABLED");
-                    topRenderFrame = 10;
+                    pickerFocus = 3;
+                    pendingAdminRectTool = ADMIN_RECT_ERASE;
+                    adminRectDragging = false;
+                    adminRectAwaitingConfirm = false;
+                    UIState::setColorPickerActive(false);
+                    setAdminNotice("DRAG ERASE AREA");
                     continue;
                 }
                 continue;
             }
+
+            for (int shape = 0; shape < 4; ++shape)
+            {
+                if (pointInRect(touch.px, touch.py, 8 + shape * 76, 42, 72, 28))
+                {
+                    currentBrushShape = shape;
+                    pickerFocus = shape;
+                    currentBrushSize = clampBrushSizeForShape(shape, currentBrushSize);
+                    markClientSettingsDirty();
+                    continue;
+                }
+            }
+            for (int row = 0; row < 5; ++row)
+            {
+                if (pointInRect(touch.px, touch.py, 48 + row * 52, 74, 48, 28))
+                {
+                    currentBrushSize = brushSizeForShapeRow(currentBrushShape, row);
+                    pickerFocus = 4 + row;
+                    markClientSettingsDirty();
+                    continue;
+                }
+            }
+            if (pointInRect(touch.px, touch.py, 110, 166, 30, 28))
+            {
+                pickerFocus = 9;
+                Color swap = currentColor;
+                currentColor = gPreviousColor;
+                gPreviousColor = swap;
+                syncPickerToColor(currentColor);
+                markClientSettingsDirty();
+                continue;
+            }
+            for (int slot = 0; slot < 8; ++slot)
+            {
+                const int column = slot % 4;
+                const int row = slot / 4;
+                if (!pointInRect(touch.px, touch.py, 150 + column * 39, 108 + row * 39, 34, 34))
+                    continue;
+                if (gPaletteAssignMode)
+                {
+                    pickerFocus = 10 + slot;
+                    gCustomPalette[slot] = currentColor;
+                    gPaletteAssignMode = false;
+                    setAdminNotice("COLOR SAVED");
+                    markClientSettingsDirty();
+                }
+                else
+                {
+                    pickerFocus = 10 + slot;
+                    gPreviousColor = currentColor;
+                    currentColor = gCustomPalette[slot];
+                    syncPickerToColor(currentColor);
+                    markClientSettingsDirty();
+                }
+                continue;
+            }
+            if (pointInRect(touch.px, touch.py, 110, 204, 46, 28))
+            {
+                pickerFocus = 18;
+                gPaletteAssignMode = !gPaletteAssignMode;
+                setAdminNotice(gPaletteAssignMode ? "CHOOSE A SWATCH" : "SAVE CANCELLED");
+                continue;
+            }
+            if (pointInRect(touch.px, touch.py, 158, 204, 48, 28))
+            {
+                pickerFocus = 19;
+                confirmPaletteReset = true;
+                clearAdminNotice();
+                continue;
+            }
+            if (pointInRect(touch.px, touch.py, 208, 204, 46, 28))
+            {
+                pickerFocus = 20;
+                Color entered = currentColor;
+                if (handleHexColorInput(entered))
+                {
+                    gPreviousColor = currentColor;
+                    currentColor = entered;
+                    syncPickerToColor(currentColor);
+                    setAdminNotice("HEX COLOR SET");
+                    markClientSettingsDirty();
+                }
+                else
+                    setAdminNotice("INVALID HEX COLOR");
+                continue;
+            }
+            if (pointInRect(touch.px, touch.py, 256, 204, 52, 28))
+            {
+                pickerFocus = 21;
+                gRainbowEnabled = !gRainbowEnabled;
+                gRainbowStrokeColorValid = false;
+                setAdminNotice(gRainbowEnabled ? "RAINBOW ENABLED" : "RAINBOW DISABLED");
+                continue;
+            }
         }
 
-        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() && pickerTab == 0 && (kHeld & KEY_TOUCH))
+        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS &&
+            UIState::isColorPickerActive() && pickerTab == 0 && (kHeld & KEY_TOUCH))
         {
             float h, s, v;
             UIState::getHSV(h, s, v);
 
-            const int colorSquareX = 162;
-            const int colorSquareY = 54;
-            const int colorSquareSize = 132;
-            const int hueStripY = 198;
-            const int hueStripH = 14;
-            if (pointInRect(touch.px, touch.py, colorSquareX, colorSquareY, colorSquareSize, colorSquareSize))
+            bool hsvChanged = false;
+            if (pointInRect(touch.px, touch.py,
+                            PICKER_COLOR_FIELD_X, PICKER_COLOR_FIELD_Y,
+                            PICKER_COLOR_FIELD_SIZE, PICKER_COLOR_FIELD_SIZE))
             {
-                s = (float)(touch.px - colorSquareX) / (float)(colorSquareSize - 1);
-                v = 1.0f - ((float)(touch.py - colorSquareY) / (float)(colorSquareSize - 1));
+                if (kDown & KEY_TOUCH)
+                    gPreviousColor = currentColor;
+                s = (float)(touch.px - PICKER_COLOR_FIELD_X) /
+                    (float)(PICKER_COLOR_FIELD_SIZE - 1);
+                v = 1.0f - ((float)(touch.py - PICKER_COLOR_FIELD_Y) /
+                            (float)(PICKER_COLOR_FIELD_SIZE - 1));
+                hsvChanged = true;
             }
-            else if (pointInRect(touch.px, touch.py, colorSquareX, hueStripY - 4, colorSquareSize, hueStripH + 8))
+            else if (pointInRect(touch.px, touch.py,
+                                 PICKER_COLOR_FIELD_X, PICKER_HUE_STRIP_Y - 3,
+                                 PICKER_COLOR_FIELD_SIZE,
+                                 PICKER_HUE_STRIP_HEIGHT + 6))
             {
-                h = (float)(touch.px - colorSquareX) / (float)(colorSquareSize - 1);
+                if (kDown & KEY_TOUCH)
+                    gPreviousColor = currentColor;
+                h = (float)(touch.px - PICKER_COLOR_FIELD_X) /
+                    (float)(PICKER_COLOR_FIELD_SIZE - 1);
+                hsvChanged = true;
             }
 
-            h = std::max(0.0f, std::min(1.0f, h));
-            s = std::max(0.0f, std::min(1.0f, s));
-            v = std::max(0.0f, std::min(1.0f, v));
-
-            UIState::updateHSV(h, s, v);
-
-            // Convert HSV to RGB
-            float r, g, b;
-            UIState::HSVtoRGB(h, s, v, r, g, b);
-            currentColor.r = r * 255;
-            currentColor.g = g * 255;
-            currentColor.b = b * 255;
-
-            const int brushYs[] = {70, 92, 114, 136, 158};
-            const int brushXs[] = {30, 60, 90, 120};
-            for (int i = 0; i < 5; i++)
+            if (hsvChanged)
             {
-                for (int shape = 0; shape < 4; shape++)
-                {
-                    if (pointInRect(touch.px, touch.py, brushXs[shape] - 14, brushYs[i] - 12, 28, 24))
-                    {
-                        currentBrushSize = clampBrushSizeForShape(shape, brushSizeForShapeRow(shape, i));
-                        currentBrushShape = shape;
-                        break;
-                    }
-                }
+                h = std::max(0.0f, std::min(1.0f, h));
+                s = std::max(0.0f, std::min(1.0f, s));
+                v = std::max(0.0f, std::min(1.0f, v));
+
+                UIState::updateHSV(h, s, v);
+
+                // Convert HSV to RGB
+                float r, g, b;
+                UIState::HSVtoRGB(h, s, v, r, g, b);
+                currentColor.r = r * 255;
+                currentColor.g = g * 255;
+                currentColor.b = b * 255;
+                markClientSettingsDirty();
             }
+
         }
 
-        if (!blockNormalCanvasInput && !zoomOverlayActive && topMode == TOP_MODE_CANVAS && (kHeld & (KEY_DLEFT | KEY_A)))
+        const bool panActionHeld = !blockNormalCanvasInput && !zoomOverlayActive &&
+                                   topMode == TOP_MODE_CANVAS &&
+                                   !UIState::isColorPickerActive() &&
+                                   semanticInput.consumeHeld(gClientSettings.bindings, Doodle::INPUT_ACTION_PAN);
+        if (panActionHeld)
         {
             // Panning mode
             if (kHeld & KEY_TOUCH)
@@ -3604,8 +5783,25 @@ int main(int argc, char **argv)
                         sessionAwaitingSnapshot = false;
                         sessionSnapshotDeadline = 0;
                         gDisconnectReason[0] = '\0';
-                        setAdminNotice(updateAvailable ? "RECONNECTED - UPDATE AVAILABLE" : "CONNECTED");
-                        topMode = supportOnlyMode ? TOP_MODE_TICKETS : TOP_MODE_CANVAS;
+                        const bool completedChannelSwitch =
+                            pendingChannelSwitch[0] &&
+                            strcmp(pendingChannelSwitch, canvas.channel) == 0;
+                        rememberSuccessfulChannel(canvas.channel);
+                        pendingChannelSwitch[0] = '\0';
+                        pendingChannelSwitchDeadline = 0;
+                        setAdminNotice(completedChannelSwitch ? "CHANNEL READY" :
+                                       (updateAvailable ? "RECONNECTED - UPDATE AVAILABLE" : "CONNECTED"));
+                        if (supportOnlyMode)
+                            topMode = TOP_MODE_TICKETS;
+                        else if (completedChannelSwitch)
+                        {
+                            if (routeStack.pop())
+                                topMode = routeStack.current();
+                            else
+                                topMode = TOP_MODE_MENU;
+                        }
+                        else
+                            topMode = TOP_MODE_CANVAS;
                         topRenderFrame = 10;
                         printf("Loaded WebSocket canvas %s.\n", canvas.channel);
                     }
@@ -3644,15 +5840,66 @@ int main(int argc, char **argv)
             topRenderFrame = 10;
             NetworkManager::reconnect();
         }
+        if (pendingChannelSwitch[0] && pendingChannelSwitchDeadline > 0 &&
+            osGetTime() >= pendingChannelSwitchDeadline)
+        {
+            pendingChannelSwitch[0] = '\0';
+            pendingChannelSwitchDeadline = 0;
+            setAdminNotice("CHANNEL SWITCH TIMED OUT");
+            topMode = TOP_MODE_CHANNELS;
+            topRenderFrame = 10;
+        }
 
         // Rendering
+        if (topMode == TOP_MODE_STATUS || gDisconnectReason[0])
+            routeStack.showOverlay(UI_OVERLAY_DISCONNECTED);
+        else if (confirmClearCanvas || confirmPaletteReset || confirmExit ||
+                 adminRectAwaitingConfirm ||
+                 moderationConfirmation || rotateBackupConfirmation ||
+                 optionsBindingConflict || ticketDraftPreview || ticketReplyPreview)
+            routeStack.showOverlay(UI_OVERLAY_CONFIRMATION);
+        else if (restrictionActive)
+            routeStack.showOverlay(UI_OVERLAY_RESTRICTED);
+        else
+            routeStack.clearOverlay();
+
+        if (topMode != TOP_MODE_STATUS && routeStack.current() != topMode)
+        {
+            if (topMode == TOP_MODE_CANVAS)
+                routeStack.reset(TOP_MODE_CANVAS);
+            else
+                routeStack.replace(topMode);
+        }
+        UiRouteEntry &routeState = routeStack.state();
+        if (topMode == TOP_MODE_MENU)
+            routeState.focus = selectedMenuItem;
+        else if (topMode == TOP_MODE_CHANNELS)
+            routeState.focus = selectedChannel;
+        else if (topMode == TOP_MODE_USERS)
+        {
+            routeState.focus = selectedPerson;
+            routeState.scroll = peopleScroll;
+            routeState.tab = peopleAllChannels ? 1 : 0;
+        }
+        else if (topMode == TOP_MODE_TICKETS)
+        {
+            routeState.focus = ticketView == 0 ? ticketHomeSelected : ticketSelected;
+            routeState.tab = ticketView;
+        }
+        else if (topMode == TOP_MODE_OPTIONS)
+        {
+            routeState.focus = optionsSelected;
+            routeState.tab = optionsPage;
+        }
+
         canvas.offsetX = offsetX;
         canvas.offsetY = offsetY;
         bool canvasWasDirty = canvas.dirty.valid;
         Renderer::renderViewport(canvas, buffer, fbWidth, fbHeight, false);
         if (zoomOverlayActive)
             drawZoomOverlay(buffer, fbWidth, fbHeight, zoomOverlayLeft);
-        if (pendingAdminRectTool != ADMIN_RECT_NONE && adminRectDragging)
+        if (pendingAdminRectTool != ADMIN_RECT_NONE &&
+            (adminRectDragging || adminRectAwaitingConfirm))
         {
             int startScreenX = (int)((adminRectStartX - canvas.offsetX) * canvas.zoomScale());
             int startScreenY = (int)((adminRectStartY - canvas.offsetY) * canvas.zoomScale());
@@ -3666,8 +5913,13 @@ int main(int argc, char **argv)
             {
                 drawRectOutline(buffer, fbWidth, fbHeight, rectX, rectY, rectMaxX - rectX + 1, rectMaxY - rectY + 1, 24, 33, 38);
                 if (rectMaxX - rectX > 4 && rectMaxY - rectY > 4)
+                {
+                    const u8 previewR = pendingAdminRectTool == ADMIN_RECT_ERASE ? 196 : currentColor.r;
+                    const u8 previewG = pendingAdminRectTool == ADMIN_RECT_ERASE ? 61 : currentColor.g;
+                    const u8 previewB = pendingAdminRectTool == ADMIN_RECT_ERASE ? 61 : currentColor.b;
                     drawRectOutline(buffer, fbWidth, fbHeight, rectX + 2, rectY + 2, rectMaxX - rectX - 3, rectMaxY - rectY - 3,
-                                    currentColor.r, currentColor.g, currentColor.b);
+                                    previewR, previewG, previewB);
+                }
             }
         }
         drawActiveDrawLabels(buffer, fbWidth, fbHeight, canvas, activeDrawLabels);
@@ -3678,26 +5930,17 @@ int main(int argc, char **argv)
                 snprintf(remaining, sizeof(remaining), "MUTED - %02d:%02d:%02d LEFT", restrictionSecondsRemaining / 3600, (restrictionSecondsRemaining / 60) % 60, restrictionSecondsRemaining % 60);
             else
                 snprintf(remaining, sizeof(remaining), "MUTED - NO AUTOMATIC EXPIRATION");
-            fillRect(buffer, fbWidth, fbHeight, 18, 16, 284, 54, 248, 250, 251);
-            drawRectOutline(buffer, fbWidth, fbHeight, 18, 16, 284, 54, 196, 92, 40);
-            drawMiniText(buffer, fbWidth, fbHeight, 28, 28, remaining, 196, 61, 61);
-            char compactReason[43];
-            snprintf(compactReason, sizeof(compactReason), "%.42s", restrictionReason);
-            drawMiniText(buffer, fbWidth, fbHeight, 28, 48, compactReason, 32, 36, 42);
-        }
-        if (gDisconnectReason[0])
-        {
-            fillRect(buffer, fbWidth, fbHeight, 28, 74, 264, 88, 248, 250, 251);
-            drawRectOutline(buffer, fbWidth, fbHeight, 28, 74, 264, 88, 196, 204, 212);
-            drawMiniText(buffer, fbWidth, fbHeight, 48, 92, "DISCONNECTED", 196, 61, 61);
-            drawMiniText(buffer, fbWidth, fbHeight, 48, 110, gDisconnectReason, 32, 36, 42);
-            drawMiniText(buffer, fbWidth, fbHeight, 48, 136, "A RECONNECT   B MENU", 13, 122, 117);
+            UiCanvas restrictedUi(buffer, fbWidth, fbHeight, UI_BUFFER_3DS_ROTATED_BGR);
+            UiComponents::panel(restrictedUi, UiRect(12, 12, 296, 62), true);
+            restrictedUi.stroke(UiRect(12, 12, 296, 62), UiTheme::Warning, 2);
+            restrictedUi.textClipped(24, 24, remaining, UiTheme::Danger, 272);
+            restrictedUi.textClipped(24, 46, restrictionReason, UiTheme::Secondary, 272);
         }
         canvas.clearDirty();
 
         bool activelyDrawing = !UIState::isColorPickerActive() &&
                                topMode == TOP_MODE_CANVAS &&
-                               !(kHeld & (KEY_DLEFT | KEY_A)) &&
+                               !panActionHeld &&
                                (kHeld & KEY_TOUCH);
         topRenderFrame++;
         if (identityNoticeFrames > 0)
@@ -3710,7 +5953,10 @@ int main(int argc, char **argv)
         {
             adminNoticeFrames--;
             if (adminNoticeFrames == 0)
+            {
+                adminNoticeExpiresAt = 0;
                 topRenderFrame = 10;
+            }
         }
         if (ticketNoticeFrames > 0)
         {
@@ -3723,6 +5969,33 @@ int main(int argc, char **argv)
             bool renderStaffScope = ticketView == 0 ? isModOrAdmin() : ticketStaffScope;
             int renderedOpenCount = isModOrAdmin() ? ticketStaffNeedsReply : 0;
             const char *renderedIdentityStatus = restrictionActive ? (supportOnlyMode ? "banned" : "muted") : identityInfo.status;
+            char bindingLabels[Doodle::INPUT_ACTION_COUNT][36];
+            RendererTopState rendererState;
+            memset(&rendererState, 0, sizeof(rendererState));
+            rendererState.peopleSelected = selectedPerson;
+            rendererState.peopleAllChannels = peopleAllChannels;
+            rendererState.presenceTotal = connectedPresenceInfo.total;
+            rendererState.presenceTruncated = connectedPresenceInfo.truncated;
+            rendererState.channelInfo = availableChannelInfo;
+            rendererState.channelInfoCount = availableChannelCount;
+            rendererState.backupCodeRevealed = backupCodeRevealed;
+            rendererState.needsDisplayName = gNeedsDisplayName;
+            rendererState.pageSelected = topMode == TOP_MODE_STAFF_CENTER
+                                             ? selectedAdminItem
+                                             : (optionsPage == 0 ? optionsSelected :
+                                                std::max(0, optionsPage - 1));
+            rendererState.controlPreset =
+                Doodle::controlPresetLabel(gClientSettings.controlPreset);
+            for (int action = 0; action < Doodle::INPUT_ACTION_COUNT; ++action)
+            {
+                const Doodle::ActionBinding &binding = gClientSettings.bindings.action[action];
+                snprintf(bindingLabels[action], sizeof(bindingLabels[action]), "%s%s%s",
+                         Doodle::buttonLabel(binding.button[0]),
+                         binding.button[1] == Doodle::BUTTON_NONE ? "" : " / ",
+                         binding.button[1] == Doodle::BUTTON_NONE ? "" :
+                         Doodle::buttonLabel(binding.button[1]));
+                rendererState.controlBindings[action] = bindingLabels[action];
+            }
             Renderer::renderTop(canvas, NetworkManager::isConnected(), updateAvailable, currentColor,
                                 currentBrushSize, currentBrushShape, topMode,
                                 availableChannels, availableChannelCount, selectedChannel,
@@ -3744,7 +6017,7 @@ int main(int argc, char **argv)
                                 ticketNoticeFrames > 0 ? ticketNotice : "", renderedOpenCount,
                                 isModOrAdmin() ? staffChatUnread : 0,
                                 restrictionSecondsRemaining, restrictionHasDuration,
-                                restrictionReason);
+                                restrictionReason, &rendererState);
             if (topMode == TOP_MODE_RULES)
                 rulesRenderedSinceKeyboard = true;
             topRenderFrame = 0;
@@ -3758,17 +6031,199 @@ int main(int argc, char **argv)
         {
             if (!isModOrAdmin() && pickerTab == 1)
                 pickerTab = 0;
-            drawToolPalette(fb, fbWidth, fbHeight, pickerTab, isModOrAdmin(), currentColor,
+            drawToolPalette(fb, fbWidth, fbHeight, pickerTab, pickerFocus,
+                            isModOrAdmin(), currentColor,
                             adminNoticeFrames > 0 ? adminNotice : "");
         }
-
-        if (!UIState::isColorPickerActive())
+        else if (topMode == TOP_MODE_CANVAS)
             UIInterface::drawCurrentSelection(fb, fbWidth, fbHeight, currentColor);
+        else
+        {
+            BottomUiViewModel bottomView;
+            memset(&bottomView, 0, sizeof(bottomView));
+            bottomView.mode = topMode;
+            bottomView.staff = isModOrAdmin();
+            bottomView.admin = strcmp(identityInfo.role, "admin") == 0;
+            bottomView.menuSelected = selectedMenuItem;
+            bottomView.channels = availableChannels;
+            bottomView.channelInfo = availableChannelInfo;
+            bottomView.channelCount = availableChannelCount;
+            bottomView.channelSelected = selectedChannel;
+            bottomView.currentChannel = canvas.channel;
+            bottomView.users = connectedUsers;
+            bottomView.userCount = connectedUserCount;
+            bottomView.personSelected = selectedPerson;
+            bottomView.peopleScroll = peopleScroll;
+            bottomView.peopleAllChannels = peopleAllChannels;
+            bottomView.peopleActionMode = peopleActionMode;
+            bottomView.reportUserSelectionMode = reportUserSelectionMode;
+            bottomView.peopleActionSelected = peopleActionSelected;
+            bottomView.viewerDisplayName = identityInfo.displayName;
+            bottomView.viewerUsername = identityInfo.username;
+            bottomView.staffSelected = selectedAdminItem;
+            bottomView.optionsPage = optionsPage;
+            bottomView.optionsSelected = optionsSelected;
+            bottomView.optionsBindingSlot = optionsBindingSlot;
+            bottomView.optionsBindingCapture = optionsBindingCapture;
+            bottomView.optionsBindingConflict = optionsBindingConflict;
+            bottomView.settings = &gClientSettings;
+            bottomView.ticketView = ticketView;
+            bottomView.ticketHomeSelected = ticketHomeSelected;
+            bottomView.ticketStaffScope = ticketStaffScope;
+            bottomView.supportOnly = supportOnlyMode;
+            bottomView.tickets = ticketList;
+            bottomView.ticketCount = ticketListCount;
+            bottomView.ticketSelected = ticketSelected;
+            bottomView.ticketActionSelected = ticketActionSelected;
+            bottomView.ticketHasNext = ticketView == 4
+                                           ? staffChatNextBeforeId > 0
+                                           : ticketNextCursor.id > 0;
+            bottomView.ticketHasPrevious = ticketCursorHistoryCount > 0;
+            bottomView.ticketActiveIsUnban =
+                strcmp(activeTicket.category, "unban") == 0;
+            bottomView.backupCodeRevealed = backupCodeRevealed;
+            bottomView.profileSelected = profileSelected;
+            bottomView.needsDisplayName = gNeedsDisplayName;
+            bottomView.needsRules = gNeedsRules;
+            bottomView.notice = gDisconnectReason[0] ? gDisconnectReason :
+                                (adminNoticeFrames > 0 ? adminNotice : "");
+            drawBottomRoute(fb, fbWidth, fbHeight, bottomView);
+        }
+
+        UiCanvas overlayUi(fb, fbWidth, fbHeight, UI_BUFFER_3DS_ROTATED_BGR);
+        if (adminNoticeFrames > 0 && adminNotice[0] &&
+            !UIState::isColorPickerActive() &&
+            !confirmClearCanvas && !confirmPaletteReset && !confirmExit &&
+            !adminRectAwaitingConfirm &&
+            !moderationConfirmation && !rotateBackupConfirmation &&
+            !optionsBindingConflict && !ticketDraftPreview &&
+            !ticketReplyPreview && !gDisconnectReason[0])
+        {
+            UiComponents::toast(overlayUi, adminNotice, UiTheme::Accent);
+        }
+        if (gDisconnectReason[0])
+            UiComponents::modal(overlayUi, "Connection",
+                                gDisconnectReason, "A Reconnect", "B Menu");
+        else if (confirmExit)
+            UiComponents::modal(
+                overlayUi, "Exit Collab Doodle?",
+                "You will disconnect from the current channel. Device settings and saved palette colors will be kept.",
+                "A Exit", "B Stay", true);
+        else if (confirmClearCanvas)
+            UiComponents::modal(overlayUi, "Clear channel?",
+                                "Every pixel in this channel will be erased. This cannot be undone.",
+                                "A Clear", "B Cancel", true);
+        else if (confirmPaletteReset)
+            UiComponents::modal(
+                overlayUi, "Reset palette?",
+                "All eight saved swatches will return to their defaults. Your current drawing color will not change.",
+                "A Reset", "B Cancel", true);
+        else if (pendingAdminRectTool != ADMIN_RECT_NONE && adminRectAwaitingConfirm)
+        {
+            UiComponents::button(
+                overlayUi, UiRect(8, 198, 148, 36),
+                pendingAdminRectTool == ADMIN_RECT_ERASE ? "A Erase area" :
+                                                           "A Fill area",
+                true, pendingAdminRectTool == ADMIN_RECT_ERASE);
+            UiComponents::button(overlayUi, UiRect(164, 198, 148, 36),
+                                 "B Cancel", false, false, false);
+        }
+        else if (optionsBindingConflict)
+        {
+            char conflictText[120];
+            snprintf(conflictText, sizeof(conflictText),
+                     "%s is already assigned to %s. Swap the two bindings?",
+                     Doodle::buttonLabel(pendingBindingButton),
+                     Doodle::inputActionLabel(pendingBindingConflict.action));
+            UiComponents::modal(overlayUi, "Binding conflict", conflictText,
+                                "A Swap", "B Cancel");
+        }
+        else if (rotateBackupConfirmation)
+            UiComponents::modal(overlayUi, "Rotate recovery code?",
+                                "The previous recovery code becomes invalid immediately.",
+                                "A Rotate", "B Cancel", true);
+        else if (moderationConfirmation)
+        {
+            const char *actionLabel =
+                strcmp(pendingModerationAction, "mute") == 0 ? "Mute 30m" :
+                strcmp(pendingModerationAction, "unmute") == 0 ? "Unmute" :
+                strcmp(pendingModerationAction, "ban") == 0 ? "Ban" : "Kick";
+            char moderationTitle[80];
+            char moderationText[180];
+            snprintf(moderationTitle, sizeof(moderationTitle), "Confirm %s?",
+                     actionLabel);
+            snprintf(moderationText, sizeof(moderationText),
+                     "User: %.24s\nAccount: %.39s\nReason: %s",
+                     pendingModerationTargetName[0] ?
+                         pendingModerationTargetName : "Selected user",
+                     pendingModerationIdentity,
+                     pendingModerationReason[0] ? pendingModerationReason :
+                                                  "No reason entered");
+            UiComponents::modal(
+                overlayUi, moderationTitle, moderationText,
+                "A Apply", "B Cancel",
+                strcmp(pendingModerationAction, "unmute") != 0);
+        }
+        else if (ticketDraftPreview)
+        {
+            overlayUi.fill(UiRect(0, 0, 320, 240), UiTheme::Background);
+            UiComponents::panel(overlayUi, UiRect(8, 8, 304, 184), true);
+            overlayUi.stroke(UiRect(8, 8, 304, 184), UiTheme::Accent, 2);
+            overlayUi.text(20, 20, "Review request", UiTheme::Ink, 2);
+            UiComponents::badge(overlayUi, UiRect(220, 18, 80, 20),
+                                ticketDraftCategory, UiTheme::Accent);
+            overlayUi.text(20, 48, "Subject", UiTheme::Secondary);
+            overlayUi.wrappedText(20, 62, ticketDraftSubject,
+                                  UiTheme::Ink, 280, 2, 10);
+            overlayUi.text(20, 84, "Details", UiTheme::Secondary);
+            overlayUi.wrappedText(20, 98, ticketDraftDetails,
+                                  UiTheme::Ink, 280, 8, 11);
+            UiComponents::button(overlayUi, UiRect(8, 200, 148, 34),
+                                 "A Send", true);
+            UiComponents::button(overlayUi, UiRect(164, 200, 148, 34),
+                                 "B Edit", false, false, false);
+        }
+        else if (ticketReplyPreview)
+        {
+            overlayUi.fill(UiRect(0, 0, 320, 240), UiTheme::Background);
+            UiComponents::panel(overlayUi, UiRect(8, 8, 304, 184), true);
+            overlayUi.stroke(UiRect(8, 8, 304, 184), UiTheme::Accent, 2);
+            overlayUi.text(20, 20, "Review reply", UiTheme::Ink, 2);
+            overlayUi.text(20, 52, "Message", UiTheme::Secondary);
+            overlayUi.wrappedText(20, 68, ticketReplyDraft,
+                                  UiTheme::Ink, 280, 10, 11);
+            UiComponents::button(overlayUi, UiRect(8, 200, 148, 34),
+                                 "A Send", true);
+            UiComponents::button(overlayUi, UiRect(164, 200, 148, 34),
+                                 "B Edit", false, false, false);
+        }
+        else if (recoveryCodeExplanation)
+        {
+            overlayUi.fill(UiRect(0, 0, 320, 240), UiTheme::Background);
+            UiComponents::panel(overlayUi, UiRect(12, 18, 296, 154), true);
+            overlayUi.stroke(UiRect(12, 18, 296, 154),
+                             UiTheme::Accent, 2);
+            overlayUi.text(24, 32, "Save your recovery code",
+                           UiTheme::Ink, 2);
+            overlayUi.textClipped(
+                24, 66,
+                identityInfo.backupCode[0] ? identityInfo.backupCode :
+                                             gIdentity.backupCode,
+                UiTheme::Accent, 272, 2);
+            overlayUi.wrappedText(
+                24, 96,
+                "Write this down and keep it private. It is required to recover this account on another device.",
+                UiTheme::Secondary, 272, 5, 11);
+            UiComponents::button(overlayUi, UiRect(24, 186, 272, 40),
+                                 "A Continue", true);
+        }
 
         gfxFlushBuffers();
         gfxSwapBuffers();
     }
 
+    if (clientSettingsDirty)
+        flushClientSettings();
     NetworkManager::disconnect();
     free(buffer);
     aptUnhook(&aptCookie);

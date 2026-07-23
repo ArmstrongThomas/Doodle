@@ -39,7 +39,7 @@ DATA		:=	data
 INCLUDES	:=	include vendor/mbedtls/include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_VERSION	?=	1.5.0
+APP_VERSION	?=	1.6.0
 CHAT_ENABLED	?=	0
 TEST_MODE	?=	0
 LOCAL_SERVER_HOST	?=	192.168.1.46
@@ -283,7 +283,7 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean cia verify-release-config FORCE
+.PHONY: all clean cia host-tests verify-release-config FORCE
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(CONFIG_STAMP) $(ROMFS_T3XFILES) $(T3XHFILES)
@@ -306,6 +306,22 @@ verify-release-config: all
 	@grep -Fqx 'SERVER_HTTPS_PORT=$(LIVE_SERVER_HTTPS_PORT)' "$(CONFIG_STAMP)"
 	@$(DEVKITARM)/bin/arm-none-eabi-strings "$(OUTPUT).elf" | grep -Fq 'DoodleBuildConfig:test=0;updater=1;ws_secure=1;ws=$(LIVE_SERVER_HOST):$(LIVE_SERVER_WS_PORT)$(LIVE_SERVER_WS_PATH);https=$(LIVE_SERVER_HOST):$(LIVE_SERVER_HTTPS_PORT)'
 	@echo "verified release config: updater enabled; WSS $(LIVE_SERVER_HOST):$(LIVE_SERVER_WS_PORT)$(LIVE_SERVER_WS_PATH)"
+
+ifeq ($(OS),Windows_NT)
+host-tests:
+	@powershell -ExecutionPolicy Bypass -File "$(WIN_CURDIR)\scripts\run-host-tests.ps1" -ProjectRoot "$(WIN_CURDIR)"
+else
+HOST_CXX ?= c++
+HOST_TEST_BINARY := $(BUILD)/host-tests/client_fixture_tests
+HOST_TEST_SOURCES := tests/client_fixture_tests.cpp source/client_settings.cpp source/input_bindings.cpp source/protocol.cpp source/ui_canvas.cpp source/ui_route.cpp
+
+host-tests:
+	@mkdir -p "$(BUILD)/host-tests"
+	@$(HOST_CXX) -std=c++11 -Wall -Wextra -pedantic \
+		-Itests/stubs -Iinclude -include tests/stubs/host_compat.h \
+		$(HOST_TEST_SOURCES) -o "$(HOST_TEST_BINARY)"
+	@"$(HOST_TEST_BINARY)"
+endif
 
 cia:
 	@powershell -ExecutionPolicy Bypass -File "$(WIN_CURDIR)\scripts\build-cia.ps1" -ProjectRoot "$(WIN_CURDIR)" -AppVersion "$(APP_VERSION)" -TestMode $(TEST_MODE) -AppTitle "$(APP_TITLE)" -AppDescription "$(APP_DESCRIPTION)" -AppAuthor "$(APP_AUTHOR)"
