@@ -79,6 +79,27 @@ static bool parseInteger(const char *text, long minimum, long maximum, long &val
     return true;
 }
 
+static bool parseBrushSizeTenths(const char *text, int &value)
+{
+    if (!text || !*text)
+        return false;
+
+    errno = 0;
+    char *end = NULL;
+    double parsed = strtod(text, &end);
+    if (errno != 0 || !end || *end != '\0' ||
+        parsed != parsed ||
+        parsed < 1.0 || parsed > 12.0)
+        return false;
+
+    int tenths = (int)(parsed * 10.0 + 0.5);
+    if (tenths < CLIENT_BRUSH_SIZE_MIN_TENTHS ||
+        tenths > CLIENT_BRUSH_SIZE_MAX_TENTHS)
+        return false;
+    value = tenths;
+    return true;
+}
+
 static int hexValue(char value)
 {
     if (value >= '0' && value <= '9')
@@ -322,9 +343,9 @@ static bool parseSettingsFile(const char *path, ClientSettings &settings)
         }
         else if (asciiEqualIgnoreCase(key, "brush_size"))
         {
-            long size = 0;
-            if (parseInteger(value, 1, 12, size))
-                settings.brushSize = (int)size;
+            int sizeTenths = 0;
+            if (parseBrushSizeTenths(value, sizeTenths))
+                settings.brushSizeTenths = sizeTenths;
         }
         else if (asciiEqualIgnoreCase(key, "solid_color"))
         {
@@ -404,7 +425,12 @@ static bool writeSettingsFile(const char *path, const ClientSettings &settings)
                        settings.lastSuccessfulChannel) >= 0;
     ok = ok && fprintf(file, "brush_shape=%s\n",
                        clientBrushShapeToken(settings.brushShape)) >= 0;
-    ok = ok && fprintf(file, "brush_size=%d\n", settings.brushSize) >= 0;
+    if (settings.brushSizeTenths % 10 == 0)
+        ok = ok && fprintf(file, "brush_size=%d\n", settings.brushSizeTenths / 10) >= 0;
+    else
+        ok = ok && fprintf(file, "brush_size=%d.%d\n",
+                           settings.brushSizeTenths / 10,
+                           settings.brushSizeTenths % 10) >= 0;
     ok = ok && fprintf(file, "solid_color=#%02X%02X%02X\n",
                        settings.solidColor.r, settings.solidColor.g,
                        settings.solidColor.b) >= 0;
@@ -568,7 +594,7 @@ void resetClientSettings(ClientSettings &settings)
     settings.zoomOverlaySide = ZOOM_OVERLAY_AUTO;
     settings.lastSuccessfulChannel[0] = '\0';
     settings.brushShape = CLIENT_BRUSH_CIRCLE;
-    settings.brushSize = 1;
+    settings.brushSizeTenths = CLIENT_BRUSH_SIZE_MIN_TENTHS;
     settings.solidColor.r = 255;
     settings.solidColor.g = 0;
     settings.solidColor.b = 0;
@@ -636,7 +662,8 @@ bool clientSettingsAreValid(const ClientSettings &settings)
     if (settings.brushShape < CLIENT_BRUSH_CIRCLE ||
         settings.brushShape >= CLIENT_BRUSH_SHAPE_COUNT)
         return false;
-    if (settings.brushSize < 1 || settings.brushSize > 12)
+    if (settings.brushSizeTenths < CLIENT_BRUSH_SIZE_MIN_TENTHS ||
+        settings.brushSizeTenths > CLIENT_BRUSH_SIZE_MAX_TENTHS)
         return false;
     return true;
 }
@@ -649,7 +676,7 @@ bool clientSettingsEqual(const ClientSettings &left, const ClientSettings &right
         left.zoomOverlaySide != right.zoomOverlaySide ||
         strcmp(left.lastSuccessfulChannel, right.lastSuccessfulChannel) != 0 ||
         left.brushShape != right.brushShape ||
-        left.brushSize != right.brushSize ||
+        left.brushSizeTenths != right.brushSizeTenths ||
         !rgbEqual(left.solidColor, right.solidColor))
         return false;
 

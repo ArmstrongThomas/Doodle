@@ -697,7 +697,8 @@ void Protocol::buildHello(char *buffer, size_t size, const char *appId, const ch
     jsonSafeString(preferredChannel, safePreferredChannel, sizeof(safePreferredChannel));
 
     const char *capabilities =
-        "\"capabilities\":[\"ui2-channel-info\",\"ui2-presence-compact\",\"ui2-ticket-cursor\"]";
+        "\"capabilities\":[\"ui2-channel-info\",\"ui2-presence-compact\",\"ui2-ticket-cursor\","
+        "\"draw-size-tenths\"]";
     if (safePreferredChannel[0])
     {
         snprintf(buffer, size,

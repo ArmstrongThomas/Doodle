@@ -17,6 +17,14 @@ namespace UiTheme
     const UiColor White(245, 248, 250);
 }
 
+float UiGeometry::normalizedPositionClamped(int coordinate, int first, int last)
+{
+    if (last <= first)
+        return 0.0f;
+    coordinate = std::max(first, std::min(coordinate, last));
+    return (float)(coordinate - first) / (float)(last - first);
+}
+
 UiCanvas::UiCanvas(u8 *buffer, int storageWidth, int storageHeight, UiBufferLayout layout)
     : buffer_(buffer), storageWidth_(storageWidth), storageHeight_(storageHeight), layout_(layout)
 {

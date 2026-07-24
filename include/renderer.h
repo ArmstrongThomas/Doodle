@@ -42,7 +42,7 @@ class Renderer {
 public:
     static void renderViewport(CanvasState &canvas, u8 *buffer, int fbWidth, int fbHeight, bool forceFull);
     static void renderTop(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
-                          int brushSize, int brushShape, TopScreenMode mode,
+                          int brushSizeTenths, int brushShape, TopScreenMode mode,
                           char channels[][25], int channelCount, int selectedChannel,
                           int selectedMenuItem = 0, PresenceUser *users = NULL, int userCount = 0,
                           const char *displayName = "3DS User", const char *username = "unknown",

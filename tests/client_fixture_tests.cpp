@@ -170,7 +170,7 @@ void testSettingsRoundTripAndRecovery()
     CHECK(setLastSuccessfulChannel(first, "sketch"));
     first.zoomOverlaySide = ZOOM_OVERLAY_RIGHT;
     first.brushShape = CLIENT_BRUSH_DITHER;
-    first.brushSize = 7;
+    first.brushSizeTenths = 75;
     first.solidColor.r = 0x12;
     first.solidColor.g = 0x34;
     first.solidColor.b = 0x56;
@@ -191,7 +191,7 @@ void testSettingsRoundTripAndRecovery()
     second.palette[0].r = 7;
     second.palette[0].g = 8;
     second.palette[0].b = 9;
-    second.brushSize = 12;
+    second.brushSizeTenths = 120;
     CHECK(saveClientSettings(second, path) == SETTINGS_SAVE_OK);
     CHECK(fileExists("build/host-tests/settings-fixture.ini.bak"));
 
@@ -221,7 +221,7 @@ void testSettingsIndependentValidation()
         "zoom_side=left\n"
         "last_channel=contains a space\n"
         "brush_shape=dither\n"
-        "brush_size=99\n"
+        "brush_size=4.5\n"
         "solid_color=#12GG56\n"
         "palette.1=#010203\n"
         "palette.2=not-a-color\n"
@@ -234,14 +234,14 @@ void testSettingsIndependentValidation()
     CHECK(settings.zoomOverlaySide == ZOOM_OVERLAY_LEFT);
     CHECK(settings.lastSuccessfulChannel[0] == '\0');
     CHECK(settings.brushShape == CLIENT_BRUSH_DITHER);
-    CHECK(settings.brushSize == 1);
+    CHECK(settings.brushSizeTenths == 45);
     CHECK(sameColor(settings.solidColor, Rgb8{255, 0, 0}));
     CHECK(sameColor(settings.palette[0], Rgb8{1, 2, 3}));
     CHECK(sameColor(settings.palette[1], Rgb8{255, 255, 255}));
 
     // Invalid data is rejected before touching the valid primary.
     ClientSettings invalid = settings;
-    invalid.brushSize = 0;
+    invalid.brushSizeTenths = 0;
     CHECK(saveClientSettings(invalid, path) == SETTINGS_SAVE_INVALID);
     ClientSettings reloaded;
     CHECK(loadClientSettings(reloaded, path) == SETTINGS_LOAD_PRIMARY);
@@ -289,6 +289,13 @@ void testUiRectAndClipping()
     CHECK(!rect.contains(9, 20));
     CHECK(!rect.contains(40, 20));
     CHECK(!rect.contains(10, 60));
+
+    CHECK(UiGeometry::normalizedPositionClamped(4, 5, 15) == 0.0f);
+    CHECK(UiGeometry::normalizedPositionClamped(5, 5, 15) == 0.0f);
+    CHECK(UiGeometry::normalizedPositionClamped(10, 5, 15) == 0.5f);
+    CHECK(UiGeometry::normalizedPositionClamped(15, 5, 15) == 1.0f);
+    CHECK(UiGeometry::normalizedPositionClamped(16, 5, 15) == 1.0f);
+    CHECK(UiGeometry::normalizedPositionClamped(10, 15, 5) == 0.0f);
 
     CHECK(UiCanvas::textWidth("ABCD") == 24);
     CHECK(UiCanvas::fitTextScale("Connection", 260, 2) == 2);
@@ -353,6 +360,12 @@ void testRouteStack()
 void testProtocolAdditionsAndEscaping()
 {
     char command[1024];
+    Protocol::buildHello(
+        command, sizeof(command), "collab-doodle", "1.6.0", true,
+        "device", "secret", "hardware", "new-3ds-xl", "Doodler", "3dsx");
+    CHECK(strstr(command, "\"protocol\":6") != NULL);
+    CHECK(strstr(command, "\"draw-size-tenths\"") != NULL);
+
     Protocol::buildTicketCreate(
         command, sizeof(command), "report", "A \"quoted\" title",
         "line 1\nline 2 \\ path");

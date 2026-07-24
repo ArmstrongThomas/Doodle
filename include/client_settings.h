@@ -11,6 +11,8 @@ namespace Doodle
 static const unsigned int CLIENT_SETTINGS_VERSION = 1;
 static const int CLIENT_PALETTE_COLOR_COUNT = 8;
 static const int CLIENT_CHANNEL_CAPACITY = 25;
+static const int CLIENT_BRUSH_SIZE_MIN_TENTHS = 10;
+static const int CLIENT_BRUSH_SIZE_MAX_TENTHS = 120;
 
 struct Rgb8
 {
@@ -46,7 +48,7 @@ struct ClientSettings
     ZoomOverlaySide zoomOverlaySide;
     char lastSuccessfulChannel[CLIENT_CHANNEL_CAPACITY];
     ClientBrushShape brushShape;
-    int brushSize;
+    int brushSizeTenths;
     Rgb8 solidColor;
     Rgb8 palette[CLIENT_PALETTE_COLOR_COUNT];
 };

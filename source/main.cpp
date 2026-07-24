@@ -10,7 +10,6 @@
 #include <sstream>
 #include <math.h>
 #include <algorithm>
-#include <unordered_map>
 #include <sys/stat.h>
 #include <errno.h>
 #include "ui.h"
@@ -53,7 +52,7 @@ static const char gBuildConfiguration[] =
     ";https=" SERVER_HTTPS_HOST ":" SERVER_HTTPS_PORT;
 
 Color currentColor = {255, 0, 0}; // Red by default
-int currentBrushSize = 1;
+int currentBrushSizeTenths = Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS;
 int currentBrushShape = 0;
 static const int BRUSH_CIRCLE = 0;
 static const int BRUSH_SQUARE = 1;
@@ -436,7 +435,9 @@ static void rememberSuccessfulChannel(const char *channel)
         return;
     gClientSettings.brushShape = (Doodle::ClientBrushShape)std::max(
         0, std::min(currentBrushShape, (int)Doodle::CLIENT_BRUSH_SHAPE_COUNT - 1));
-    gClientSettings.brushSize = std::max(1, std::min(currentBrushSize, 12));
+    gClientSettings.brushSizeTenths = std::max(
+        Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS,
+        std::min(currentBrushSizeTenths, Doodle::CLIENT_BRUSH_SIZE_MAX_TENTHS));
     gClientSettings.solidColor.r = currentColor.r;
     gClientSettings.solidColor.g = currentColor.g;
     gClientSettings.solidColor.b = currentColor.b;
@@ -766,40 +767,6 @@ static HttpsUpdateAttempt offerHttpsUpdate(const char *packageType, const char *
 }
 #endif
 
-std::unordered_map<int, std::vector<float>> gaussianFalloffTables;
-
-std::vector<float> computeGaussianFalloff(int radius)
-{
-    float sigma = radius / 1.5f; // Adjust softness (larger = softer)
-    float twoSigmaSquared = 2.0f * sigma * sigma;
-
-    int diameter = 2 * radius + 1;
-    std::vector<float> table(diameter * diameter, 0.0f);
-
-    for (int y = -radius; y <= radius; y++)
-    {
-        for (int x = -radius; x <= radius; x++)
-        {
-            float distanceSquared = x * x + y * y;
-            if (distanceSquared <= radius * radius)
-            {
-                table[(y + radius) * diameter + (x + radius)] = exp(-distanceSquared / twoSigmaSquared);
-            }
-        }
-    }
-
-    return table;
-}
-
-void initializeGaussianFalloff(const std::vector<int> &brushSizes)
-{
-    for (int size : brushSizes)
-    {
-        int radius = size / 2;
-        gaussianFalloffTables[size] = computeGaussianFalloff(radius);
-    }
-}
-
 void writeColor(u8 *buffer, int idx, u8 r, u8 g, u8 b)
 {
     buffer[idx] = b;
@@ -870,19 +837,21 @@ static bool pointInRect(int px, int py, int x, int y, int w, int h)
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
-static int brushSizeForShapeRow(int shape, int row)
+static int clampBrushSizeTenths(int sizeTenths)
 {
-    static const int normalSizes[] = {1, 2, 3, 5, 7};
-    static const int largeSizes[] = {3, 5, 7, 9, 12};
-    row = std::max(0, std::min(4, row));
-    return (shape == BRUSH_DITHER || shape == BRUSH_ERASER) ? largeSizes[row] : normalSizes[row];
+    return std::max(Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS,
+                    std::min(sizeTenths, Doodle::CLIENT_BRUSH_SIZE_MAX_TENTHS));
 }
 
-static int clampBrushSizeForShape(int shape, int size)
+static int brushDirtyRadius(int sizeTenths)
 {
-    if (shape == BRUSH_DITHER || shape == BRUSH_ERASER)
-        return std::max(3, std::min(12, size));
-    return std::max(1, std::min(7, size));
+    return std::max(1, (clampBrushSizeTenths(sizeTenths) + 19) / 20);
+}
+
+static int clampRenderedBrushSizeTenths(int sizeTenths)
+{
+    return std::max(Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS,
+                    std::min(sizeTenths, 310));
 }
 
 void drawPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight, int x, int y, u8 r, u8 g, u8 b)
@@ -954,7 +923,8 @@ u8 clampColor(float colorValue)
     return static_cast<u8>(std::max(0.0f, std::min(255.0f, colorValue)));
 }
 
-void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, int size, int shape, u8 r, u8 g, u8 b)
+static bool brushContainsPixelAtWholeSize(int centerX, int centerY,
+                                         int x, int y, int size, int shape)
 {
     static const int bayer4[4][4] = {
         {0, 8, 2, 10},
@@ -962,33 +932,55 @@ void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY, 
         {3, 11, 1, 9},
         {15, 7, 13, 5},
     };
-    int radius = std::max(1, size / 2);
-    for (int y = -size / 2; y <= size / 2; y++)
+    const int extent = size / 2;
+    if (abs(x) > extent || abs(y) > extent)
+        return false;
+
+    if (shape == BRUSH_SQUARE)
+        return true;
+
+    const int radius = shape == BRUSH_DITHER ? std::max(1, extent) : extent;
+    const int dist2 = x * x + y * y;
+    if (dist2 > radius * radius)
+        return false;
+    if (shape != BRUSH_DITHER)
+        return true;
+
+    const float dist = sqrtf((float)dist2);
+    const float coverage = 1.0f - (dist / (float)(radius + 1));
+    const int threshold = bayer4[(centerY + y) & 3][(centerX + x) & 3];
+    return (int)(coverage * 16.0f) > threshold;
+}
+
+void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY,
+               int sizeTenths, int shape, u8 r, u8 g, u8 b)
+{
+    static const int bayer4[4][4] = {
+        {0, 8, 2, 10},
+        {12, 4, 14, 6},
+        {3, 11, 1, 9},
+        {15, 7, 13, 5},
+    };
+    sizeTenths = clampRenderedBrushSizeTenths(sizeTenths);
+    const int lowerSize = sizeTenths / 10;
+    const int fraction = sizeTenths % 10;
+    const int upperSize = std::min(31, lowerSize + (fraction ? 1 : 0));
+    const int extent = upperSize / 2;
+
+    for (int y = -extent; y <= extent; y++)
     {
-        for (int x = -size / 2; x <= size / 2; x++)
+        for (int x = -extent; x <= extent; x++)
         {
-            if (shape == 0)
-            { // Circle
-                if (x * x + y * y <= (size / 2) * (size / 2))
-                {
-                    drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
-                }
-            }
-            else if (shape == 1)
-            { // Square
-                drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
-            }
-            else if (shape == 2)
-            {
-                int dist2 = x * x + y * y;
-                if (dist2 > radius * radius)
-                    continue;
-                float dist = sqrtf((float)dist2);
-                float coverage = 1.0f - (dist / (float)(radius + 1));
-                int threshold = bayer4[(centerY + y) & 3][(centerX + x) & 3];
-                if ((int)(coverage * 16.0f) > threshold)
-                    drawPointOnBuffer(buffer, fbWidth, fbHeight, centerX + x, centerY + y, r, g, b);
-            }
+            const bool lowerContains =
+                brushContainsPixelAtWholeSize(centerX, centerY, x, y, lowerSize, shape);
+            const bool upperContains = fraction > 0 &&
+                brushContainsPixelAtWholeSize(centerX, centerY, x, y, upperSize, shape);
+            const int transitionThreshold =
+                (bayer4[(centerY + y) & 3][(centerX + x) & 3] * 10) / 16;
+            if (lowerContains ||
+                (upperContains && !lowerContains && transitionThreshold < fraction))
+                drawPointOnBuffer(buffer, fbWidth, fbHeight,
+                                  centerX + x, centerY + y, r, g, b);
         }
     }
 }
@@ -1003,9 +995,9 @@ static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
 
     Color drawColor = effectiveDrawColor();
     drawBrush(fullCanvas, canvasWidth, canvasHeight, canvasX, canvasY,
-              currentBrushSize, effectiveBrushShape(),
+              currentBrushSizeTenths, effectiveBrushShape(),
               drawColor.r, drawColor.g, drawColor.b);
-    canvas.markDirty(canvasX, canvasY, currentBrushSize);
+    canvas.markDirty(canvasX, canvasY, brushDirtyRadius(currentBrushSizeTenths));
     UIState::addPoint(canvasX, canvasY);
 }
 
@@ -1028,9 +1020,9 @@ static void drawStrokeLine(u8 *fullCanvas, int canvasWidth, int canvasHeight,
             continue;
         Color drawColor = effectiveDrawColor();
         drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
-                  currentBrushSize, effectiveBrushShape(),
+                  currentBrushSizeTenths, effectiveBrushShape(),
                   drawColor.r, drawColor.g, drawColor.b);
-        canvas.markDirty(x, y, currentBrushSize);
+        canvas.markDirty(x, y, brushDirtyRadius(currentBrushSizeTenths));
         UIState::addPoint(x, y);
     }
 }
@@ -1058,9 +1050,9 @@ static void drawStrokeCurve(u8 *fullCanvas, int canvasWidth, int canvasHeight,
             continue;
         Color drawColor = effectiveDrawColor();
         drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
-                  currentBrushSize, effectiveBrushShape(),
+                  currentBrushSizeTenths, effectiveBrushShape(),
                   drawColor.r, drawColor.g, drawColor.b);
-        canvas.markDirty(x, y, currentBrushSize);
+        canvas.markDirty(x, y, brushDirtyRadius(currentBrushSizeTenths));
         UIState::addPoint(x, y);
     }
 }
@@ -1074,7 +1066,7 @@ void processDrawPacket(const uint8_t *packet, size_t length, u8 *buffer, int fbW
     uint8_t r = packet[1];
     uint8_t g = packet[2];
     uint8_t b = packet[3];
-    uint8_t size = packet[4];
+    int sizeTenths = packet[0] == 4 ? packet[4] : packet[4] * 10;
     uint8_t shape = packet[5];
     uint8_t numPoints = packet[6];
 
@@ -1097,7 +1089,8 @@ void processDrawPacket(const uint8_t *packet, size_t length, u8 *buffer, int fbW
                 float t = (steps == 0) ? 0.0f : static_cast<float>(j) / steps;
                 int drawX = prevX + (x - prevX) * t;
                 int drawY = prevY + (y - prevY) * t;
-                drawBrush(fullCanvas, canvasWidth, canvasHeight, drawX, drawY, size, shape, r, g, b);
+                drawBrush(fullCanvas, canvasWidth, canvasHeight, drawX, drawY,
+                          sizeTenths, shape, r, g, b);
             }
         }
 
@@ -1187,7 +1180,7 @@ static bool processBinaryCanvasPackets(const uint8_t *packets, size_t length, Ca
     if (!packets || length == 0)
         return false;
     uint8_t type = packets[0];
-    if (type == 1)
+    if (type == 1 || type == 4)
     {
         if (length < 7 || length != 7 + (size_t)packets[6] * 4)
             return false;
@@ -1238,52 +1231,8 @@ static void drawActiveDrawLabels(u8 *buffer, int fbWidth, int fbHeight, CanvasSt
     }
 }
 
-void drawBrushSizeSelector(u8 *framebuffer, int screenWidth, int screenHeight)
-{
-    std::vector<int> brushSizes = {1, 2, 3, 5, 7, 9, 12};
-    std::vector<int> brushPositions = {24, 46, 68, 90, 112, 134, 156};
-
-    for (size_t i = 0; i < brushSizes.size(); i++)
-    {
-        int size = brushSizes[i];
-        int y = brushPositions[i];
-
-        // Draw circular brush
-        int x = screenWidth - 40;
-        drawBrush(framebuffer, screenWidth, screenHeight, x, y, size, 0, 0, 0, 0);
-
-        // Draw square brush
-        int squareX = screenWidth - 70;
-        drawBrush(framebuffer, screenWidth, screenHeight, squareX, y, size, 1, 0, 0, 0);
-
-        // Draw antialiased circular brush
-        int antialiasedX = screenWidth - 100;
-        drawBrush(framebuffer, screenWidth, screenHeight, antialiasedX, y, size, 2, 0, 0, 0);
-
-        // Highlight the selected brush size and shape
-        if (currentBrushSize == size)
-        {
-            int highlightX = (currentBrushShape == 0) ? x : (currentBrushShape == 1) ? squareX
-                                                                                     : antialiasedX;
-            int highlightY = y;
-            for (int angle = 0; angle < 360; angle++)
-            {
-                float rad = angle * M_PI / 180.0f;
-                int px = highlightX + 12 * cos(rad);
-                int py = highlightY + 12 * sin(rad);
-                if (px >= 0 && px < screenWidth && py >= 0 && py < screenHeight)
-                {
-                    int idx = 3 * (px + py * screenWidth);
-                    framebuffer[idx] = 255; // Yellow border
-                    framebuffer[idx + 1] = 255;
-                    framebuffer[idx + 2] = 0;
-                }
-            }
-        }
-    }
-}
-
-static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Color &color, int size, int shape)
+static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Color &color,
+                                 int sizeTenths, int shape)
 {
     if (!NetworkManager::checkConnection() || points.empty())
         return;
@@ -1294,11 +1243,11 @@ static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Col
     {
         size_t count = std::min(maxPointsPerPacket, points.size() - start);
         uint8_t packet[7 + maxPointsPerPacket * 4];
-        packet[0] = 1; // Type: drawBatch
+        packet[0] = 4; // Type: drawBatch with size encoded in tenths.
         packet[1] = color.r;
         packet[2] = color.g;
         packet[3] = color.b;
-        packet[4] = size;
+        packet[4] = (uint8_t)clampBrushSizeTenths(sizeTenths);
         packet[5] = shape;
         packet[6] = (uint8_t)count;
 
@@ -1323,37 +1272,56 @@ static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Col
 static void drawColorSquare(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h,
                             float hue, float saturation, float value)
 {
-    for (int py = 0; py < h; py++)
+    const int innerWidth = std::max(1, w - 2);
+    const int innerHeight = std::max(1, h - 2);
+    for (int py = 0; py < innerHeight; py++)
     {
-        float v = 1.0f - ((float)py / (float)std::max(1, h - 1));
-        for (int px = 0; px < w; px++)
+        const float v = 1.0f - UiGeometry::normalizedPositionClamped(
+            py, 0, innerHeight - 1);
+        for (int px = 0; px < innerWidth; px++)
         {
-            float s = (float)px / (float)std::max(1, w - 1);
+            const float s = UiGeometry::normalizedPositionClamped(
+                px, 0, innerWidth - 1);
             float rr, gg, bb;
             UIState::HSVtoRGB(hue, s, v, rr, gg, bb);
-            putBufferScreenPixel(framebuffer, fbWidth, fbHeight, x + px, y + py,
-                                 (u8)(rr * 255.0f), (u8)(gg * 255.0f), (u8)(bb * 255.0f));
+            putBufferScreenPixel(
+                framebuffer, fbWidth, fbHeight, x + 1 + px, y + 1 + py,
+                clampColor(std::round(rr * 255.0f)),
+                clampColor(std::round(gg * 255.0f)),
+                clampColor(std::round(bb * 255.0f)));
         }
     }
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, 24, 33, 38);
-    int knobX = x + std::max(0, std::min(w - 1, (int)(saturation * (float)(w - 1))));
-    int knobY = y + std::max(0, std::min(h - 1, (int)((1.0f - value) * (float)(h - 1))));
+    const int knobX = x + 1 + std::max(
+        0, std::min(innerWidth - 1,
+                    (int)std::round(saturation * (float)(innerWidth - 1))));
+    const int knobY = y + 1 + std::max(
+        0, std::min(innerHeight - 1,
+                    (int)std::round((1.0f - value) * (float)(innerHeight - 1))));
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 4, knobY - 4, 9, 9, 245, 248, 250);
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 3, knobY - 3, 7, 7, 24, 33, 38);
 }
 
 static void drawHueStrip(u8 *framebuffer, int fbWidth, int fbHeight, int x, int y, int w, int h, float hue)
 {
-    for (int px = 0; px < w; px++)
+    const int innerWidth = std::max(1, w - 2);
+    for (int px = 0; px < innerWidth; px++)
     {
-        float hh = (float)px / (float)std::max(1, w - 1);
+        const float hh = UiGeometry::normalizedPositionClamped(
+            px, 0, innerWidth - 1);
         float rr, gg, bb;
         UIState::HSVtoRGB(hh, 1.0f, 1.0f, rr, gg, bb);
-        fillBufferScreenRect(framebuffer, fbWidth, fbHeight, x + px, y, 1, h,
-                             (u8)(rr * 255.0f), (u8)(gg * 255.0f), (u8)(bb * 255.0f));
+        fillBufferScreenRect(
+            framebuffer, fbWidth, fbHeight, x + 1 + px, y + 1, 1,
+            std::max(1, h - 2),
+            clampColor(std::round(rr * 255.0f)),
+            clampColor(std::round(gg * 255.0f)),
+            clampColor(std::round(bb * 255.0f)));
     }
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, x, y, w, h, 24, 33, 38);
-    int knobX = x + std::max(0, std::min(w - 1, (int)(hue * (float)(w - 1))));
+    const int knobX = x + 1 + std::max(
+        0, std::min(innerWidth - 1,
+                    (int)std::round(hue * (float)(innerWidth - 1))));
     fillBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 2, y - 3, 5, h + 6, 245, 248, 250);
     strokeBufferScreenRect(framebuffer, fbWidth, fbHeight, knobX - 2, y - 3, 5, h + 6, 24, 33, 38);
 }
@@ -1361,11 +1329,20 @@ static void drawHueStrip(u8 *framebuffer, int fbWidth, int fbHeight, int x, int 
 static const int PICKER_COLOR_FIELD_X = 8;
 static const int PICKER_COLOR_FIELD_Y = 108;
 static const int PICKER_COLOR_FIELD_SIZE = 92;
+static const int PICKER_COLOR_FIELD_INNER_X = PICKER_COLOR_FIELD_X + 1;
+static const int PICKER_COLOR_FIELD_INNER_Y = PICKER_COLOR_FIELD_Y + 1;
+static const int PICKER_COLOR_FIELD_INNER_SIZE = PICKER_COLOR_FIELD_SIZE - 2;
+static const int PICKER_COLOR_FIELD_HIT_SLOP = 4;
 static const int PICKER_HUE_STRIP_Y = 214;
 static const int PICKER_HUE_STRIP_HEIGHT = 12;
+static const int PICKER_SIZE_SLIDER_X = 82;
+static const int PICKER_SIZE_SLIDER_Y = 84;
+static const int PICKER_SIZE_SLIDER_WIDTH = 220;
+static const int PICKER_SIZE_SLIDER_HIT_Y = 72;
+static const int PICKER_SIZE_SLIDER_HIT_HEIGHT = 32;
 
 static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int activeTab,
-                            int focus, bool modAllowed, Color color, const char *notice)
+                            bool modAllowed, Color color, const char *notice)
 {
     UiCanvas ui(framebuffer, fbWidth, fbHeight, UI_BUFFER_3DS_ROTATED_BGR);
     ui.fill(UiRect(0, 0, 320, 240), UiTheme::Ink);
@@ -1381,21 +1358,25 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
         {
             UiComponents::button(ui, UiRect(8 + shape * 76, 42, 72, 28), shapeLabels[shape],
                                  currentBrushShape == shape, shape == BRUSH_ERASER);
-            if (focus == shape)
-                ui.stroke(UiRect(8 + shape * 76, 42, 72, 28), UiTheme::AccentBright, 2);
         }
 
-        ui.text(10, 82, "Size", UiTheme::Secondary);
-        for (int row = 0; row < 5; ++row)
-        {
-            const int size = brushSizeForShapeRow(currentBrushShape, row);
-            char sizeLabel[5];
-            snprintf(sizeLabel, sizeof(sizeLabel), "%d", size);
-            UiComponents::button(ui, UiRect(48 + row * 52, 74, 48, 28), sizeLabel,
-                                 currentBrushSize == size);
-            if (focus == 4 + row)
-                ui.stroke(UiRect(48 + row * 52, 74, 48, 28), UiTheme::AccentBright, 2);
-        }
+        char sizeLabel[32];
+        snprintf(sizeLabel, sizeof(sizeLabel), "Size %d.%d",
+                 currentBrushSizeTenths / 10, currentBrushSizeTenths % 10);
+        ui.text(10, 82, sizeLabel, UiTheme::Secondary);
+        const int sliderTravel = PICKER_SIZE_SLIDER_WIDTH - 1;
+        const int sliderFill = (currentBrushSizeTenths - Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS) *
+                               sliderTravel /
+                               (Doodle::CLIENT_BRUSH_SIZE_MAX_TENTHS -
+                                Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS);
+        ui.fill(UiRect(PICKER_SIZE_SLIDER_X, PICKER_SIZE_SLIDER_Y,
+                       PICKER_SIZE_SLIDER_WIDTH, 6), UiTheme::Border);
+        ui.fill(UiRect(PICKER_SIZE_SLIDER_X, PICKER_SIZE_SLIDER_Y,
+                       sliderFill + 1, 6), UiTheme::Accent);
+        ui.fill(UiRect(PICKER_SIZE_SLIDER_X + sliderFill - 3,
+                       PICKER_SIZE_SLIDER_Y - 5, 7, 16), UiTheme::White);
+        ui.stroke(UiRect(PICKER_SIZE_SLIDER_X + sliderFill - 3,
+                         PICKER_SIZE_SLIDER_Y - 5, 7, 16), UiTheme::Ink);
 
         float h, s, v;
         UIState::getHSV(h, s, v);
@@ -1413,8 +1394,6 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
         ui.text(110, 154, "Prev", UiTheme::Secondary);
         ui.fill(UiRect(110, 166, 30, 28), UiColor(gPreviousColor.r, gPreviousColor.g, gPreviousColor.b));
         ui.stroke(UiRect(110, 166, 30, 28), UiTheme::Ink);
-        if (focus == 9)
-            ui.stroke(UiRect(108, 164, 34, 32), UiTheme::AccentBright, 2);
 
         for (int slot = 0; slot < 8; ++slot)
         {
@@ -1423,10 +1402,9 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
             UiRect swatch(150 + column * 39, 108 + row * 39, 34, 34);
             ui.fill(swatch, UiColor(gCustomPalette[slot].r, gCustomPalette[slot].g, gCustomPalette[slot].b));
             const bool selected = sameColor(color, gCustomPalette[slot]);
-            ui.stroke(swatch, focus == 10 + slot ? UiTheme::AccentBright :
-                              gPaletteAssignMode ? UiTheme::Warning :
+            ui.stroke(swatch, gPaletteAssignMode ? UiTheme::Warning :
                               (selected ? UiTheme::Accent : UiTheme::Ink),
-                      selected || gPaletteAssignMode || focus == 10 + slot ? 2 : 1);
+                      selected || gPaletteAssignMode ? 2 : 1);
             char slotLabel[3];
             snprintf(slotLabel, sizeof(slotLabel), "%d", slot + 1);
             const int brightness = (int)gCustomPalette[slot].r + gCustomPalette[slot].g + gCustomPalette[slot].b;
@@ -1436,35 +1414,19 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
 
         UiComponents::button(ui, UiRect(110, 204, 46, 28), gPaletteAssignMode ? "Pick" : "Save",
                              gPaletteAssignMode);
-        if (focus == 18)
-            ui.stroke(UiRect(110, 204, 46, 28), UiTheme::AccentBright, 2);
         UiComponents::button(ui, UiRect(158, 204, 48, 28), "Reset", false);
-        if (focus == 19)
-            ui.stroke(UiRect(158, 204, 48, 28), UiTheme::AccentBright, 2);
         UiComponents::button(ui, UiRect(208, 204, 46, 28), "Hex", false);
-        if (focus == 20)
-            ui.stroke(UiRect(208, 204, 46, 28), UiTheme::AccentBright, 2);
         UiComponents::button(ui, UiRect(256, 204, 52, 28),
                              gRainbowEnabled ? "Rainbow*" : "Rainbow", gRainbowEnabled);
-        if (focus == 21)
-            ui.stroke(UiRect(256, 204, 52, 28), UiTheme::AccentBright, 2);
         if (notice && notice[0])
             UiComponents::toast(ui, notice, UiTheme::Accent);
     }
     else if (modAllowed)
     {
         UiComponents::button(ui, UiRect(8, 48, 148, 38), "Snapshot", false);
-        if (focus == 0)
-            ui.stroke(UiRect(8, 48, 148, 38), UiTheme::AccentBright, 2);
         UiComponents::button(ui, UiRect(164, 48, 148, 38), "Clear", false, true);
-        if (focus == 1)
-            ui.stroke(UiRect(164, 48, 148, 38), UiTheme::AccentBright, 2);
         UiComponents::button(ui, UiRect(8, 94, 148, 38), "Fill select", false);
-        if (focus == 2)
-            ui.stroke(UiRect(8, 94, 148, 38), UiTheme::AccentBright, 2);
         UiComponents::button(ui, UiRect(164, 94, 148, 38), "Erase select", false, true);
-        if (focus == 3)
-            ui.stroke(UiRect(164, 94, 148, 38), UiTheme::AccentBright, 2);
         UiComponents::panel(ui, UiRect(8, 142, 304, 62), true);
         ui.text(20, 154, "Canvas changes apply to", UiTheme::Secondary);
         ui.text(20, 168, "the current channel.", UiTheme::Secondary);
@@ -2061,7 +2023,7 @@ int main(int argc, char **argv)
     // Settings remain independent and never modify identity credentials.
     settingsLoad = Doodle::loadClientSettings(gClientSettings);
     currentBrushShape = (int)gClientSettings.brushShape;
-    currentBrushSize = gClientSettings.brushSize;
+    currentBrushSizeTenths = gClientSettings.brushSizeTenths;
     currentColor.r = gClientSettings.solidColor.r;
     currentColor.g = gClientSettings.solidColor.g;
     currentColor.b = gClientSettings.solidColor.b;
@@ -2117,9 +2079,6 @@ int main(int argc, char **argv)
         failExit("Failed to send client hello.");
     }
     printf("Client hello sent: %s\n", APP_VERSION);
-
-    std::vector<int> brushSizes = {1, 2, 3, 5, 7, 9, 12}; // Define your brush sizes
-    initializeGaussianFalloff(brushSizes);
 
     u16 fbWidth, fbHeight;
     u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fbWidth, &fbHeight);
@@ -2186,11 +2145,18 @@ int main(int argc, char **argv)
     int profileSelected = 0;
     bool rotateBackupConfirmation = false;
     int pickerTab = 0;
-    int pickerFocus = 0;
+    enum PickerDragTarget
+    {
+        PICKER_DRAG_NONE = 0,
+        PICKER_DRAG_SIZE,
+        PICKER_DRAG_COLOR,
+        PICKER_DRAG_HUE,
+    };
+    PickerDragTarget pickerDragTarget = PICKER_DRAG_NONE;
     bool pickerReturnToRoute = false;
     bool shoulderEraserActive = false;
     int shoulderSavedBrushShape = currentBrushShape;
-    int shoulderSavedBrushSize = currentBrushSize;
+    int shoulderSavedBrushSizeTenths = currentBrushSizeTenths;
     char availableChannels[8][25];
     ChannelInfo availableChannelInfo[8];
     memset(availableChannelInfo, 0, sizeof(availableChannelInfo));
@@ -2387,12 +2353,12 @@ int main(int argc, char **argv)
         const int persistedBrushShape = shoulderEraserActive
                                             ? shoulderSavedBrushShape
                                             : currentBrushShape;
-        const int persistedBrushSize = shoulderEraserActive
-                                           ? shoulderSavedBrushSize
-                                           : currentBrushSize;
+        const int persistedBrushSizeTenths = shoulderEraserActive
+                                                 ? shoulderSavedBrushSizeTenths
+                                                 : currentBrushSizeTenths;
         gClientSettings.brushShape = (Doodle::ClientBrushShape)std::max(
             0, std::min(persistedBrushShape, (int)Doodle::CLIENT_BRUSH_SHAPE_COUNT - 1));
-        gClientSettings.brushSize = std::max(1, std::min(persistedBrushSize, 12));
+        gClientSettings.brushSizeTenths = clampBrushSizeTenths(persistedBrushSizeTenths);
         gClientSettings.solidColor.r = currentColor.r;
         gClientSettings.solidColor.g = currentColor.g;
         gClientSettings.solidColor.b = currentColor.b;
@@ -4988,16 +4954,16 @@ int main(int argc, char **argv)
             gPaletteAssignMode = false;
             pickerReturnToRoute = false;
             pickerTab = 0;
-            pickerFocus = 0;
+            pickerDragTarget = PICKER_DRAG_NONE;
         }
         if (!shoulderEraserActive && !blockNormalCanvasInput &&
             !UIState::isColorPickerActive() && topMode == TOP_MODE_CANVAS &&
             semanticInput.consumeDown(gClientSettings.bindings, Doodle::INPUT_ACTION_QUICK_ERASER))
         {
             shoulderSavedBrushShape = currentBrushShape;
-            shoulderSavedBrushSize = currentBrushSize;
+            shoulderSavedBrushSizeTenths = currentBrushSizeTenths;
             currentBrushShape = BRUSH_ERASER;
-            currentBrushSize = 7;
+            currentBrushSizeTenths = 70;
             shoulderEraserActive = true;
             topRenderFrame = 10;
         }
@@ -5005,7 +4971,7 @@ int main(int argc, char **argv)
             !Doodle::actionIsHeld(gClientSettings.bindings, Doodle::INPUT_ACTION_QUICK_ERASER, kHeld))
         {
             currentBrushShape = shoulderSavedBrushShape;
-            currentBrushSize = shoulderSavedBrushSize;
+            currentBrushSizeTenths = shoulderSavedBrushSizeTenths;
             shoulderEraserActive = false;
             topRenderFrame = 10;
         }
@@ -5074,7 +5040,6 @@ int main(int argc, char **argv)
                     if (pickerReturnToRoute)
                     {
                         pickerTab = 1;
-                        pickerFocus = 2;
                         UIState::setColorPickerActive(true);
                     }
                     setAdminNotice("RECT CANCELLED");
@@ -5178,14 +5143,19 @@ int main(int argc, char **argv)
             }
         }
 
-        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS &&
-            UIState::isColorPickerActive() && (kDown & KEY_B))
+        const bool toolsToggle = !blockNormalCanvasInput &&
+                                 topMode == TOP_MODE_CANVAS &&
+                                 !zoomActionHeld &&
+                                 semanticInput.consumeDown(
+                                     gClientSettings.bindings,
+                                     Doodle::INPUT_ACTION_TOOLS);
+        if (toolsToggle && UIState::isColorPickerActive())
         {
             UIState::setColorPickerActive(false);
             gPaletteAssignMode = false;
+            pickerDragTarget = PICKER_DRAG_NONE;
             clearAdminNotice();
             pickerTab = 0;
-            pickerFocus = 0;
             if (pickerReturnToRoute)
             {
                 pickerReturnToRoute = false;
@@ -5197,9 +5167,7 @@ int main(int argc, char **argv)
             topRenderFrame = 10;
             continue;
         }
-        if (!blockNormalCanvasInput && topMode == TOP_MODE_CANVAS && !zoomActionHeld &&
-            !UIState::isColorPickerActive() &&
-            semanticInput.consumeDown(gClientSettings.bindings, Doodle::INPUT_ACTION_TOOLS))
+        if (toolsToggle && !UIState::isColorPickerActive())
         {
             pickerReturnToRoute = false;
             UIState::setColorPickerActive(true);
@@ -5207,8 +5175,8 @@ int main(int argc, char **argv)
             adminRectDragging = false;
             adminRectAwaitingConfirm = false;
             gPaletteAssignMode = false;
+            pickerDragTarget = PICKER_DRAG_NONE;
             pickerTab = 0;
-            pickerFocus = 0;
             topMode = TOP_MODE_CANVAS;
             printf("Color picker activated\n");
         }
@@ -5241,76 +5209,58 @@ int main(int argc, char **argv)
             }
         }
 
-        bool paletteActivate = (kDown & KEY_TOUCH) != 0;
+        if (!(kHeld & KEY_TOUCH))
+            pickerDragTarget = PICKER_DRAG_NONE;
         if (!blockNormalCanvasInput && !zoomOverlayActive &&
-            topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive())
+            topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() &&
+            pickerTab == 0 && (kDown & KEY_TOUCH))
         {
-            if (isModOrAdmin() && (kDown & (KEY_L | KEY_R)))
+            if (pointInRect(touch.px, touch.py,
+                            PICKER_SIZE_SLIDER_X, PICKER_SIZE_SLIDER_HIT_Y,
+                            PICKER_SIZE_SLIDER_WIDTH, PICKER_SIZE_SLIDER_HIT_HEIGHT))
             {
-                pickerTab = pickerTab == 0 ? 1 : 0;
-                pickerFocus = 0;
-                topRenderFrame = 10;
+                pickerDragTarget = PICKER_DRAG_SIZE;
             }
-            const int pickerItemCount = pickerTab == 0 ? 22 : 4;
-            if (navDown & (KEY_DLEFT | KEY_DUP))
-                pickerFocus = (pickerFocus + pickerItemCount - 1) % pickerItemCount;
-            if (navDown & (KEY_DRIGHT | KEY_DDOWN))
-                pickerFocus = (pickerFocus + 1) % pickerItemCount;
-            if (kDown & KEY_A)
+            else if (pointInRect(
+                         touch.px, touch.py,
+                         PICKER_COLOR_FIELD_X - PICKER_COLOR_FIELD_HIT_SLOP,
+                         PICKER_COLOR_FIELD_Y - PICKER_COLOR_FIELD_HIT_SLOP,
+                         PICKER_COLOR_FIELD_SIZE + PICKER_COLOR_FIELD_HIT_SLOP * 2,
+                         PICKER_COLOR_FIELD_SIZE + PICKER_COLOR_FIELD_HIT_SLOP * 2))
             {
-                paletteActivate = true;
-                if (pickerTab == 1)
-                {
-                    static const int staffX[] = {82, 238, 82, 238};
-                    static const int staffY[] = {67, 67, 113, 113};
-                    touch.px = staffX[pickerFocus];
-                    touch.py = staffY[pickerFocus];
-                }
-                else if (pickerFocus < 4)
-                {
-                    touch.px = 44 + pickerFocus * 76;
-                    touch.py = 56;
-                }
-                else if (pickerFocus < 9)
-                {
-                    touch.px = 72 + (pickerFocus - 4) * 52;
-                    touch.py = 88;
-                }
-                else if (pickerFocus == 9)
-                {
-                    touch.px = 125;
-                    touch.py = 180;
-                }
-                else if (pickerFocus < 18)
-                {
-                    const int slot = pickerFocus - 10;
-                    touch.px = 167 + (slot % 4) * 39;
-                    touch.py = 125 + (slot / 4) * 39;
-                }
-                else
-                {
-                    static const int footerX[] = {133, 182, 231, 282};
-                    touch.px = footerX[pickerFocus - 18];
-                    touch.py = 218;
-                }
+                pickerDragTarget = PICKER_DRAG_COLOR;
+            }
+            else if (pointInRect(
+                         touch.px, touch.py,
+                         PICKER_COLOR_FIELD_X - PICKER_COLOR_FIELD_HIT_SLOP,
+                         PICKER_HUE_STRIP_Y - 3 - PICKER_COLOR_FIELD_HIT_SLOP,
+                         PICKER_COLOR_FIELD_SIZE + PICKER_COLOR_FIELD_HIT_SLOP * 2,
+                         PICKER_HUE_STRIP_HEIGHT + 6 + PICKER_COLOR_FIELD_HIT_SLOP * 2))
+            {
+                pickerDragTarget = PICKER_DRAG_HUE;
             }
         }
+        const bool paletteActivate = (kDown & KEY_TOUCH) != 0 ||
+                                     (pickerDragTarget == PICKER_DRAG_SIZE &&
+                                      (kHeld & KEY_TOUCH));
 
         if (!blockNormalCanvasInput && !zoomOverlayActive &&
             topMode == TOP_MODE_CANVAS && UIState::isColorPickerActive() &&
-            paletteActivate)
+            paletteActivate &&
+            pickerDragTarget != PICKER_DRAG_COLOR &&
+            pickerDragTarget != PICKER_DRAG_HUE)
         {
             if (pointInRect(touch.px, touch.py, 8, 8, 92, 28))
             {
                 pickerTab = 0;
-                pickerFocus = 0;
+                pickerDragTarget = PICKER_DRAG_NONE;
                 topRenderFrame = 10;
                 continue;
             }
             if (isModOrAdmin() && pointInRect(touch.px, touch.py, 104, 8, 92, 28))
             {
                 pickerTab = 1;
-                pickerFocus = 0;
+                pickerDragTarget = PICKER_DRAG_NONE;
                 topRenderFrame = 10;
                 continue;
             }
@@ -5324,20 +5274,17 @@ int main(int argc, char **argv)
                 }
                 if (pointInRect(touch.px, touch.py, 8, 48, 148, 38))
                 {
-                    pickerFocus = 0;
                     sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
                     continue;
                 }
                 if (pointInRect(touch.px, touch.py, 164, 48, 148, 38))
                 {
-                    pickerFocus = 1;
                     confirmClearCanvas = true;
                     setAdminNotice("CONFIRM CLEAR");
                     continue;
                 }
                 if (pointInRect(touch.px, touch.py, 8, 94, 148, 38))
                 {
-                    pickerFocus = 2;
                     pendingAdminRectTool = ADMIN_RECT_FILL;
                     adminRectDragging = false;
                     adminRectAwaitingConfirm = false;
@@ -5347,7 +5294,6 @@ int main(int argc, char **argv)
                 }
                 if (pointInRect(touch.px, touch.py, 164, 94, 148, 38))
                 {
-                    pickerFocus = 3;
                     pendingAdminRectTool = ADMIN_RECT_ERASE;
                     adminRectDragging = false;
                     adminRectAwaitingConfirm = false;
@@ -5358,30 +5304,40 @@ int main(int argc, char **argv)
                 continue;
             }
 
+            if (pickerDragTarget == PICKER_DRAG_SIZE)
+            {
+                const int sliderX = std::max(
+                    PICKER_SIZE_SLIDER_X,
+                    std::min((int)touch.px,
+                             PICKER_SIZE_SLIDER_X + PICKER_SIZE_SLIDER_WIDTH - 1));
+                const int sliderOffset = sliderX - PICKER_SIZE_SLIDER_X;
+                const int sizeRange = Doodle::CLIENT_BRUSH_SIZE_MAX_TENTHS -
+                                      Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS;
+                const int nextSizeTenths =
+                    Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS +
+                    (sliderOffset * sizeRange +
+                     (PICKER_SIZE_SLIDER_WIDTH - 1) / 2) /
+                        (PICKER_SIZE_SLIDER_WIDTH - 1);
+                if (nextSizeTenths != currentBrushSizeTenths)
+                {
+                    currentBrushSizeTenths = nextSizeTenths;
+                    markClientSettingsDirty();
+                    topRenderFrame = 10;
+                }
+                continue;
+            }
+
             for (int shape = 0; shape < 4; ++shape)
             {
                 if (pointInRect(touch.px, touch.py, 8 + shape * 76, 42, 72, 28))
                 {
                     currentBrushShape = shape;
-                    pickerFocus = shape;
-                    currentBrushSize = clampBrushSizeForShape(shape, currentBrushSize);
-                    markClientSettingsDirty();
-                    continue;
-                }
-            }
-            for (int row = 0; row < 5; ++row)
-            {
-                if (pointInRect(touch.px, touch.py, 48 + row * 52, 74, 48, 28))
-                {
-                    currentBrushSize = brushSizeForShapeRow(currentBrushShape, row);
-                    pickerFocus = 4 + row;
                     markClientSettingsDirty();
                     continue;
                 }
             }
             if (pointInRect(touch.px, touch.py, 110, 166, 30, 28))
             {
-                pickerFocus = 9;
                 Color swap = currentColor;
                 currentColor = gPreviousColor;
                 gPreviousColor = swap;
@@ -5397,7 +5353,6 @@ int main(int argc, char **argv)
                     continue;
                 if (gPaletteAssignMode)
                 {
-                    pickerFocus = 10 + slot;
                     gCustomPalette[slot] = currentColor;
                     gPaletteAssignMode = false;
                     setAdminNotice("COLOR SAVED");
@@ -5405,7 +5360,6 @@ int main(int argc, char **argv)
                 }
                 else
                 {
-                    pickerFocus = 10 + slot;
                     gPreviousColor = currentColor;
                     currentColor = gCustomPalette[slot];
                     syncPickerToColor(currentColor);
@@ -5415,21 +5369,18 @@ int main(int argc, char **argv)
             }
             if (pointInRect(touch.px, touch.py, 110, 204, 46, 28))
             {
-                pickerFocus = 18;
                 gPaletteAssignMode = !gPaletteAssignMode;
                 setAdminNotice(gPaletteAssignMode ? "CHOOSE A SWATCH" : "SAVE CANCELLED");
                 continue;
             }
             if (pointInRect(touch.px, touch.py, 158, 204, 48, 28))
             {
-                pickerFocus = 19;
                 confirmPaletteReset = true;
                 clearAdminNotice();
                 continue;
             }
             if (pointInRect(touch.px, touch.py, 208, 204, 46, 28))
             {
-                pickerFocus = 20;
                 Color entered = currentColor;
                 if (handleHexColorInput(entered))
                 {
@@ -5445,7 +5396,6 @@ int main(int argc, char **argv)
             }
             if (pointInRect(touch.px, touch.py, 256, 204, 52, 28))
             {
-                pickerFocus = 21;
                 gRainbowEnabled = !gRainbowEnabled;
                 gRainbowStrokeColorValid = false;
                 setAdminNotice(gRainbowEnabled ? "RAINBOW ENABLED" : "RAINBOW DISABLED");
@@ -5460,27 +5410,28 @@ int main(int argc, char **argv)
             UIState::getHSV(h, s, v);
 
             bool hsvChanged = false;
-            if (pointInRect(touch.px, touch.py,
-                            PICKER_COLOR_FIELD_X, PICKER_COLOR_FIELD_Y,
-                            PICKER_COLOR_FIELD_SIZE, PICKER_COLOR_FIELD_SIZE))
+            if (pickerDragTarget == PICKER_DRAG_COLOR)
             {
                 if (kDown & KEY_TOUCH)
                     gPreviousColor = currentColor;
-                s = (float)(touch.px - PICKER_COLOR_FIELD_X) /
-                    (float)(PICKER_COLOR_FIELD_SIZE - 1);
-                v = 1.0f - ((float)(touch.py - PICKER_COLOR_FIELD_Y) /
-                            (float)(PICKER_COLOR_FIELD_SIZE - 1));
+                s = UiGeometry::normalizedPositionClamped(
+                    touch.px,
+                    PICKER_COLOR_FIELD_INNER_X,
+                    PICKER_COLOR_FIELD_INNER_X + PICKER_COLOR_FIELD_INNER_SIZE - 1);
+                v = 1.0f - UiGeometry::normalizedPositionClamped(
+                    touch.py,
+                    PICKER_COLOR_FIELD_INNER_Y,
+                    PICKER_COLOR_FIELD_INNER_Y + PICKER_COLOR_FIELD_INNER_SIZE - 1);
                 hsvChanged = true;
             }
-            else if (pointInRect(touch.px, touch.py,
-                                 PICKER_COLOR_FIELD_X, PICKER_HUE_STRIP_Y - 3,
-                                 PICKER_COLOR_FIELD_SIZE,
-                                 PICKER_HUE_STRIP_HEIGHT + 6))
+            else if (pickerDragTarget == PICKER_DRAG_HUE)
             {
                 if (kDown & KEY_TOUCH)
                     gPreviousColor = currentColor;
-                h = (float)(touch.px - PICKER_COLOR_FIELD_X) /
-                    (float)(PICKER_COLOR_FIELD_SIZE - 1);
+                h = UiGeometry::normalizedPositionClamped(
+                    touch.px,
+                    PICKER_COLOR_FIELD_INNER_X,
+                    PICKER_COLOR_FIELD_INNER_X + PICKER_COLOR_FIELD_INNER_SIZE - 1);
                 hsvChanged = true;
             }
 
@@ -5495,9 +5446,9 @@ int main(int argc, char **argv)
                 // Convert HSV to RGB
                 float r, g, b;
                 UIState::HSVtoRGB(h, s, v, r, g, b);
-                currentColor.r = r * 255;
-                currentColor.g = g * 255;
-                currentColor.b = b * 255;
+                currentColor.r = clampColor(std::round(r * 255.0f));
+                currentColor.g = clampColor(std::round(g * 255.0f));
+                currentColor.b = clampColor(std::round(b * 255.0f));
                 markClientSettingsDirty();
             }
 
@@ -5563,7 +5514,7 @@ int main(int argc, char **argv)
                             continue;
                         }
                         sendDrawBatchCommand(UIState::getPoints(), gRainbowStrokeColor,
-                                             currentBrushSize, effectiveBrushShape());
+                                             currentBrushSizeTenths, effectiveBrushShape());
                         UIState::clearPoints();
                     }
                     gRainbowStrokeColor = nextRainbowColor;
@@ -5619,7 +5570,7 @@ int main(int argc, char **argv)
                         }
                         Color drawColor = effectiveDrawColor();
                         sendDrawBatchCommand(UIState::getPoints(), drawColor,
-                                             currentBrushSize, effectiveBrushShape());
+                                             currentBrushSizeTenths, effectiveBrushShape());
                         UIState::clearPoints();
                     }
 
@@ -5650,7 +5601,7 @@ int main(int argc, char **argv)
                     }
                     Color drawColor = effectiveDrawColor();
                     sendDrawBatchCommand(UIState::getPoints(), drawColor,
-                                         currentBrushSize, effectiveBrushShape());
+                                         currentBrushSizeTenths, effectiveBrushShape());
                     UIState::clearPoints();
                 }
                 gRainbowStrokeColorValid = false;
@@ -5997,7 +5948,7 @@ int main(int argc, char **argv)
                 rendererState.controlBindings[action] = bindingLabels[action];
             }
             Renderer::renderTop(canvas, NetworkManager::isConnected(), updateAvailable, currentColor,
-                                currentBrushSize, currentBrushShape, topMode,
+                                currentBrushSizeTenths, currentBrushShape, topMode,
                                 availableChannels, availableChannelCount, selectedChannel,
                                 selectedMenuItem, connectedUsers, connectedUserCount,
                                 identityInfo.displayName, identityInfo.username,
@@ -6031,7 +5982,7 @@ int main(int argc, char **argv)
         {
             if (!isModOrAdmin() && pickerTab == 1)
                 pickerTab = 0;
-            drawToolPalette(fb, fbWidth, fbHeight, pickerTab, pickerFocus,
+            drawToolPalette(fb, fbWidth, fbHeight, pickerTab,
                             isModOrAdmin(), currentColor,
                             adminNoticeFrames > 0 ? adminNotice : "");
         }

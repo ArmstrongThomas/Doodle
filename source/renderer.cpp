@@ -265,8 +265,16 @@ static void updateMinimapCache(CanvasState &canvas)
     minimapCacheValid = true;
 }
 
+static void formatBrushSize(int sizeTenths, char *buffer, size_t capacity)
+{
+    if (sizeTenths % 10 == 0)
+        snprintf(buffer, capacity, "%d", sizeTenths / 10);
+    else
+        snprintf(buffer, capacity, "%d.%d", sizeTenths / 10, sizeTenths % 10);
+}
+
 static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
-                                   int brushSize, int brushShape, int ticketNeedsReply, int staffChatUnread,
+                                   int brushSizeTenths, int brushShape, int ticketNeedsReply, int staffChatUnread,
                                    PresenceUser *users, int userCount,
                                    ChannelInfo *channelInfo, int channelInfoCount)
 {
@@ -350,7 +358,9 @@ static void composeCanvasTopFrame(CanvasState &canvas, bool connected, bool upda
 
     const char *brushName = brushShape == 1 ? "Square" : brushShape == 2 ? "Dither" : brushShape == 3 ? "Eraser" : "Circle";
     char drawingInfo[44];
-    snprintf(drawingInfo, sizeof(drawingInfo), "%.10s | %s %d | %s",
+    char brushSize[32];
+    formatBrushSize(brushSizeTenths, brushSize, sizeof(brushSize));
+    snprintf(drawingInfo, sizeof(drawingInfo), "%.10s | %s %.5s | %s",
              canvas.channel[0] ? canvas.channel : "main", brushName, brushSize, canvas.zoomLabel());
     drawText(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 14, 198, drawingInfo, 32, 36, 42);
     fillTopRect(topFrame, TOP_SCREEN_W, TOP_SCREEN_H, 252, 196, 14, 12, currentColor.r, currentColor.g, currentColor.b);
@@ -950,7 +960,7 @@ static void composeTicketsTopFrame(bool connected, bool updateAvailable,
 }
 
 static void composeOptionsTopFrame(CanvasState &canvas, bool connected, bool updateAvailable,
-                                   Color currentColor, int brushSize, int brushShape,
+                                   Color currentColor, int brushSizeTenths, int brushShape,
                                    const RendererTopState *topState)
 {
     drawTopChrome(connected, updateAvailable);
@@ -992,7 +1002,9 @@ static void composeOptionsTopFrame(CanvasState &canvas, bool connected, bool upd
         const char *shape = brushShape == 1 ? "Square" : brushShape == 2 ? "Dither" :
                             brushShape == 3 ? "Eraser" : "Circle";
         char brush[48];
-        snprintf(brush, sizeof(brush), "%s / size %d", shape, brushSize);
+        char brushSize[32];
+        formatBrushSize(brushSizeTenths, brushSize, sizeof(brushSize));
+        snprintf(brush, sizeof(brush), "%s / size %s", shape, brushSize);
         ui.textClipped(196, 88, brush, UiTheme::Ink, 150);
         ui.fill(UiRect(352, 84, 24, 16), UiColor(currentColor.r, currentColor.g, currentColor.b));
         ui.stroke(UiRect(352, 84, 24, 16), UiTheme::Ink);
@@ -1232,7 +1244,7 @@ static void presentTopFrameToFramebuffer(u8 *fb, u16 fbWidth, u16 fbHeight)
 }
 
 void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailable, Color currentColor,
-                         int brushSize, int brushShape, TopScreenMode mode,
+                         int brushSizeTenths, int brushShape, TopScreenMode mode,
                          char channels[][25], int channelCount, int selectedChannel,
                          int selectedMenuItem, PresenceUser *users, int userCount,
                          const char *displayName, const char *username,
@@ -1287,7 +1299,8 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
     else if (mode == TOP_MODE_ADMIN)
         composeAdminTopFrame(canvas, connected, updateAvailable, role, selectedAdminItem, adminNotice);
     else if (mode == TOP_MODE_OPTIONS)
-        composeOptionsTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape, topState);
+        composeOptionsTopFrame(canvas, connected, updateAvailable, currentColor,
+                               brushSizeTenths, brushShape, topState);
     else if (mode == TOP_MODE_STAFF_CENTER)
         composeStaffCenterTopFrame(canvas, connected, updateAvailable, role,
                                    topState ? topState->pageSelected : selectedAdminItem,
@@ -1301,7 +1314,7 @@ void Renderer::renderTop(CanvasState &canvas, bool connected, bool updateAvailab
                                  topState ? topState->backupCodeRevealed : false,
                                  topState ? topState->needsDisplayName : false);
     else
-        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSize, brushShape,
+        composeCanvasTopFrame(canvas, connected, updateAvailable, currentColor, brushSizeTenths, brushShape,
                                ticketNeedsReplyCount, staffChatUnreadCount, users, userCount,
                                topState ? topState->channelInfo : NULL,
                                topState ? topState->channelInfoCount : 0);

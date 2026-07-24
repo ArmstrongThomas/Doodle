@@ -29,6 +29,11 @@ struct UiRect
     }
 };
 
+namespace UiGeometry
+{
+    float normalizedPositionClamped(int coordinate, int first, int last);
+}
+
 enum UiBufferLayout
 {
     UI_BUFFER_RGB = 0,

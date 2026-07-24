@@ -6,6 +6,11 @@ ifeq ($(strip $(DEVKITARM)),)
 $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>devkitARM")
 endif
 
+ifeq ($(OS),Windows_NT)
+DEVKITPRO := $(shell cygpath -u "$(DEVKITPRO)")
+DEVKITARM := $(shell cygpath -u "$(DEVKITARM)")
+endif
+
 TOPDIR ?= $(CURDIR)
 include $(DEVKITARM)/3ds_rules
 
@@ -39,7 +44,7 @@ DATA		:=	data
 INCLUDES	:=	include vendor/mbedtls/include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_VERSION	?=	1.6.0
+APP_VERSION	?=	1.6.1
 CHAT_ENABLED	?=	0
 TEST_MODE	?=	0
 LOCAL_SERVER_HOST	?=	192.168.1.46
