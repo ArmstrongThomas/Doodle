@@ -1,6 +1,11 @@
 #include "client_settings.h"
+#include "brush_render.h"
+#include "canvas_sync.h"
 #include "input_bindings.h"
 #include "protocol.h"
+#include "scoped_notice.h"
+#include "timestamp_format.h"
+#include "ticket_flow.h"
 #include "ui_canvas.h"
 #include "ui_route.h"
 
@@ -169,8 +174,9 @@ void testSettingsRoundTripAndRecovery()
     resetClientSettings(first);
     CHECK(setLastSuccessfulChannel(first, "sketch"));
     first.zoomOverlaySide = ZOOM_OVERLAY_RIGHT;
-    first.brushShape = CLIENT_BRUSH_DITHER;
+    first.brushShape = CLIENT_BRUSH_SPRAY;
     first.brushSizeTenths = 75;
+    first.brushFeatherEnabled = false;
     first.solidColor.r = 0x12;
     first.solidColor.g = 0x34;
     first.solidColor.b = 0x56;
@@ -222,6 +228,7 @@ void testSettingsIndependentValidation()
         "last_channel=contains a space\n"
         "brush_shape=dither\n"
         "brush_size=4.5\n"
+        "brush_feather=off\n"
         "solid_color=#12GG56\n"
         "palette.1=#010203\n"
         "palette.2=not-a-color\n"
@@ -235,6 +242,7 @@ void testSettingsIndependentValidation()
     CHECK(settings.lastSuccessfulChannel[0] == '\0');
     CHECK(settings.brushShape == CLIENT_BRUSH_DITHER);
     CHECK(settings.brushSizeTenths == 45);
+    CHECK(!settings.brushFeatherEnabled);
     CHECK(sameColor(settings.solidColor, Rgb8{255, 0, 0}));
     CHECK(sameColor(settings.palette[0], Rgb8{1, 2, 3}));
     CHECK(sameColor(settings.palette[1], Rgb8{255, 255, 255}));
@@ -365,6 +373,8 @@ void testProtocolAdditionsAndEscaping()
         "device", "secret", "hardware", "new-3ds-xl", "Doodler", "3dsx");
     CHECK(strstr(command, "\"protocol\":6") != NULL);
     CHECK(strstr(command, "\"draw-size-tenths\"") != NULL);
+    CHECK(strstr(command, "\"brush-feather\"") != NULL);
+    CHECK(strstr(command, "\"brush-suite-v2\"") != NULL);
 
     Protocol::buildTicketCreate(
         command, sizeof(command), "report", "A \"quoted\" title",
@@ -389,12 +399,124 @@ void testProtocolAdditionsAndEscaping()
     CHECK(Protocol::parseChannels(
         "{\"type\":\"channels\",\"channels\":[\"main\",\"art\"],"
         "\"channelInfo\":[{\"name\":\"main\",\"userCount\":3,"
+        "\"width\":1920,\"height\":1080,"
         "\"staffOnly\":false,\"adminOnly\":false,\"readOnly\":false}],"
         "\"currentChannel\":\"main\"}",
         channels, metadata, 8, count, current));
     CHECK(strcmp(metadata[0].name, "main") == 0);
     CHECK(metadata[0].userCount == 3);
+    CHECK(metadata[0].width == 1920);
+    CHECK(metadata[0].height == 1080);
     CHECK(metadata[1].name[0] == '\0');
+
+    CHECK(canvasSnapshotTimeoutMs(1) == 38000);
+    CHECK(canvasSnapshotTimeoutMs(1024 * 1024) == 38000);
+    CHECK(canvasSnapshotTimeoutMs(6 * 1024 * 1024) == 78000);
+    CHECK(canvasSnapshotTimeoutMs(10 * 1024 * 1024) == 90000);
+    CHECK(isSupportedCanvasSnapshot(320, 240, 100));
+    CHECK(isSupportedCanvasSnapshot(640, 480, 640 * 480 * 3));
+    CHECK(isSupportedCanvasSnapshot(960, 540, 960 * 540 * 3));
+    CHECK(isSupportedCanvasSnapshot(1280, 720, 1280 * 720 * 3));
+    CHECK(isSupportedCanvasSnapshot(1920, 1080, 6222706));
+    CHECK(!isSupportedCanvasSnapshot(1921, 1080, 100));
+    CHECK(!isSupportedCanvasSnapshot(1920, 1081, 100));
+    CHECK(!isSupportedCanvasSnapshot(1920, 1080, 10000001));
+    CHECK(!shouldResetCanvasViewport("size-small", "size-small"));
+    CHECK(shouldResetCanvasViewport("size-small", "size-large"));
+    CHECK(shouldResetCanvasViewport("", "main"));
+}
+
+void testTimestampAndScopedNotices()
+{
+    char timestamp[24];
+    CHECK(formatIsoMinuteTimestamp(
+        "2026-07-24T09:23:45.123Z", timestamp, sizeof(timestamp)));
+    CHECK(strcmp(timestamp, "2026-07-24 09:23Z") == 0);
+    CHECK(formatIsoMinuteTimestamp(
+        "2026-12-31 23:59:00.000Z", timestamp, sizeof(timestamp)));
+    CHECK(strcmp(timestamp, "2026-12-31 23:59Z") == 0);
+    CHECK(!formatIsoMinuteTimestamp("not-a-date", timestamp, sizeof(timestamp)));
+    CHECK(strcmp(timestamp, "Unknown date") == 0);
+
+    ScopedNotice<64> notice;
+    CHECK(!notice.visible(1, 1000));
+    notice.set("REFRESHING", 1, 1000, 10000, true);
+    CHECK(notice.visible(1, 1000));
+    CHECK(!notice.visible(2, 1000));
+    CHECK(notice.pending());
+    CHECK(!notice.expire(10999));
+    CHECK(notice.expire(11000));
+    CHECK(!notice.visible(1, 11000));
+    notice.set("DONE", 2, 12000, 1800);
+    CHECK(!notice.pending());
+    CHECK(strcmp(notice.text(), "DONE") == 0);
+    CHECK(!notice.clearPending());
+    notice.set("LOADING", 2, 12000, 10000, true);
+    CHECK(notice.clearPending());
+    CHECK(!notice.visible(2, 12000));
+    notice.set("DONE", 2, 12000, 1800);
+    notice.clear();
+    CHECK(!notice.visible(2, 12000));
+}
+
+void testTicketFlowHelpers()
+{
+    char subject[65];
+    char details[241];
+    buildUserReportDraft(
+        subject, sizeof(subject), details, sizeof(details),
+        "Reported Person", "reported_user", "identity-123",
+        "size-small", "Repeatedly drawing over other people");
+    CHECK(strcmp(subject, "Report: Reported Person") == 0);
+    CHECK(strstr(details, "User: Reported Person (reported_user)") != NULL);
+    CHECK(strstr(details, "Identity: identity-123") != NULL);
+    CHECK(strstr(details, "Channel: size-small") != NULL);
+    CHECK(strstr(details, "Reason: Repeatedly drawing over other people") != NULL);
+
+    buildUserReportDraft(
+        subject, sizeof(subject), details, sizeof(details),
+        "", "", "", "", "");
+    CHECK(strcmp(subject, "Report: Anonymous") == 0);
+    CHECK(strstr(details, "Reason: No reason provided") != NULL);
+}
+
+void testBrushRenderingMath()
+{
+    CHECK(brushStrokeSpacing(10, CLIENT_BRUSH_CIRCLE) == 1);
+    CHECK(brushStrokeSpacing(10, CLIENT_BRUSH_DITHER) == 3);
+    CHECK(brushStrokeSpacing(60, CLIENT_BRUSH_DITHER) == 3);
+    CHECK(brushStrokeSpacing(61, CLIENT_BRUSH_DITHER) == 4);
+    CHECK(brushStrokeSpacing(120, CLIENT_BRUSH_DITHER) == 6);
+    CHECK(brushStrokeSpacing(40, CLIENT_BRUSH_SPRAY) == 3);
+    CHECK(brushStrokeSpacing(120, CLIENT_BRUSH_SPRAY) == 6);
+    CHECK(brushStrokeSegmentSteps(8, 0, 40, CLIENT_BRUSH_CIRCLE) == 8);
+    CHECK(brushStrokeSegmentSteps(8, 0, 40, CLIENT_BRUSH_DITHER) == 3);
+    CHECK(brushStrokeSegmentSteps(-8, 3, 120, CLIENT_BRUSH_DITHER) == 2);
+    CHECK(brushStrokeSegmentSteps(0, 0, 120, CLIENT_BRUSH_DITHER) == 1);
+
+    CHECK(fractionalBrushCoverageTenths(
+              true, true, true, 1, CLIENT_BRUSH_CIRCLE,
+              4, 4, false, false) == 10);
+    CHECK(fractionalBrushCoverageTenths(
+              true, true, true, 1, CLIENT_BRUSH_CIRCLE,
+              4, 4, true, false) == 7);
+    CHECK(fractionalBrushCoverageTenths(
+              true, true, true, 1, CLIENT_BRUSH_CIRCLE,
+              4, 4, true, true) == 10);
+    CHECK(fractionalBrushCoverageTenths(
+              false, true, false, 1, CLIENT_BRUSH_CIRCLE,
+              4, 4, true, false) == 1);
+    CHECK(fractionalBrushCoverageTenths(
+              false, true, false, 9, CLIENT_BRUSH_DITHER,
+              4, 4, true, false) == 7);
+    CHECK(fractionalBrushCoverageTenths(
+              false, false, false, 9, CLIENT_BRUSH_CIRCLE,
+              4, 4, true, false) == 0);
+
+    CHECK(blendBrushChannel(255, 0, 1) == 230);
+    CHECK(blendBrushChannel(255, 0, 5) == 128);
+    CHECK(blendBrushChannel(255, 0, 9) == 26);
+    CHECK(blendBrushChannel(42, 200, 10) == 200);
 }
 
 } // namespace
@@ -410,6 +532,9 @@ int main()
     testUiRectAndClipping();
     testRouteStack();
     testProtocolAdditionsAndEscaping();
+    testTimestampAndScopedNotices();
+    testTicketFlowHelpers();
+    testBrushRenderingMath();
 
     if (failures)
     {

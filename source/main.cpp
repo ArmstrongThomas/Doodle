@@ -22,6 +22,10 @@
 #include "ui_route.h"
 #include "client_settings.h"
 #include "input_bindings.h"
+#include "brush_render.h"
+#include "canvas_sync.h"
+#include "scoped_notice.h"
+#include "ticket_flow.h"
 
 // TLS certificate verification can exceed libctru's 32 KiB default main
 // thread stack. The updater deliberately runs HTTPS on the main thread so it
@@ -58,6 +62,12 @@ static const int BRUSH_CIRCLE = 0;
 static const int BRUSH_SQUARE = 1;
 static const int BRUSH_DITHER = 2;
 static const int BRUSH_ERASER = 3;
+static const int BRUSH_DIAMOND = 4;
+static const int BRUSH_CROSS = 5;
+static const int BRUSH_SPRAY = 6;
+static int gLastBrushSampleX = -1;
+static int gLastBrushSampleY = -1;
+static bool gFeatherEnabled = true;
 static bool gRainbowEnabled = false;
 static bool gRainbowStrokeColorValid = false;
 static Color gRainbowStrokeColor = {255, 0, 0};
@@ -114,14 +124,10 @@ static volatile bool gAptWentToSleep = false;
 // Keep this bounded, but large enough that the negotiated response is not
 // silently discarded before Protocol gets a chance to validate it.
 static const size_t CONTROL_LINE_CAPACITY = 12 * 1024;
-static const uint64_t MAX_CANVAS_BYTES = 12ULL * 1024ULL * 1024ULL;
-
 static bool isValidCanvasMeta(const CanvasMeta &meta)
 {
-    if (meta.width <= 0 || meta.height <= 0 || meta.compressedSize <= 0 || meta.compressedSize > 10000000)
-        return false;
-    uint64_t pixelBytes = (uint64_t)meta.width * (uint64_t)meta.height * 3ULL;
-    return pixelBytes > 0 && pixelBytes <= MAX_CANVAS_BYTES;
+    return Doodle::isSupportedCanvasSnapshot(
+        meta.width, meta.height, meta.compressedSize);
 }
 
 static void handleAptEvent(APT_HookType hook, void *)
@@ -438,6 +444,7 @@ static void rememberSuccessfulChannel(const char *channel)
     gClientSettings.brushSizeTenths = std::max(
         Doodle::CLIENT_BRUSH_SIZE_MIN_TENTHS,
         std::min(currentBrushSizeTenths, Doodle::CLIENT_BRUSH_SIZE_MAX_TENTHS));
+    gClientSettings.brushFeatherEnabled = gFeatherEnabled;
     gClientSettings.solidColor.r = currentColor.r;
     gClientSettings.solidColor.g = currentColor.g;
     gClientSettings.solidColor.b = currentColor.b;
@@ -865,6 +872,19 @@ void drawPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight, int x, int y, u8 r
     }
 }
 
+static void blendPointOnBuffer(u8 *buffer, int fbWidth, int fbHeight,
+                               int x, int y, u8 r, u8 g, u8 b,
+                               int coverageTenths)
+{
+    if (x < 0 || x >= fbWidth || y < 0 || y >= fbHeight)
+        return;
+
+    const int idx = 3 * (y * fbWidth + x);
+    buffer[idx] = Doodle::blendBrushChannel(buffer[idx], r, coverageTenths);
+    buffer[idx + 1] = Doodle::blendBrushChannel(buffer[idx + 1], g, coverageTenths);
+    buffer[idx + 2] = Doodle::blendBrushChannel(buffer[idx + 2], b, coverageTenths);
+}
+
 static Color effectiveDrawColor()
 {
     if (currentBrushShape == BRUSH_ERASER)
@@ -932,35 +952,66 @@ static bool brushContainsPixelAtWholeSize(int centerX, int centerY,
         {3, 11, 1, 9},
         {15, 7, 13, 5},
     };
+    static const int spray8[8][8] = {
+        {17, 52, 3, 44, 29, 61, 11, 36},
+        {48, 7, 57, 22, 40, 1, 31, 54},
+        {13, 34, 20, 63, 9, 46, 26, 42},
+        {59, 24, 38, 5, 50, 15, 56, 0},
+        {30, 45, 10, 53, 18, 62, 4, 35},
+        {6, 51, 27, 41, 2, 47, 21, 58},
+        {43, 12, 60, 25, 37, 8, 49, 16},
+        {23, 55, 14, 39, 32, 19, 33, 28},
+    };
     const int extent = size / 2;
     if (abs(x) > extent || abs(y) > extent)
         return false;
 
     if (shape == BRUSH_SQUARE)
         return true;
+    if (shape == BRUSH_DIAMOND)
+        return abs(x) + abs(y) <= extent;
+    if (shape == BRUSH_CROSS)
+    {
+        const int arm = extent / 3;
+        return abs(x) <= arm || abs(y) <= arm;
+    }
 
-    const int radius = shape == BRUSH_DITHER ? std::max(1, extent) : extent;
+    const bool sparseShape = shape == BRUSH_DITHER || shape == BRUSH_SPRAY;
+    const int radius = sparseShape ? std::max(1, extent) : extent;
     const int dist2 = x * x + y * y;
     if (dist2 > radius * radius)
         return false;
-    if (shape != BRUSH_DITHER)
+    if (!sparseShape)
         return true;
 
+    if (dist2 == 0)
+        return true;
     const float dist = sqrtf((float)dist2);
     const float coverage = 1.0f - (dist / (float)(radius + 1));
+    if (shape == BRUSH_SPRAY)
+    {
+        const int density = (int)(18.0f + coverage * 38.0f);
+        return spray8[(centerY + y) & 7][(centerX + x) & 7] < density;
+    }
     const int threshold = bayer4[(centerY + y) & 3][(centerX + x) & 3];
-    return (int)(coverage * 16.0f) > threshold;
+    return (int)(coverage * 11.0f) > threshold;
+}
+
+static bool brushPixelIsBoundaryAtWholeSize(int centerX, int centerY,
+                                            int x, int y, int size, int shape)
+{
+    if (!brushContainsPixelAtWholeSize(centerX, centerY, x, y, size, shape))
+        return false;
+    return !brushContainsPixelAtWholeSize(centerX, centerY, x - 1, y, size, shape) ||
+           !brushContainsPixelAtWholeSize(centerX, centerY, x + 1, y, size, shape) ||
+           !brushContainsPixelAtWholeSize(centerX, centerY, x, y - 1, size, shape) ||
+           !brushContainsPixelAtWholeSize(centerX, centerY, x, y + 1, size, shape);
 }
 
 void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY,
-               int sizeTenths, int shape, u8 r, u8 g, u8 b)
+               int sizeTenths, int shape, u8 r, u8 g, u8 b,
+               bool feather = false)
 {
-    static const int bayer4[4][4] = {
-        {0, 8, 2, 10},
-        {12, 4, 14, 6},
-        {3, 11, 1, 9},
-        {15, 7, 13, 5},
-    };
     sizeTenths = clampRenderedBrushSizeTenths(sizeTenths);
     const int lowerSize = sizeTenths / 10;
     const int fraction = sizeTenths % 10;
@@ -975,35 +1026,74 @@ void drawBrush(u8 *buffer, int fbWidth, int fbHeight, int centerX, int centerY,
                 brushContainsPixelAtWholeSize(centerX, centerY, x, y, lowerSize, shape);
             const bool upperContains = fraction > 0 &&
                 brushContainsPixelAtWholeSize(centerX, centerY, x, y, upperSize, shape);
-            const int transitionThreshold =
-                (bayer4[(centerY + y) & 3][(centerX + x) & 3] * 10) / 16;
-            if (lowerContains ||
-                (upperContains && !lowerContains && transitionThreshold < fraction))
+            const bool lowerBoundary = lowerContains &&
+                brushPixelIsBoundaryAtWholeSize(
+                    centerX, centerY, x, y, lowerSize, shape);
+            const int coverageTenths = Doodle::fractionalBrushCoverageTenths(
+                lowerContains, upperContains, lowerBoundary, fraction, shape,
+                centerX + x, centerY + y, feather, x == 0 && y == 0);
+            if (coverageTenths >= 10)
                 drawPointOnBuffer(buffer, fbWidth, fbHeight,
                                   centerX + x, centerY + y, r, g, b);
+            else if (coverageTenths > 0)
+                blendPointOnBuffer(buffer, fbWidth, fbHeight,
+                                   centerX + x, centerY + y, r, g, b,
+                                   coverageTenths);
         }
     }
 }
 
-static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
-                             int screenX, int screenY, CanvasState &canvas)
+static void resetBrushStrokeSampling()
 {
-    int canvasX = canvas.screenToCanvasX(screenX);
-    int canvasY = canvas.screenToCanvasY(screenY);
-    if (canvasX < 0 || canvasX >= canvasWidth || canvasY < 0 || canvasY >= canvasHeight)
+    gLastBrushSampleX = -1;
+    gLastBrushSampleY = -1;
+}
+
+static bool shouldDrawBrushSample(int x, int y, bool force)
+{
+    if (gLastBrushSampleX == x && gLastBrushSampleY == y)
+        return false;
+    if (gLastBrushSampleX < 0 || gLastBrushSampleY < 0)
+        return true;
+
+    const int spacing = Doodle::brushStrokeSpacing(
+        currentBrushSizeTenths, effectiveBrushShape());
+    const int distance = std::max(
+        abs(x - gLastBrushSampleX), abs(y - gLastBrushSampleY));
+    return force || distance >= spacing;
+}
+
+static void drawStrokeCanvasPoint(u8 *fullCanvas, int canvasWidth, int canvasHeight,
+                                  int canvasX, int canvasY, CanvasState &canvas,
+                                  bool force = false)
+{
+    if (canvasX < 0 || canvasX >= canvasWidth ||
+        canvasY < 0 || canvasY >= canvasHeight ||
+        !shouldDrawBrushSample(canvasX, canvasY, force))
         return;
 
     Color drawColor = effectiveDrawColor();
     drawBrush(fullCanvas, canvasWidth, canvasHeight, canvasX, canvasY,
               currentBrushSizeTenths, effectiveBrushShape(),
-              drawColor.r, drawColor.g, drawColor.b);
+              drawColor.r, drawColor.g, drawColor.b, gFeatherEnabled);
     canvas.markDirty(canvasX, canvasY, brushDirtyRadius(currentBrushSizeTenths));
     UIState::addPoint(canvasX, canvasY);
+    gLastBrushSampleX = canvasX;
+    gLastBrushSampleY = canvasY;
+}
+
+static void drawStrokeSample(u8 *fullCanvas, int canvasWidth, int canvasHeight,
+                             int screenX, int screenY, CanvasState &canvas)
+{
+    const int canvasX = canvas.screenToCanvasX(screenX);
+    const int canvasY = canvas.screenToCanvasY(screenY);
+    drawStrokeCanvasPoint(fullCanvas, canvasWidth, canvasHeight,
+                          canvasX, canvasY, canvas);
 }
 
 static void drawStrokeLine(u8 *fullCanvas, int canvasWidth, int canvasHeight,
                            float x0, float y0, float x1, float y1,
-                           CanvasState &canvas)
+                           CanvasState &canvas, bool forceEnd = false)
 {
     float zoom = canvas.zoomScale();
     float cx0 = (float)canvas.offsetX + x0 / zoom;
@@ -1016,14 +1106,8 @@ static void drawStrokeLine(u8 *fullCanvas, int canvasWidth, int canvasHeight,
         float t = (float)i / (float)steps;
         int x = (int)std::round(cx0 + (cx1 - cx0) * t);
         int y = (int)std::round(cy0 + (cy1 - cy0) * t);
-        if (x < 0 || x >= canvasWidth || y < 0 || y >= canvasHeight)
-            continue;
-        Color drawColor = effectiveDrawColor();
-        drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
-                  currentBrushSizeTenths, effectiveBrushShape(),
-                  drawColor.r, drawColor.g, drawColor.b);
-        canvas.markDirty(x, y, brushDirtyRadius(currentBrushSizeTenths));
-        UIState::addPoint(x, y);
+        drawStrokeCanvasPoint(fullCanvas, canvasWidth, canvasHeight,
+                              x, y, canvas, forceEnd && i == steps);
     }
 }
 
@@ -1046,14 +1130,8 @@ static void drawStrokeCurve(u8 *fullCanvas, int canvasWidth, int canvasHeight,
         float inv = 1.0f - t;
         int x = (int)std::round(inv * inv * c0x + 2.0f * inv * t * ccx + t * t * c1x);
         int y = (int)std::round(inv * inv * c0y + 2.0f * inv * t * ccy + t * t * c1y);
-        if (x < 0 || x >= canvasWidth || y < 0 || y >= canvasHeight)
-            continue;
-        Color drawColor = effectiveDrawColor();
-        drawBrush(fullCanvas, canvasWidth, canvasHeight, x, y,
-                  currentBrushSizeTenths, effectiveBrushShape(),
-                  drawColor.r, drawColor.g, drawColor.b);
-        canvas.markDirty(x, y, brushDirtyRadius(currentBrushSizeTenths));
-        UIState::addPoint(x, y);
+        drawStrokeCanvasPoint(fullCanvas, canvasWidth, canvasHeight,
+                              x, y, canvas);
     }
 }
 
@@ -1066,32 +1144,42 @@ void processDrawPacket(const uint8_t *packet, size_t length, u8 *buffer, int fbW
     uint8_t r = packet[1];
     uint8_t g = packet[2];
     uint8_t b = packet[3];
-    int sizeTenths = packet[0] == 4 ? packet[4] : packet[4] * 10;
+    int sizeTenths = packet[0] == 4 || packet[0] == 5
+                         ? packet[4]
+                         : packet[4] * 10;
+    const bool feather = packet[0] == 5;
     uint8_t shape = packet[5];
     uint8_t numPoints = packet[6];
 
     if (length != static_cast<size_t>(7 + numPoints * 4))
         return; // Invalid packet length
 
-    int prevX = -1, prevY = -1;
+    if (numPoints == 0)
+        return;
 
-    for (int i = 0; i < numPoints; i++)
+    int prevX = *(uint16_t *)(packet + 7);
+    int prevY = *(uint16_t *)(packet + 9);
+    drawBrush(fullCanvas, canvasWidth, canvasHeight, prevX, prevY,
+              sizeTenths, shape, r, g, b, feather);
+
+    for (int i = 1; i < numPoints; i++)
     {
-        uint16_t x = *(uint16_t *)(packet + 7 + i * 4);
-        uint16_t y = *(uint16_t *)(packet + 9 + i * 4);
-
-        if (prevX != -1 && prevY != -1)
+        int x = *(uint16_t *)(packet + 7 + i * 4);
+        int y = *(uint16_t *)(packet + 9 + i * 4);
+        const int deltaX = x - prevX;
+        const int deltaY = y - prevY;
+        const int steps = Doodle::brushStrokeSegmentSteps(
+            deltaX, deltaY, sizeTenths, shape);
+        for (int step = 1; step <= steps; step++)
         {
-            // Draw line on fullCanvas
-            int steps = std::max(abs(x - prevX), abs(y - prevY));
-            for (int j = 0; j <= steps; j++)
-            {
-                float t = (steps == 0) ? 0.0f : static_cast<float>(j) / steps;
-                int drawX = prevX + (x - prevX) * t;
-                int drawY = prevY + (y - prevY) * t;
-                drawBrush(fullCanvas, canvasWidth, canvasHeight, drawX, drawY,
-                          sizeTenths, shape, r, g, b);
-            }
+            const int drawX = (int)std::round(
+                prevX + (float)deltaX * step / steps);
+            const int drawY = (int)std::round(
+                prevY + (float)deltaY * step / steps);
+            if (drawX == prevX && drawY == prevY)
+                continue;
+            drawBrush(fullCanvas, canvasWidth, canvasHeight, drawX, drawY,
+                      sizeTenths, shape, r, g, b, feather);
         }
 
         prevX = x;
@@ -1180,7 +1268,7 @@ static bool processBinaryCanvasPackets(const uint8_t *packets, size_t length, Ca
     if (!packets || length == 0)
         return false;
     uint8_t type = packets[0];
-    if (type == 1 || type == 4)
+    if (type == 1 || type == 4 || type == 5)
     {
         if (length < 7 || length != 7 + (size_t)packets[6] * 4)
             return false;
@@ -1243,7 +1331,7 @@ static void sendDrawBatchCommand(const std::vector<DrawPoint> &points, const Col
     {
         size_t count = std::min(maxPointsPerPacket, points.size() - start);
         uint8_t packet[7 + maxPointsPerPacket * 4];
-        packet[0] = 4; // Type: drawBatch with size encoded in tenths.
+        packet[0] = gFeatherEnabled ? 5 : 4;
         packet[1] = color.r;
         packet[2] = color.g;
         packet[3] = color.b;
@@ -1336,10 +1424,20 @@ static const int PICKER_COLOR_FIELD_HIT_SLOP = 4;
 static const int PICKER_HUE_STRIP_Y = 214;
 static const int PICKER_HUE_STRIP_HEIGHT = 12;
 static const int PICKER_SIZE_SLIDER_X = 82;
-static const int PICKER_SIZE_SLIDER_Y = 84;
+static const int PICKER_SIZE_SLIDER_Y = 89;
 static const int PICKER_SIZE_SLIDER_WIDTH = 220;
-static const int PICKER_SIZE_SLIDER_HIT_Y = 72;
-static const int PICKER_SIZE_SLIDER_HIT_HEIGHT = 32;
+static const int PICKER_SIZE_SLIDER_HIT_Y = 78;
+static const int PICKER_SIZE_SLIDER_HIT_HEIGHT = 26;
+static const int PICKER_TAB_Y = 7;
+static const int PICKER_TAB_WIDTH = 64;
+static const int PICKER_TAB_HEIGHT = 22;
+static const int PICKER_STAFF_TAB_X = 76;
+static const int PICKER_TOOL_GRID_X = 8;
+static const int PICKER_TOOL_GRID_Y = 33;
+static const int PICKER_TOOL_COLUMN_STEP = 76;
+static const int PICKER_TOOL_ROW_STEP = 23;
+static const int PICKER_TOOL_WIDTH = 72;
+static const int PICKER_TOOL_HEIGHT = 21;
 
 static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int activeTab,
                             bool modAllowed, Color color, const char *notice)
@@ -1347,18 +1445,36 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     UiCanvas ui(framebuffer, fbWidth, fbHeight, UI_BUFFER_3DS_ROTATED_BGR);
     ui.fill(UiRect(0, 0, 320, 240), UiTheme::Ink);
     UiComponents::panel(ui, UiRect(4, 4, 312, 232), false);
-    UiComponents::tab(ui, UiRect(8, 8, 92, 28), "Draw", activeTab == 0);
+    UiComponents::tab(
+        ui, UiRect(8, PICKER_TAB_Y, PICKER_TAB_WIDTH, PICKER_TAB_HEIGHT),
+        "Draw", activeTab == 0);
     if (modAllowed)
-        UiComponents::tab(ui, UiRect(104, 8, 92, 28), "Staff", activeTab == 1);
+        UiComponents::tab(
+            ui, UiRect(PICKER_STAFF_TAB_X, PICKER_TAB_Y,
+                       PICKER_TAB_WIDTH, PICKER_TAB_HEIGHT),
+            "Staff", activeTab == 1);
 
     if (activeTab == 0)
     {
-        static const char *shapeLabels[] = {"Circle", "Square", "Dither", "Eraser"};
-        for (int shape = 0; shape < 4; ++shape)
+        static const char *shapeLabels[] = {
+            "Circle", "Square", "Dither", "Eraser",
+            "Diamond", "Cross", "Spray"};
+        for (int shape = 0; shape < Doodle::CLIENT_BRUSH_SHAPE_COUNT; ++shape)
         {
-            UiComponents::button(ui, UiRect(8 + shape * 76, 42, 72, 28), shapeLabels[shape],
-                                 currentBrushShape == shape, shape == BRUSH_ERASER);
+            const int column = shape % 4;
+            const int row = shape / 4;
+            UiComponents::button(
+                ui, UiRect(PICKER_TOOL_GRID_X + column * PICKER_TOOL_COLUMN_STEP,
+                           PICKER_TOOL_GRID_Y + row * PICKER_TOOL_ROW_STEP,
+                           PICKER_TOOL_WIDTH, PICKER_TOOL_HEIGHT),
+                shapeLabels[shape], currentBrushShape == shape,
+                shape == BRUSH_ERASER);
         }
+        UiComponents::button(
+            ui, UiRect(PICKER_TOOL_GRID_X + 3 * PICKER_TOOL_COLUMN_STEP,
+                       PICKER_TOOL_GRID_Y + PICKER_TOOL_ROW_STEP,
+                       PICKER_TOOL_WIDTH, PICKER_TOOL_HEIGHT),
+            gFeatherEnabled ? "Feather*" : "Feather", gFeatherEnabled);
 
         char sizeLabel[32];
         snprintf(sizeLabel, sizeof(sizeLabel), "Size %d.%d",
@@ -1423,14 +1539,14 @@ static void drawToolPalette(u8 *framebuffer, int fbWidth, int fbHeight, int acti
     }
     else if (modAllowed)
     {
-        UiComponents::button(ui, UiRect(8, 48, 148, 38), "Snapshot", false);
-        UiComponents::button(ui, UiRect(164, 48, 148, 38), "Clear", false, true);
-        UiComponents::button(ui, UiRect(8, 94, 148, 38), "Fill select", false);
-        UiComponents::button(ui, UiRect(164, 94, 148, 38), "Erase select", false, true);
-        UiComponents::panel(ui, UiRect(8, 142, 304, 62), true);
-        ui.text(20, 154, "Canvas changes apply to", UiTheme::Secondary);
-        ui.text(20, 168, "the current channel.", UiTheme::Secondary);
-        ui.textClipped(20, 186, notice && notice[0] ? notice : "Choose a staff action.",
+        UiComponents::button(ui, UiRect(8, 38, 148, 38), "Snapshot", false);
+        UiComponents::button(ui, UiRect(164, 38, 148, 38), "Clear", false, true);
+        UiComponents::button(ui, UiRect(8, 84, 148, 38), "Fill select", false);
+        UiComponents::button(ui, UiRect(164, 84, 148, 38), "Erase select", false, true);
+        UiComponents::panel(ui, UiRect(8, 132, 304, 72), true);
+        ui.text(20, 146, "Canvas changes apply to", UiTheme::Secondary);
+        ui.text(20, 160, "the current channel.", UiTheme::Secondary);
+        ui.textClipped(20, 182, notice && notice[0] ? notice : "Choose a staff action.",
                        notice && notice[0] ? UiTheme::Warning : UiTheme::Ink, 280);
         UiComponents::actionBar(ui, "A/Touch Use", "", "B Close");
     }
@@ -1699,6 +1815,20 @@ struct BottomUiViewModel
     const char *notice;
 };
 
+static const int TOUCH_ROUTE_BACK_X = 214;
+static const int TOUCH_ROUTE_BACK_Y = 218;
+static const int TOUCH_ROUTE_BACK_W = 102;
+static const int TOUCH_ROUTE_BACK_H = 22;
+
+static void drawTouchRouteBack(UiCanvas &ui, const char *label = "Back")
+{
+    UiComponents::button(
+        ui,
+        UiRect(TOUCH_ROUTE_BACK_X, TOUCH_ROUTE_BACK_Y,
+               TOUCH_ROUTE_BACK_W, TOUCH_ROUTE_BACK_H),
+        label, false);
+}
+
 static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                             const BottomUiViewModel &view)
 {
@@ -1712,9 +1842,13 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
         {
             const bool danger = item == count - 1;
             if (danger)
-                UiComponents::button(ui, UiRect(4, 4 + item * 28, 312, 28),
+            {
+                UiComponents::button(ui, UiRect(4, 4 + item * 28, 154, 28),
                                      rootMenuItemLabel(item, view.staff),
                                      item == view.menuSelected, true);
+                UiComponents::button(ui, UiRect(162, 4 + item * 28, 154, 28),
+                                     "Back", false);
+            }
             else
                 UiComponents::listRow(ui, UiRect(4, 4 + item * 28, 312, 28),
                                       rootMenuItemLabel(item, view.staff), "",
@@ -1727,11 +1861,17 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
     {
         for (int item = 0; item < view.channelCount && item < 8; ++item)
         {
-            char meta[18];
+            char meta[32];
             const ChannelInfo *info = view.channelInfo ? &view.channelInfo[item] : NULL;
             const bool hasInfo = info && info->name[0];
-            if (hasInfo && info->readOnly)
+            const bool hasDimensions = hasInfo && info->width > 0 && info->height > 0;
+            if (hasInfo && info->readOnly && hasDimensions)
+                snprintf(meta, sizeof(meta), "%dx%d READ", info->width, info->height);
+            else if (hasInfo && info->readOnly)
                 snprintf(meta, sizeof(meta), "%d  READ", info->userCount);
+            else if (hasDimensions)
+                snprintf(meta, sizeof(meta), "%d %dx%d",
+                         info->userCount, info->width, info->height);
             else if (hasInfo)
                 snprintf(meta, sizeof(meta), "%d", info->userCount);
             else
@@ -1744,6 +1884,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                                    hasInfo && (info->adminOnly || info->staffOnly) && !view.staff);
         }
         UiComponents::actionBar(ui, "A Switch", "", "B Back");
+        drawTouchRouteBack(ui);
         return;
     }
 
@@ -1758,6 +1899,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                                      ACTIONS[item], item == view.peopleActionSelected,
                                      item == 3, item == 3 && !view.admin);
             UiComponents::actionBar(ui, "A Continue", "", "B People");
+            drawTouchRouteBack(ui);
             return;
         }
         UiComponents::tab(ui, UiRect(8, 4, 148, 30), "Current", !view.peopleAllChannels);
@@ -1793,6 +1935,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
         UiComponents::actionBar(ui, view.reportUserSelectionMode ? "A Report user" :
                                 (view.staff ? "A Actions" : ""),
                                 "X Scope", "B Back");
+        drawTouchRouteBack(ui);
         return;
     }
 
@@ -1805,6 +1948,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                                   ITEMS[item], META[item],
                                   item == view.staffSelected);
         UiComponents::actionBar(ui, "A Open", "", "B Back");
+        drawTouchRouteBack(ui);
         return;
     }
 
@@ -1820,6 +1964,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                                       ITEMS[item], META[item],
                                       item == view.optionsSelected);
             UiComponents::actionBar(ui, "A Open", "", "B Back");
+            drawTouchRouteBack(ui);
         }
         else if (view.optionsPage == 1 && view.settings)
         {
@@ -1853,6 +1998,8 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                 view.optionsBindingCapture ? "SELECT Cancel" : "B Back");
             if (view.optionsBindingCapture)
                 UiComponents::toast(ui, "Press any bindable button", UiTheme::Accent);
+            else
+                drawTouchRouteBack(ui);
         }
         else if (view.optionsPage == 2 && view.settings)
         {
@@ -1866,6 +2013,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
             UiComponents::listRow(ui, UiRect(8, 140, 304, 40),
                                   "Reset palette", "defaults", view.optionsSelected == 2);
             UiComponents::actionBar(ui, "A Change", "", "B Back");
+            drawTouchRouteBack(ui);
         }
         else
         {
@@ -1876,6 +2024,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
             ui.text(20, 108, "A reconnects and resyncs safely.", UiTheme::Secondary);
             UiComponents::button(ui, UiRect(20, 136, 280, 34), "Reconnect", true);
             UiComponents::actionBar(ui, "A Reconnect", "", "B Back");
+            drawTouchRouteBack(ui);
         }
         return;
     }
@@ -1895,6 +2044,8 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                 UiComponents::listRow(ui, UiRect(8, 8 + item * 34, 304, 32),
                                       items[item], "", item == view.ticketHomeSelected);
             UiComponents::actionBar(ui, "A Open", "", view.supportOnly ? "" : "B Back");
+            if (!view.supportOnly)
+                drawTouchRouteBack(ui);
         }
         else if (view.ticketView == 1)
         {
@@ -1912,6 +2063,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
             UiComponents::button(ui, UiRect(212, 172, 100, 36), "Next",
                                  false, false, !view.ticketHasNext);
             UiComponents::actionBar(ui, "A Open", "L/X/Y Page", "B Back");
+            drawTouchRouteBack(ui);
         }
         else if (view.ticketView == 2)
         {
@@ -1919,6 +2071,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
             UiComponents::button(ui, UiRect(164, 164, 148, 40), "Staff actions",
                                  false, false, !view.ticketStaffScope);
             UiComponents::actionBar(ui, "A Reply", view.ticketStaffScope ? "X Staff" : "", "B Back");
+            drawTouchRouteBack(ui);
         }
         else if (view.ticketView == 3)
         {
@@ -1930,6 +2083,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                                       ACTIONS[item], "", item == view.ticketActionSelected,
                                       false, item == 4 && !view.ticketActiveIsUnban);
             UiComponents::actionBar(ui, "A Apply", "", "B Thread");
+            drawTouchRouteBack(ui);
         }
         else if (view.ticketView == 4)
         {
@@ -1939,6 +2093,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
             UiComponents::button(ui, UiRect(8, 140, 304, 40), "Load older",
                                  false, false, !view.ticketHasNext);
             UiComponents::actionBar(ui, "A Send", "X/Y Refresh/Older", "B Staff");
+            drawTouchRouteBack(ui);
         }
         return;
     }
@@ -1956,6 +2111,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
             UiComponents::button(ui, UiRect(164, 180, 148, 36), "Recover",
                                  false, false, false);
             UiComponents::actionBar(ui, "A Create", "X Recover", "B Exit");
+            drawTouchRouteBack(ui, "Exit");
             return;
         }
         UiComponents::button(ui, UiRect(8, 46, 304, 38), "Change display name",
@@ -1969,6 +2125,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                              view.profileSelected == 3, false, view.supportOnly);
         UiComponents::actionBar(ui, view.supportOnly ? "A Reveal only" : "A Use",
                                 "", "B Back");
+        drawTouchRouteBack(ui);
         return;
     }
 
@@ -1978,6 +2135,7 @@ static void drawBottomRoute(u8 *framebuffer, int fbWidth, int fbHeight,
                              view.needsRules ? "Accept rules" : "Done", true);
         UiComponents::actionBar(ui, view.needsRules ? "A Accept" : "A Done", "",
                                 view.needsRules ? "B Exit" : "B Back");
+        drawTouchRouteBack(ui, view.needsRules ? "Exit" : "Back");
         return;
     }
 
@@ -2024,6 +2182,7 @@ int main(int argc, char **argv)
     settingsLoad = Doodle::loadClientSettings(gClientSettings);
     currentBrushShape = (int)gClientSettings.brushShape;
     currentBrushSizeTenths = gClientSettings.brushSizeTenths;
+    gFeatherEnabled = gClientSettings.brushFeatherEnabled;
     currentColor.r = gClientSettings.solidColor.r;
     currentColor.g = gClientSettings.solidColor.g;
     currentColor.b = gClientSettings.solidColor.b;
@@ -2230,11 +2389,15 @@ int main(int argc, char **argv)
     int restrictionSecondsRemaining = 0;
     u64 restrictionStartedAt = 0;
     char restrictionReason[81] = "";
-    char ticketNotice[64] = "";
-    int ticketNoticeFrames = 0;
+    Doodle::ScopedNotice<64> ticketNotice;
     char ticketDraftCategory[12] = "";
     char ticketDraftSubject[65] = "";
     char ticketDraftDetails[241] = "";
+    char ticketReportDisplayName[25] = "";
+    char ticketReportUsername[25] = "";
+    char ticketReportIdentity[40] = "";
+    char ticketReportChannel[25] = "";
+    char ticketReportReason[91] = "";
     bool ticketDraftPreview = false;
     bool ticketDraftSendPending = false;
     char ticketReplyDraft[241] = "";
@@ -2324,9 +2487,35 @@ int main(int argc, char **argv)
 
     auto setTicketNotice = [&](const char *notice)
     {
-        snprintf(ticketNotice, sizeof(ticketNotice), "%.63s", notice ? notice : "");
-        ticketNoticeFrames = ticketNotice[0] ? 240 : 0;
+        ticketNotice.set(notice, ticketView, osGetTime(), 1800);
         topRenderFrame = 10;
+    };
+
+    auto setTicketLoadingNotice = [&](const char *notice)
+    {
+        ticketNotice.set(notice, ticketView, osGetTime(), 10000, true);
+        topRenderFrame = 10;
+    };
+
+    auto clearTicketLoadingNotice = [&]()
+    {
+        if (ticketNotice.clearPending())
+            topRenderFrame = 10;
+    };
+
+    auto clearTicketDraft = [&]()
+    {
+        ticketDraftCategory[0] = '\0';
+        ticketDraftSubject[0] = '\0';
+        ticketDraftDetails[0] = '\0';
+        ticketReportDisplayName[0] = '\0';
+        ticketReportUsername[0] = '\0';
+        ticketReportIdentity[0] = '\0';
+        ticketReportChannel[0] = '\0';
+        ticketReportReason[0] = '\0';
+        ticketDraftPreview = false;
+        ticketDraftSendPending = false;
+        reportUserSelectionMode = false;
     };
 
     auto markClientSettingsDirty = [&]()
@@ -2359,6 +2548,7 @@ int main(int argc, char **argv)
         gClientSettings.brushShape = (Doodle::ClientBrushShape)std::max(
             0, std::min(persistedBrushShape, (int)Doodle::CLIENT_BRUSH_SHAPE_COUNT - 1));
         gClientSettings.brushSizeTenths = clampBrushSizeTenths(persistedBrushSizeTenths);
+        gClientSettings.brushFeatherEnabled = gFeatherEnabled;
         gClientSettings.solidColor.r = currentColor.r;
         gClientSettings.solidColor.g = currentColor.g;
         gClientSettings.solidColor.b = currentColor.b;
@@ -2461,7 +2651,7 @@ int main(int argc, char **argv)
     {
         if (ticketListLoading)
         {
-            setTicketNotice("WAIT FOR CURRENT PAGE");
+            setTicketLoadingNotice("WAIT FOR CURRENT PAGE");
             return false;
         }
         char command[192];
@@ -2478,7 +2668,7 @@ int main(int argc, char **argv)
             memcpy(pendingTicketCursorHistory, history,
                    sizeof(TicketCursor) * pendingTicketCursorHistoryCount);
         ticketListLoading = true;
-        setTicketNotice(notice);
+        setTicketLoadingNotice(notice);
         return true;
     };
 
@@ -2573,6 +2763,7 @@ int main(int argc, char **argv)
         {
             staffChatNextBeforeId = parsedStaffNextBeforeId;
             ticketView = 4;
+            clearTicketLoadingNotice();
             topRenderFrame = 10;
             return true;
         }
@@ -2641,6 +2832,7 @@ int main(int argc, char **argv)
             }
             ticketSelected = std::max(0, std::min(ticketSelected, std::max(0, ticketListCount - 1)));
             ticketView = 1;
+            clearTicketLoadingNotice();
             topRenderFrame = 10;
             return true;
         }
@@ -2651,6 +2843,7 @@ int main(int argc, char **argv)
             (void)parsedThreadId;
             ticketNextBeforeMessageId = parsedNextMessage;
             ticketView = 2;
+            clearTicketLoadingNotice();
             topRenderFrame = 10;
             return true;
         }
@@ -2664,11 +2857,7 @@ int main(int argc, char **argv)
             {
                 setTicketNotice("TICKET ACTION OK");
                 if (strcmp(ticketAction, "create") == 0 && ticketDraftSendPending)
-                {
-                    ticketDraftSendPending = false;
-                    ticketDraftSubject[0] = '\0';
-                    ticketDraftDetails[0] = '\0';
-                }
+                    clearTicketDraft();
                 if (strcmp(ticketAction, "reply") == 0 && ticketReplySendPending)
                 {
                     ticketReplySendPending = false;
@@ -3040,7 +3229,7 @@ int main(int argc, char **argv)
         bool receivedMeta = false;
         bool initialHelloSent = true;
         std::vector<uint8_t> initialCanvas;
-        u64 initialDeadline = osGetTime() + 15000;
+        u64 initialDeadline = osGetTime() + 30000;
         NetworkEvent event;
         while (osGetTime() < initialDeadline)
         {
@@ -3109,9 +3298,13 @@ int main(int argc, char **argv)
                 if (!isValidCanvasMeta(meta))
                 {
                     printf("Invalid initial canvas size: %d\n", meta.compressedSize);
+                    snprintf(gDisconnectReason, sizeof(gDisconnectReason),
+                             "UNSUPPORTED CANVAS %dX%d", meta.width, meta.height);
                     break;
                 }
                 receivedMeta = true;
+                initialDeadline = osGetTime() +
+                    Doodle::canvasSnapshotTimeoutMs(meta.compressedSize);
             }
         }
 
@@ -3142,7 +3335,8 @@ int main(int argc, char **argv)
                     fullCanvas = canvas.pixels;
                     Renderer::invalidateMinimap();
                     rememberSuccessfulChannel(canvas.channel);
-                    printf("Canvas decompressed successfully.\n");
+                    printf("Canvas decompressed successfully (%dx%d, capacity %d bytes).\n",
+                           canvas.width, canvas.height, canvas.capacity);
                 }
                 else
                 {
@@ -3164,7 +3358,8 @@ int main(int argc, char **argv)
             canvas.allocate(canvasWidth, canvasHeight);
             canvas.setChannel("main");
             fullCanvas = canvas.pixels;
-            snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SYNC FAILED - RETRYING");
+            if (!gDisconnectReason[0])
+                snprintf(gDisconnectReason, sizeof(gDisconnectReason), "SYNC FAILED - RETRYING");
             topMode = TOP_MODE_STATUS;
             NetworkManager::reconnect();
         }
@@ -3316,6 +3511,8 @@ int main(int argc, char **argv)
         if (adminNoticeFrames > 0 && adminNoticeExpiresAt > 0 &&
             osGetTime() >= adminNoticeExpiresAt)
             clearAdminNotice();
+        if (ticketNotice.expire(osGetTime()))
+            topRenderFrame = 10;
         if (clientSettingsDirty && clientSettingsSaveAfter > 0 &&
             osGetTime() >= clientSettingsSaveAfter)
             flushClientSettings();
@@ -3596,6 +3793,29 @@ int main(int argc, char **argv)
             continue;
         }
 
+        const bool routeTouchBackAvailable =
+            topMode == TOP_MODE_CHANNELS ||
+            topMode == TOP_MODE_USERS ||
+            topMode == TOP_MODE_STAFF_CENTER ||
+            topMode == TOP_MODE_OPTIONS ||
+            topMode == TOP_MODE_IDENTITY ||
+            topMode == TOP_MODE_RULES ||
+            (topMode == TOP_MODE_TICKETS &&
+             (!supportOnlyMode || ticketView != 0));
+        if (routeTouchBackAvailable &&
+            !higherPriorityConfirmation &&
+            !recoveryCodeExplanation &&
+            !optionsBindingCapture &&
+            (kDown & KEY_TOUCH) &&
+            pointInRect(touch.px, touch.py,
+                        TOUCH_ROUTE_BACK_X, TOUCH_ROUTE_BACK_Y,
+                        TOUCH_ROUTE_BACK_W, TOUCH_ROUTE_BACK_H))
+        {
+            kDown &= ~KEY_TOUCH;
+            kDown |= KEY_B;
+            suppressTouchUntilRelease = true;
+        }
+
         if (!supportOnlyMode && topMode == TOP_MODE_CANVAS &&
             !gDisconnectReason[0] && !higherPriorityConfirmation &&
             !UIState::isColorPickerActive() &&
@@ -3653,9 +3873,18 @@ int main(int argc, char **argv)
             bool activateMenuItem = (kDown & KEY_A) != 0;
             if (kDown & KEY_TOUCH)
             {
+                const int finalRowY = 4 + (menuCount - 1) * 28;
+                if (pointInRect(touch.px, touch.py, 162, finalRowY, 154, 28))
+                {
+                    topMode = TOP_MODE_CANVAS;
+                    routeStack.reset(TOP_MODE_CANVAS);
+                    topRenderFrame = 10;
+                    continue;
+                }
                 for (int item = 0; item < menuCount; ++item)
                 {
-                    if (pointInRect(touch.px, touch.py, 4, 4 + item * 28, 312, 28))
+                    const int itemWidth = item == menuCount - 1 ? 154 : 312;
+                    if (pointInRect(touch.px, touch.py, 4, 4 + item * 28, itemWidth, 28))
                     {
                         selectedMenuItem = item;
                         activateMenuItem = true;
@@ -3773,7 +4002,7 @@ int main(int argc, char **argv)
                     char command[96];
                     Protocol::buildStaffChatList(command, sizeof(command));
                     if (sendTicketCommand(command))
-                        setTicketNotice("LOADING STAFF CHAT");
+                        setTicketLoadingNotice("LOADING STAFF CHAT");
                     topMode = TOP_MODE_TICKETS;
                 }
                 else if (selectedAdminItem == 2)
@@ -4049,7 +4278,13 @@ int main(int argc, char **argv)
             {
                 const bool sendPreview = (kDown & KEY_A) ||
                                          ((kDown & KEY_TOUCH) &&
-                                          pointInRect(touch.px, touch.py, 8, 200, 148, 34));
+                                          pointInRect(touch.px, touch.py, 8, 200, 96, 34));
+                const bool editPreview = (kDown & KEY_B) ||
+                                         ((kDown & KEY_TOUCH) &&
+                                          pointInRect(touch.px, touch.py, 110, 200, 96, 34));
+                const bool cancelPreview = (kDown & KEY_X) ||
+                                           ((kDown & KEY_TOUCH) &&
+                                            pointInRect(touch.px, touch.py, 212, 200, 100, 34));
                 if (sendPreview)
                 {
                     char command[1024];
@@ -4061,17 +4296,41 @@ int main(int argc, char **argv)
                     {
                         ticketDraftPreview = false;
                         ticketDraftSendPending = true;
-                        setTicketNotice("SENDING REQUEST");
+                        setTicketLoadingNotice("SENDING REQUEST");
                     }
                 }
-                else if ((kDown & KEY_B) ||
-                         ((kDown & KEY_TOUCH) &&
-                          pointInRect(touch.px, touch.py, 164, 200, 148, 34)))
+                else if (editPreview)
                 {
-                    readKeyboardText("Ticket subject", ticketDraftSubject,
-                                     sizeof(ticketDraftSubject), ticketDraftSubject);
-                    readKeyboardText("Ticket details", ticketDraftDetails,
-                                     sizeof(ticketDraftDetails), ticketDraftDetails);
+                    if (strcmp(ticketDraftCategory, "report") == 0)
+                    {
+                        if (readKeyboardText(
+                                "Reason for report", ticketReportReason,
+                                sizeof(ticketReportReason), ticketReportReason))
+                        {
+                            Doodle::buildUserReportDraft(
+                                ticketDraftSubject, sizeof(ticketDraftSubject),
+                                ticketDraftDetails, sizeof(ticketDraftDetails),
+                                ticketReportDisplayName,
+                                ticketReportUsername,
+                                ticketReportIdentity,
+                                ticketReportChannel,
+                                ticketReportReason);
+                        }
+                    }
+                    else
+                    {
+                        readKeyboardText("Ticket subject", ticketDraftSubject,
+                                         sizeof(ticketDraftSubject), ticketDraftSubject);
+                        readKeyboardText("Ticket details", ticketDraftDetails,
+                                         sizeof(ticketDraftDetails), ticketDraftDetails);
+                    }
+                }
+                else if (cancelPreview)
+                {
+                    clearTicketDraft();
+                    ticketNotice.clear();
+                    ticketView = 0;
+                    topRenderFrame = 10;
                 }
                 continue;
             }
@@ -4079,7 +4338,13 @@ int main(int argc, char **argv)
             {
                 const bool sendPreview = (kDown & KEY_A) ||
                                          ((kDown & KEY_TOUCH) &&
-                                          pointInRect(touch.px, touch.py, 8, 200, 148, 34));
+                                          pointInRect(touch.px, touch.py, 8, 200, 96, 34));
+                const bool editPreview = (kDown & KEY_B) ||
+                                         ((kDown & KEY_TOUCH) &&
+                                          pointInRect(touch.px, touch.py, 110, 200, 96, 34));
+                const bool cancelPreview = (kDown & KEY_X) ||
+                                           ((kDown & KEY_TOUCH) &&
+                                            pointInRect(touch.px, touch.py, 212, 200, 100, 34));
                 if (sendPreview)
                 {
                     char command[640];
@@ -4091,15 +4356,23 @@ int main(int argc, char **argv)
                     {
                         ticketReplyPreview = false;
                         ticketReplySendPending = true;
-                        setTicketNotice("SENDING REPLY");
+                        setTicketLoadingNotice("SENDING REPLY");
                     }
                 }
-                else if ((kDown & KEY_B) ||
-                         ((kDown & KEY_TOUCH) &&
-                          pointInRect(touch.px, touch.py, 164, 200, 148, 34)))
+                else if (editPreview)
                 {
                     readKeyboardText("Ticket reply", ticketReplyDraft,
                                      sizeof(ticketReplyDraft), ticketReplyDraft);
+                }
+                else if (cancelPreview)
+                {
+                    ticketReplyPreview = false;
+                    ticketReplySendPending = false;
+                    ticketReplyDraft[0] = '\0';
+                    ticketReplyDraftTicketId = 0;
+                    ticketReplyDraftStaff = false;
+                    ticketNotice.clear();
+                    topRenderFrame = 10;
                 }
                 continue;
             }
@@ -4191,6 +4464,11 @@ int main(int argc, char **argv)
                     {
                         const char *category = supportOnlyMode ? "unban" :
                                                (ticketHomeSelected == 0 ? "bug" : "feature");
+                        ticketReportDisplayName[0] = '\0';
+                        ticketReportUsername[0] = '\0';
+                        ticketReportIdentity[0] = '\0';
+                        ticketReportChannel[0] = '\0';
+                        ticketReportReason[0] = '\0';
                         snprintf(ticketDraftCategory, sizeof(ticketDraftCategory), "%s", category);
                         if (!readKeyboardText("Ticket subject", ticketDraftSubject,
                                               sizeof(ticketDraftSubject), ticketDraftSubject))
@@ -4258,7 +4536,7 @@ int main(int argc, char **argv)
                     char command[128];
                     Protocol::buildTicketGet(command, sizeof(command), ticketList[ticketSelected].id);
                     if (sendTicketCommand(command))
-                        setTicketNotice("LOADING THREAD");
+                        setTicketLoadingNotice("LOADING THREAD");
                     continue;
                 }
                 const bool refreshPage = (kDown & KEY_X) != 0 || touchRefresh;
@@ -4431,8 +4709,8 @@ int main(int argc, char **argv)
 
                     if (command[0] && sendTicketCommand(command))
                     {
-                        setTicketNotice("STAFF ACTION SENT");
                         ticketView = 2;
+                        setTicketLoadingNotice("STAFF ACTION SENT");
                     }
                     continue;
                 }
@@ -4461,7 +4739,8 @@ int main(int argc, char **argv)
                     if (!readKeyboardText("Staff message", message, sizeof(message), "")) continue;
                     char command[640];
                     Protocol::buildStaffChatSend(command, sizeof(command), message);
-                    if (sendTicketCommand(command)) setTicketNotice("STAFF MESSAGE SENT");
+                    if (sendTicketCommand(command))
+                        setTicketLoadingNotice("SENDING STAFF MESSAGE");
                     continue;
                 }
                 if ((kDown & KEY_X) || touchRefresh ||
@@ -4473,8 +4752,8 @@ int main(int argc, char **argv)
                     Protocol::buildStaffChatList(command, sizeof(command),
                                                  older ? staffChatNextBeforeId : 0);
                     if (sendTicketCommand(command))
-                        setTicketNotice(older ? "LOADING OLDER CHAT" :
-                                                  "REFRESHING STAFF CHAT");
+                        setTicketLoadingNotice(older ? "LOADING OLDER CHAT" :
+                                                         "REFRESHING STAFF CHAT");
                     continue;
                 }
             }
@@ -4637,18 +4916,29 @@ int main(int argc, char **argv)
                     }
                     const PresenceUser &target = connectedUsers[peopleIndices[selectedPerson]];
                     const char *name = peopleName(target);
-                    snprintf(ticketDraftCategory, sizeof(ticketDraftCategory), "report");
-                    snprintf(ticketDraftSubject, sizeof(ticketDraftSubject),
-                             "Report: %.48s", name);
-                    snprintf(ticketDraftDetails, sizeof(ticketDraftDetails),
-                             "Reported user: %.48s\nAccount: %.24s\nIdentity/session: %.39s\nChannel: %.24s\nReason: ",
-                             name,
-                             target.username[0] ? target.username : "anonymous",
-                             target.identityId[0] ? target.identityId : target.id,
-                             target.channel[0] ? target.channel : canvas.channel);
-                    if (readKeyboardText("Report details", ticketDraftDetails,
-                                         sizeof(ticketDraftDetails), ticketDraftDetails))
+                    char reportReason[91] = "";
+                    if (readKeyboardText("Reason for report", reportReason,
+                                         sizeof(reportReason), ""))
                     {
+                        snprintf(ticketDraftCategory, sizeof(ticketDraftCategory), "report");
+                        snprintf(ticketReportDisplayName, sizeof(ticketReportDisplayName),
+                                 "%s", name);
+                        snprintf(ticketReportUsername, sizeof(ticketReportUsername),
+                                 "%s", target.username[0] ? target.username : "anonymous");
+                        snprintf(ticketReportIdentity, sizeof(ticketReportIdentity),
+                                 "%s", target.identityId[0] ? target.identityId : target.id);
+                        snprintf(ticketReportChannel, sizeof(ticketReportChannel),
+                                 "%s", target.channel[0] ? target.channel : canvas.channel);
+                        snprintf(ticketReportReason, sizeof(ticketReportReason),
+                                 "%s", reportReason);
+                        Doodle::buildUserReportDraft(
+                            ticketDraftSubject, sizeof(ticketDraftSubject),
+                            ticketDraftDetails, sizeof(ticketDraftDetails),
+                            ticketReportDisplayName,
+                            ticketReportUsername,
+                            ticketReportIdentity,
+                            ticketReportChannel,
+                            ticketReportReason);
                         reportUserSelectionMode = false;
                         ticketDraftPreview = true;
                         ticketView = 0;
@@ -5250,14 +5540,17 @@ int main(int argc, char **argv)
             pickerDragTarget != PICKER_DRAG_COLOR &&
             pickerDragTarget != PICKER_DRAG_HUE)
         {
-            if (pointInRect(touch.px, touch.py, 8, 8, 92, 28))
+            if (pointInRect(touch.px, touch.py, 8, PICKER_TAB_Y,
+                            PICKER_TAB_WIDTH, PICKER_TAB_HEIGHT))
             {
                 pickerTab = 0;
                 pickerDragTarget = PICKER_DRAG_NONE;
                 topRenderFrame = 10;
                 continue;
             }
-            if (isModOrAdmin() && pointInRect(touch.px, touch.py, 104, 8, 92, 28))
+            if (isModOrAdmin() &&
+                pointInRect(touch.px, touch.py, PICKER_STAFF_TAB_X, PICKER_TAB_Y,
+                            PICKER_TAB_WIDTH, PICKER_TAB_HEIGHT))
             {
                 pickerTab = 1;
                 pickerDragTarget = PICKER_DRAG_NONE;
@@ -5272,18 +5565,18 @@ int main(int argc, char **argv)
                     setAdminNotice("MOD OR ADMIN REQUIRED");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 8, 48, 148, 38))
+                if (pointInRect(touch.px, touch.py, 8, 38, 148, 38))
                 {
                     sendAdminCanvasCommand("snapshot", 0, 0, 1, 1, currentColor);
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 164, 48, 148, 38))
+                if (pointInRect(touch.px, touch.py, 164, 38, 148, 38))
                 {
                     confirmClearCanvas = true;
                     setAdminNotice("CONFIRM CLEAR");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 8, 94, 148, 38))
+                if (pointInRect(touch.px, touch.py, 8, 84, 148, 38))
                 {
                     pendingAdminRectTool = ADMIN_RECT_FILL;
                     adminRectDragging = false;
@@ -5292,7 +5585,7 @@ int main(int argc, char **argv)
                     setAdminNotice("DRAG SELECTION");
                     continue;
                 }
-                if (pointInRect(touch.px, touch.py, 164, 94, 148, 38))
+                if (pointInRect(touch.px, touch.py, 164, 84, 148, 38))
                 {
                     pendingAdminRectTool = ADMIN_RECT_ERASE;
                     adminRectDragging = false;
@@ -5327,14 +5620,32 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            for (int shape = 0; shape < 4; ++shape)
+            for (int shape = 0; shape < Doodle::CLIENT_BRUSH_SHAPE_COUNT; ++shape)
             {
-                if (pointInRect(touch.px, touch.py, 8 + shape * 76, 42, 72, 28))
+                const int column = shape % 4;
+                const int row = shape / 4;
+                if (pointInRect(
+                        touch.px, touch.py,
+                        PICKER_TOOL_GRID_X + column * PICKER_TOOL_COLUMN_STEP,
+                        PICKER_TOOL_GRID_Y + row * PICKER_TOOL_ROW_STEP,
+                        PICKER_TOOL_WIDTH, PICKER_TOOL_HEIGHT))
                 {
                     currentBrushShape = shape;
                     markClientSettingsDirty();
                     continue;
                 }
+            }
+            if (pointInRect(
+                    touch.px, touch.py,
+                    PICKER_TOOL_GRID_X + 3 * PICKER_TOOL_COLUMN_STEP,
+                    PICKER_TOOL_GRID_Y + PICKER_TOOL_ROW_STEP,
+                    PICKER_TOOL_WIDTH, PICKER_TOOL_HEIGHT))
+            {
+                gFeatherEnabled = !gFeatherEnabled;
+                markClientSettingsDirty();
+                setAdminNotice(
+                    gFeatherEnabled ? "FEATHER ENABLED" : "FEATHER DISABLED");
+                continue;
             }
             if (pointInRect(touch.px, touch.py, 110, 166, 30, 28))
             {
@@ -5532,6 +5843,7 @@ int main(int argc, char **argv)
                     lastStrokeX = (float)touch.px;
                     lastStrokeY = (float)touch.py;
                     hasLastStrokePoint = true;
+                    resetBrushStrokeSampling();
                     canvas.offsetX = offsetX;
                     canvas.offsetY = offsetY;
                     drawStrokeSample(fullCanvas, canvasWidth, canvasHeight, touch.px, touch.py, canvas);
@@ -5588,7 +5900,7 @@ int main(int argc, char **argv)
                     drawStrokeLine(fullCanvas, canvasWidth, canvasHeight,
                                    lastStrokeX, lastStrokeY,
                                    (float)prevTouchX, (float)prevTouchY,
-                                   canvas);
+                                   canvas, true);
                 }
 
                 if (!UIState::getPoints().empty())
@@ -5608,6 +5920,7 @@ int main(int argc, char **argv)
                 prevTouchX = prevTouchY = -1;
                 prevPrevTouchX = prevPrevTouchY = -1;
                 hasLastStrokePoint = false;
+                resetBrushStrokeSampling();
             }
         }
 
@@ -5676,14 +5989,24 @@ int main(int argc, char **argv)
                 {
                     if (!isValidCanvasMeta(meta))
                     {
-                        setAdminNotice("INVALID CANVAS SIZE");
+                        setAdminNotice("UNSUPPORTED CANVAS SIZE");
+                        snprintf(gDisconnectReason, sizeof(gDisconnectReason),
+                                 "UNSUPPORTED CANVAS %dX%d", meta.width, meta.height);
+                        topMode = TOP_MODE_STATUS;
+                        topRenderFrame = 10;
                         NetworkManager::reconnect();
                         continue;
                     }
                     realtimeCanvasMeta = meta;
                     realtimeCanvasPending = true;
                     sessionAwaitingSnapshot = true;
-                    sessionSnapshotDeadline = osGetTime() + 30000;
+                    sessionSnapshotDeadline = osGetTime() +
+                        Doodle::canvasSnapshotTimeoutMs(meta.compressedSize);
+                    snprintf(gDisconnectReason, sizeof(gDisconnectReason),
+                             "SYNCING %dX%d CANVAS", meta.width, meta.height);
+                    setAdminNotice(gDisconnectReason);
+                    topMode = TOP_MODE_STATUS;
+                    topRenderFrame = 10;
                     continue;
                 }
 
@@ -5714,6 +6037,8 @@ int main(int argc, char **argv)
                 {
                     size_t expectedSize = (size_t)realtimeCanvasMeta.compressedSize;
                     bool loaded = networkEvent.payload.size() == expectedSize;
+                    const bool resetViewport = Doodle::shouldResetCanvasViewport(
+                        canvas.channel, realtimeCanvasMeta.channel);
                     if (loaded)
                     {
                         canvasWidth = realtimeCanvasMeta.width;
@@ -5726,7 +6051,8 @@ int main(int argc, char **argv)
                     if (loaded)
                     {
                         fullCanvas = canvas.pixels;
-                        offsetX = offsetY = 0;
+                        if (resetViewport)
+                            offsetX = offsetY = 0;
                         clampOffsets(offsetX, offsetY);
                         canvas.markFullDirty();
                         Renderer::invalidateMinimap();
@@ -5754,7 +6080,8 @@ int main(int argc, char **argv)
                         else
                             topMode = TOP_MODE_CANVAS;
                         topRenderFrame = 10;
-                        printf("Loaded WebSocket canvas %s.\n", canvas.channel);
+                        printf("Loaded WebSocket canvas %s (%dx%d, capacity %d bytes).\n",
+                               canvas.channel, canvas.width, canvas.height, canvas.capacity);
                     }
                     else
                     {
@@ -5909,12 +6236,6 @@ int main(int argc, char **argv)
                 topRenderFrame = 10;
             }
         }
-        if (ticketNoticeFrames > 0)
-        {
-            ticketNoticeFrames--;
-            if (ticketNoticeFrames == 0)
-                topRenderFrame = 10;
-        }
         if (!activelyDrawing && (topRenderFrame >= 10 || canvasWasDirty))
         {
             bool renderStaffScope = ticketView == 0 ? isModOrAdmin() : ticketStaffScope;
@@ -5965,7 +6286,9 @@ int main(int argc, char **argv)
                                 staffChatMessages, staffChatMessageCount,
                                 ticketHomeSelected, ticketActionSelected,
                                 supportOnlyMode, supportOnlyReasonText,
-                                ticketNoticeFrames > 0 ? ticketNotice : "", renderedOpenCount,
+                                ticketNotice.visible(ticketView, osGetTime())
+                                    ? ticketNotice.text() : "",
+                                renderedOpenCount,
                                 isModOrAdmin() ? staffChatUnread : 0,
                                 restrictionSecondsRemaining, restrictionHasDuration,
                                 restrictionReason, &rendererState);
@@ -6120,8 +6443,12 @@ int main(int argc, char **argv)
             overlayUi.fill(UiRect(0, 0, 320, 240), UiTheme::Background);
             UiComponents::panel(overlayUi, UiRect(8, 8, 304, 184), true);
             overlayUi.stroke(UiRect(8, 8, 304, 184), UiTheme::Accent, 2);
-            overlayUi.text(20, 20, "Review request", UiTheme::Ink, 2);
-            UiComponents::badge(overlayUi, UiRect(220, 18, 80, 20),
+            overlayUi.text(
+                20, 20,
+                strcmp(ticketDraftCategory, "report") == 0
+                    ? "Review user report" : "Review request",
+                UiTheme::Ink, 2);
+            UiComponents::badge(overlayUi, UiRect(238, 18, 62, 20),
                                 ticketDraftCategory, UiTheme::Accent);
             overlayUi.text(20, 48, "Subject", UiTheme::Secondary);
             overlayUi.wrappedText(20, 62, ticketDraftSubject,
@@ -6129,10 +6456,12 @@ int main(int argc, char **argv)
             overlayUi.text(20, 84, "Details", UiTheme::Secondary);
             overlayUi.wrappedText(20, 98, ticketDraftDetails,
                                   UiTheme::Ink, 280, 8, 11);
-            UiComponents::button(overlayUi, UiRect(8, 200, 148, 34),
+            UiComponents::button(overlayUi, UiRect(8, 200, 96, 34),
                                  "A Send", true);
-            UiComponents::button(overlayUi, UiRect(164, 200, 148, 34),
+            UiComponents::button(overlayUi, UiRect(110, 200, 96, 34),
                                  "B Edit", false, false, false);
+            UiComponents::button(overlayUi, UiRect(212, 200, 100, 34),
+                                 "X Cancel", false, true, false);
         }
         else if (ticketReplyPreview)
         {
@@ -6143,10 +6472,12 @@ int main(int argc, char **argv)
             overlayUi.text(20, 52, "Message", UiTheme::Secondary);
             overlayUi.wrappedText(20, 68, ticketReplyDraft,
                                   UiTheme::Ink, 280, 10, 11);
-            UiComponents::button(overlayUi, UiRect(8, 200, 148, 34),
+            UiComponents::button(overlayUi, UiRect(8, 200, 96, 34),
                                  "A Send", true);
-            UiComponents::button(overlayUi, UiRect(164, 200, 148, 34),
+            UiComponents::button(overlayUi, UiRect(110, 200, 96, 34),
                                  "B Edit", false, false, false);
+            UiComponents::button(overlayUi, UiRect(212, 200, 100, 34),
+                                 "X Cancel", false, true, false);
         }
         else if (recoveryCodeExplanation)
         {

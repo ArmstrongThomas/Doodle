@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "timestamp_format.h"
 #include "ui_canvas.h"
 #include <algorithm>
 #include <math.h>
@@ -417,10 +418,21 @@ static void composeChannelTopFrame(CanvasState &canvas, bool connected, bool upd
         {
             const char *access = info->adminOnly ? "ADMIN" : info->staffOnly ? "STAFF" : "";
             const char *readOnly = info->readOnly ? "READ ONLY" : "";
-            if (access[0] && readOnly[0])
+            const bool hasDimensions = info->width > 0 && info->height > 0;
+            if (access[0] && readOnly[0] && hasDimensions)
+                snprintf(meta, sizeof(meta), "%d  %dx%d  %s/%s",
+                         info->userCount, info->width, info->height, access, readOnly);
+            else if ((access[0] || readOnly[0]) && hasDimensions)
+                snprintf(meta, sizeof(meta), "%d  %dx%d  %s",
+                         info->userCount, info->width, info->height,
+                         access[0] ? access : readOnly);
+            else if (access[0] && readOnly[0])
                 snprintf(meta, sizeof(meta), "%d  %s / %s", info->userCount, access, readOnly);
             else if (access[0] || readOnly[0])
                 snprintf(meta, sizeof(meta), "%d  %s", info->userCount, access[0] ? access : readOnly);
+            else if (hasDimensions)
+                snprintf(meta, sizeof(meta), "%d online  %dx%d",
+                         info->userCount, info->width, info->height);
             else
                 snprintf(meta, sizeof(meta), "%d online", info->userCount);
         }
@@ -882,9 +894,9 @@ static void composeTicketsTopFrame(bool connected, bool updateAvailable,
         int y = firstY;
         for (int i = start; messages && i < messageCount && y < 200; i++)
         {
-            char timeText[6] = "--:--";
-            if (messages[i].createdAt[11] && messages[i].createdAt[12] && messages[i].createdAt[14] && messages[i].createdAt[15])
-                snprintf(timeText, sizeof(timeText), "%.2s:%.2s", messages[i].createdAt + 11, messages[i].createdAt + 14);
+            char timeText[18];
+            Doodle::formatIsoMinuteTimestamp(
+                messages[i].createdAt, timeText, sizeof(timeText));
             char authorKind[20], author[72];
             formatTitleLabel(messages[i].authorKind, authorKind, sizeof(authorKind));
             snprintf(author, sizeof(author), "[%s] %s  %s", authorKind,
@@ -933,9 +945,9 @@ static void composeTicketsTopFrame(bool connected, bool updateAvailable,
         int y = firstY;
         for (int i = start; staffMessages && i < staffMessageCount && y < 200; i++)
         {
-            char timeText[6] = "--:--";
-            if (staffMessages[i].createdAt[11] && staffMessages[i].createdAt[12] && staffMessages[i].createdAt[14] && staffMessages[i].createdAt[15])
-                snprintf(timeText, sizeof(timeText), "%.2s:%.2s", staffMessages[i].createdAt + 11, staffMessages[i].createdAt + 14);
+            char timeText[18];
+            Doodle::formatIsoMinuteTimestamp(
+                staffMessages[i].createdAt, timeText, sizeof(timeText));
             char role[16], prefix[72];
             const char *name = staffMessages[i].displayName[0] ? staffMessages[i].displayName : staffMessages[i].username;
             formatTitleLabel(staffMessages[i].role, role, sizeof(role));

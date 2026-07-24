@@ -36,6 +36,7 @@ public:
     int width;
     int height;
     int size;
+    int capacity;
     int offsetX;
     int offsetY;
     int zoomLevel;

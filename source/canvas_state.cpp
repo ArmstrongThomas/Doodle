@@ -3,7 +3,7 @@
 #include <cmath>
 
 CanvasState::CanvasState()
-    : width(0), height(0), size(0), offsetX(0), offsetY(0), zoomLevel(0), pixels(NULL)
+    : width(0), height(0), size(0), capacity(0), offsetX(0), offsetY(0), zoomLevel(0), pixels(NULL)
 {
     channel[0] = '\0';
     clearDirty();
@@ -17,16 +17,20 @@ CanvasState::~CanvasState()
 
 bool CanvasState::allocate(int newWidth, int newHeight)
 {
-    int newSize = newWidth * newHeight * 3;
-    if (newSize <= 0)
+    if (newWidth <= 0 || newHeight <= 0)
         return false;
+    const uint64_t newSize64 = (uint64_t)newWidth * (uint64_t)newHeight * 3ULL;
+    if (newSize64 == 0 || newSize64 > 0x7fffffffULL)
+        return false;
+    const int newSize = (int)newSize64;
 
-    if (newSize != size)
+    if (newSize > capacity)
     {
         u8 *nextPixels = (u8 *)realloc(pixels, newSize);
         if (!nextPixels)
             return false;
         pixels = nextPixels;
+        capacity = newSize;
     }
 
     width = newWidth;
@@ -57,7 +61,7 @@ bool CanvasState::loadFromCompressed(const u8 *compressedData, size_t compressed
     int ret = inflate(&strm, Z_FINISH);
     inflateEnd(&strm);
 
-    if (ret == Z_STREAM_END)
+    if (ret == Z_STREAM_END && strm.total_out == (uLong)size)
     {
         markFullDirty();
         return true;

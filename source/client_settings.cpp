@@ -100,6 +100,25 @@ static bool parseBrushSizeTenths(const char *text, int &value)
     return true;
 }
 
+static bool parseBoolean(const char *text, bool &value)
+{
+    if (asciiEqualIgnoreCase(text, "1") ||
+        asciiEqualIgnoreCase(text, "true") ||
+        asciiEqualIgnoreCase(text, "on"))
+    {
+        value = true;
+        return true;
+    }
+    if (asciiEqualIgnoreCase(text, "0") ||
+        asciiEqualIgnoreCase(text, "false") ||
+        asciiEqualIgnoreCase(text, "off"))
+    {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
 static int hexValue(char value)
 {
     if (value >= '0' && value <= '9')
@@ -347,6 +366,12 @@ static bool parseSettingsFile(const char *path, ClientSettings &settings)
             if (parseBrushSizeTenths(value, sizeTenths))
                 settings.brushSizeTenths = sizeTenths;
         }
+        else if (asciiEqualIgnoreCase(key, "brush_feather"))
+        {
+            bool featherEnabled = true;
+            if (parseBoolean(value, featherEnabled))
+                settings.brushFeatherEnabled = featherEnabled;
+        }
         else if (asciiEqualIgnoreCase(key, "solid_color"))
         {
             Rgb8 color;
@@ -431,6 +456,8 @@ static bool writeSettingsFile(const char *path, const ClientSettings &settings)
         ok = ok && fprintf(file, "brush_size=%d.%d\n",
                            settings.brushSizeTenths / 10,
                            settings.brushSizeTenths % 10) >= 0;
+    ok = ok && fprintf(file, "brush_feather=%s\n",
+                       settings.brushFeatherEnabled ? "on" : "off") >= 0;
     ok = ok && fprintf(file, "solid_color=#%02X%02X%02X\n",
                        settings.solidColor.r, settings.solidColor.g,
                        settings.solidColor.b) >= 0;
@@ -490,7 +517,8 @@ const char *settingsSaveResultLabel(SettingsSaveResult result)
 const char *clientBrushShapeToken(ClientBrushShape shape)
 {
     static const char *TOKENS[CLIENT_BRUSH_SHAPE_COUNT] = {
-        "circle", "square", "dither", "eraser"};
+        "circle", "square", "dither", "eraser",
+        "diamond", "cross", "spray"};
     return shape >= CLIENT_BRUSH_CIRCLE && shape < CLIENT_BRUSH_SHAPE_COUNT
                ? TOKENS[shape]
                : "invalid";
@@ -499,7 +527,8 @@ const char *clientBrushShapeToken(ClientBrushShape shape)
 const char *clientBrushShapeLabel(ClientBrushShape shape)
 {
     static const char *LABELS[CLIENT_BRUSH_SHAPE_COUNT] = {
-        "Circle", "Square", "Dither", "Eraser"};
+        "Circle", "Square", "Dither", "Eraser",
+        "Diamond", "Cross", "Spray"};
     return shape >= CLIENT_BRUSH_CIRCLE && shape < CLIENT_BRUSH_SHAPE_COUNT
                ? LABELS[shape]
                : "Invalid";
@@ -595,6 +624,7 @@ void resetClientSettings(ClientSettings &settings)
     settings.lastSuccessfulChannel[0] = '\0';
     settings.brushShape = CLIENT_BRUSH_CIRCLE;
     settings.brushSizeTenths = CLIENT_BRUSH_SIZE_MIN_TENTHS;
+    settings.brushFeatherEnabled = true;
     settings.solidColor.r = 255;
     settings.solidColor.g = 0;
     settings.solidColor.b = 0;
@@ -677,6 +707,7 @@ bool clientSettingsEqual(const ClientSettings &left, const ClientSettings &right
         strcmp(left.lastSuccessfulChannel, right.lastSuccessfulChannel) != 0 ||
         left.brushShape != right.brushShape ||
         left.brushSizeTenths != right.brushSizeTenths ||
+        left.brushFeatherEnabled != right.brushFeatherEnabled ||
         !rgbEqual(left.solidColor, right.solidColor))
         return false;
 

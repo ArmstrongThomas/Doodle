@@ -27,6 +27,9 @@ enum ClientBrushShape
     CLIENT_BRUSH_SQUARE,
     CLIENT_BRUSH_DITHER,
     CLIENT_BRUSH_ERASER,
+    CLIENT_BRUSH_DIAMOND,
+    CLIENT_BRUSH_CROSS,
+    CLIENT_BRUSH_SPRAY,
     CLIENT_BRUSH_SHAPE_COUNT
 };
 
@@ -49,6 +52,7 @@ struct ClientSettings
     char lastSuccessfulChannel[CLIENT_CHANNEL_CAPACITY];
     ClientBrushShape brushShape;
     int brushSizeTenths;
+    bool brushFeatherEnabled;
     Rgb8 solidColor;
     Rgb8 palette[CLIENT_PALETTE_COLOR_COUNT];
 };

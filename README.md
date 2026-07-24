@@ -4,7 +4,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 
 ## Current Release
 
-- Version: `1.6.1`
+- Version: `1.6.2`
 
 ## Features
 
@@ -13,7 +13,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Zoom levels: `0.5x`, `1x`, `2x`, and `4x`.
 - Named channels: `main`, `sketch`, and `test`.
 - Touch and button-complete channel, people, support, staff, profile, options, and help pages.
-- Circle, square, dither, and eraser shapes with a shared `1.0`–`12.0` touch slider in `0.1` steps and live preview.
+- Circle, square, dither, eraser, diamond, cross, and spray shapes with a shared `1.0`–`12.0` touch slider in `0.1` steps and live preview. A persistent, default-on Feather toggle blends shape boundaries and applies to Dither and Spray; both sparse tools use size-aware `3`–`6` pixel sampling.
 - Validated `#RRGGBB` entry, current/previous colors, and eight persistent favorite swatches.
 - Device identity, display name, masked backup-code recovery, and grouped connected-user sessions.
 - Staff canvas tools with snapshot, fill/erase selection previews, and confirmed clear.
@@ -21,6 +21,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Balanced, right-handed stylus, left-handed stylus, and custom control layouts.
 - Shared connection, syncing, restriction, update, and fatal-error overlays.
 - Compressed canvas snapshots using zlib.
+- Per-channel canvas dimensions up to 1920x1080, with channel sizes shown before switching.
 - Cloudflare-proxied WSS realtime transport with automatic sleep/Wi-Fi recovery, heartbeat detection, and reconnect backoff.
 - HTTPS update checks and downloads with certificate, size, and SHA-256 verification.
 - App metadata/icon via SMDH, including the visible app version/build label.
@@ -32,6 +33,7 @@ Collab Doodle is a Nintendo 3DS homebrew client for drawing together on shared s
 - Circle Pad: Pan viewport.
 - SELECT: Open the root menu from the canvas, or escape back to it from any page.
 - Lists: Touch or D-Pad/Circle Pad to select, A to confirm, and B to go back.
+- Route pages expose a bottom-right touch Back button with the same behavior as B. The root menu splits its final row into Exit and Back; the drawing palette keeps its dedicated Tools-button toggle.
 - The default Balanced canvas layout is:
   - D-Pad DOWN or B: Open/close tools.
   - Hold D-Pad LEFT or A + drag stylus: Pan viewport.
@@ -57,11 +59,13 @@ The root menu contains:
 
 The old standalone Status and Controls pages are gone. Connection status still appears automatically when the client is connecting, syncing, recovering, updating, restricted, or unable to continue. Controls now live in `Options > Controls & Presets`. Every intentional Exit action asks for confirmation before disconnecting; fatal-error and completed-update shutdowns remain immediate.
 
+Refreshing the current canvas preserves its pan and zoom. Switching to another channel resets the viewport to that channel's origin.
+
 The drawing sheet has `Draw` and role-gated `Staff` tabs. Its controls are touch-only: D-Pad, A, and shoulder input do not move focus or activate palette items. Press the configured Tools button again to close the sheet. Draw separates shape from the shared `1.0`–`12.0` size slider, keeps Rainbow available to every user, and provides current/previous colors, validated hex entry, and eight favorite swatches. Tap a swatch to apply it. Choose `Save`, then a slot, to replace that favorite explicitly. Reset asks for confirmation before restoring black, white, red, yellow, green, cyan, blue, and magenta. Action toasts dismiss automatically after about 1.5 seconds or immediately when tapped. Rainbow always starts disabled.
 
 Staff actions report pending, success, denied, or error results. Fill Selection and Erase Selection show the chosen rectangle before A applies it or B cancels. Clear always requires confirmation.
 
-Support offers bug reports, feature requests, user reports, and My Tickets. “Report a user” opens the People picker, records the selected account/session and channel in the draft, then presents the same editable final preview used by every other request. Restricted accounts continue to see only appeal creation and their existing appeals.
+Support offers bug reports, feature requests, user reports, and My Tickets. “Report a user” opens the People picker, asks only for the report reason, records the selected account/session and channel in a structured draft, then presents the final preview. Request and reply previews provide touch/button actions for Send, Edit, and Cancel; cancelling discards the unsent draft and returns to the appropriate Support screen. Ticket replies and staff-chat messages show their UTC creation minute as `YYYY-MM-DD HH:MMZ`. Loading notices are scoped to the support view that started them, clear as soon as the matching response completes, and time out safely if no response arrives. Restricted accounts continue to see only appeal creation and their existing appeals.
 
 ## Options and Device Settings
 
@@ -112,7 +116,7 @@ make
 The Makefile exposes these primary release/server variables:
 
 ```make
-APP_VERSION ?= 1.6.1
+APP_VERSION ?= 1.6.2
 CHAT_ENABLED ?= 0
 TEST_MODE ?= 0
 LOCAL_SERVER_HOST ?= 192.168.1.46
@@ -186,7 +190,7 @@ make cia TEST_MODE=2 DISABLE_UPDATER=0
 
 The updater always uses TLS. If it is intentionally enabled for `TEST_MODE=1`, point `SERVER_HTTPS_HOST` and `SERVER_HTTPS_PORT` at a real HTTPS endpoint whose certificate matches the host; the default local port `3000` is intended for the plain local WebSocket server, not an insecure updater fallback.
 
-Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. Test modes disable update prompts/downloads by default so they can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` only when intentionally testing against HTTPS. Test builds display labels such as `1.6.1-test1` or `1.6.1-test2`.
+Client hello/version checks, SMDH metadata, and the top-screen version label use the same build settings. `CHAT_ENABLED` is currently off for public builds. Any non-zero `TEST_MODE` marks the build as a test build and uses the test CIA title ID. Test modes disable update prompts/downloads by default so they can be sent with `3dslink` without publishing a live update. Override with `DISABLE_UPDATER=0` only when intentionally testing against HTTPS. Test builds display labels such as `1.6.2-test1` or `1.6.2-test2`.
 
 ## Client Fixture Tests
 
@@ -266,7 +270,16 @@ Homebrew Launcher `.3dsx` apps do not currently support a reliable in-app relaun
 
 ### Protocol compatibility
 
-Version 1.6 keeps native protocol version `6`. Its hello advertises the additive `ui2-channel-info`, `ui2-presence-compact`, `ui2-ticket-cursor`, and `draw-size-tenths` capabilities and may include the last successfully loaded channel as `preferredChannel`. Type-4 draw packets use the existing seven-byte draw header but encode the size byte in tenths (`45` means `4.5`); type 1 remains the whole-size legacy packet. Capable servers send exact fractional packets to capable clients and rounded type-1 packets to older clients. Compact channel metadata, bounded/grouped presence with channel totals, compound ticket cursors (`updatedAt + id`), legacy channel-name arrays, and `beforeId` ticket requests remain supported, so 1.5 clients continue to connect and the server minimum supported version does not change.
+Version 1.6 keeps native protocol version `6`. Its hello advertises the additive `ui2-channel-info`, `ui2-presence-compact`, `ui2-ticket-cursor`, `draw-size-tenths`, `brush-feather`, and `brush-suite-v2` capabilities and may include the last successfully loaded channel as `preferredChannel`. Type-4 draw packets use the existing seven-byte draw header but encode the size byte in tenths (`45` means `4.5`); capability-gated type 5 uses that same layout and enables Feather. Type 1 remains the whole-size fallback packet. The expanded suite adds deterministic diamond, cross, and spray masks; unsupported peers receive circle or dither fallbacks as protocol hardening. Outdated released clients enter the blocking updater before normal canvas use, so the current client/server pair is the authoritative visual target. The client sends the points it actually rendered, so the server canvas and capable peers reproduce the same sparse stroke. Compact channel metadata, bounded/grouped presence with channel totals, compound ticket cursors (`updatedAt + id`), legacy channel-name arrays, and `beforeId` ticket requests remain supported.
+
+Canvas metadata remains part of the existing protocol-6 compressed snapshot
+envelope, so channels may use different dimensions without a protocol bump.
+The client accepts at most 1920x1080, keeps a high-water canvas allocation when
+switching between sizes, and extends the snapshot deadline from 30 seconds by
+8 seconds per compressed MiB (up to 90 seconds). Large snapshots show their
+target dimensions while syncing. Going beyond this ceiling requires a
+chunked/tiled snapshot protocol instead of increasing the current whole-frame
+limits.
 
 Version `1.4.4` clients still connect over direct raw TCP and cannot use Cloudflare's HTTP/WebSocket proxy for realtime traffic. Keep the server's temporary legacy TCP bridge enabled only while that migration path is still required. Versions `1.5.0` and newer use WSS and HTTPS.
 

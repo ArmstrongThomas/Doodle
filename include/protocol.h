@@ -73,6 +73,8 @@ struct StaffChatMessage {
 struct ChannelInfo {
     char name[25];
     int userCount;
+    int width;
+    int height;
     bool staffOnly;
     bool adminOnly;
     bool readOnly;

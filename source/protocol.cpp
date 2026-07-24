@@ -257,6 +257,8 @@ bool Protocol::parseChannels(const char *line, char channels[][25], ChannelInfo 
         memset(&parsed, 0, sizeof(parsed));
         jsonStringRange(ptr, end, "\"name\":\"", parsed.name, sizeof(parsed.name));
         jsonIntRange(ptr, end, "\"userCount\":", parsed.userCount);
+        jsonIntRange(ptr, end, "\"width\":", parsed.width);
+        jsonIntRange(ptr, end, "\"height\":", parsed.height);
         jsonBoolRange(ptr, end, "\"staffOnly\":", parsed.staffOnly);
         jsonBoolRange(ptr, end, "\"adminOnly\":", parsed.adminOnly);
         jsonBoolRange(ptr, end, "\"readOnly\":", parsed.readOnly);
@@ -698,7 +700,7 @@ void Protocol::buildHello(char *buffer, size_t size, const char *appId, const ch
 
     const char *capabilities =
         "\"capabilities\":[\"ui2-channel-info\",\"ui2-presence-compact\",\"ui2-ticket-cursor\","
-        "\"draw-size-tenths\"]";
+        "\"draw-size-tenths\",\"brush-feather\",\"brush-suite-v2\"]";
     if (safePreferredChannel[0])
     {
         snprintf(buffer, size,
