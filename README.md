@@ -268,6 +268,26 @@ When an update is available:
 
 Homebrew Launcher `.3dsx` apps do not currently support a reliable in-app relaunch of the freshly replaced file, so the final step is manual reopen.
 
+### Mandatory update acceptance before release
+
+Building `Doodle.cia` is not proof that the installed-CIA updater works. Before
+any client release is called ready or announced, test both exact artifacts from
+the immediately previous public release:
+
+1. Launch a disposable copy of the previous `.3dsx`, accept the candidate
+   update, reopen it, and confirm the new version.
+2. Install the previous CIA into a disposable Azahar profile, launch it from
+   Azahar's installed-title list, accept the candidate update, and confirm CIA
+   download, checksum verification, AM overwrite, and the new version after
+   relaunch or manual reopen.
+
+Launching a CIA file directly is not an installed-CIA update test. Manifest
+inspection and a successful PC download are useful preflight checks, but they
+also do not replace the device/emulator flow. Record both results using
+`..\releases\CLIENT_UPDATE_RELEASE_CHECKLIST.md`. If either path fails after the
+candidate manifest is published, restore the previous manifest before
+announcement and fix the client under a new patch version.
+
 ### Protocol compatibility
 
 Version 1.6 keeps native protocol version `6`. Its hello advertises the additive `ui2-channel-info`, `ui2-presence-compact`, `ui2-ticket-cursor`, `draw-size-tenths`, `brush-feather`, and `brush-suite-v2` capabilities and may include the last successfully loaded channel as `preferredChannel`. Type-4 draw packets use the existing seven-byte draw header but encode the size byte in tenths (`45` means `4.5`); capability-gated type 5 uses that same layout and enables Feather. Type 1 remains the whole-size fallback packet. The expanded suite adds deterministic diamond, cross, and spray masks; unsupported peers receive circle or dither fallbacks as protocol hardening. Outdated released clients enter the blocking updater before normal canvas use, so the current client/server pair is the authoritative visual target. The client sends the points it actually rendered, so the server canvas and capable peers reproduce the same sparse stroke. Compact channel metadata, bounded/grouped presence with channel totals, compound ticket cursors (`updatedAt + id`), legacy channel-name arrays, and `beforeId` ticket requests remain supported.
